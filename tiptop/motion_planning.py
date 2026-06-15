@@ -163,7 +163,8 @@ def build_curobo_solvers(
     world_cfg = WorldConfig(cuboid=cuboids)
     ik_solver = get_ik_solver(world_cfg, num_particles)
     motion_gen = get_motion_gen(
-        world_cfg, collision_activation_distance=collision_activation_distance, num_spheres=num_spheres
+        world_cfg, collision_activation_distance=collision_activation_distance, num_spheres=num_spheres,
+        use_cuda_graph=False,  # della: cuRobo CUDA-graph replay throws illegal memory access on driver 595
     )
     return ik_solver, motion_gen, world_cfg
 

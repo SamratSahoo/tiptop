@@ -2,7 +2,8 @@
 
 # == Robot connection and control ==
 robot:
-  type: fr3_robotiq
+  # Sim (droid-sim-evals) uses a Franka Panda + Robotiq 2F-85; switch back to fr3_robotiq for the real FR3.
+  type: panda_robotiq
   dof: 7
 
   # IP address or hostname of the workstation running the Bamboo controller (directly networked to robot)
