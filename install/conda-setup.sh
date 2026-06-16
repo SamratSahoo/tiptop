@@ -38,8 +38,9 @@ export MAX_JOBS="${MAX_JOBS:-4}"
 
 TIPTOP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CUTAMP_DIR="${CUTAMP_DIR:-/scratch/gpfs/TSILVER/ss1824/cuTAMP}"
-CUROBO_DIR="${CUROBO_DIR:-$TIPTOP_DIR/curobo}"
-CUROBO_REPO="${CUROBO_REPO:-https://github.com/williamshen-nz/curobo.git}"
+# cuRobo lives as a sibling submodule of the parent tamp-vla checkout (tamp-vla/curobo).
+CUROBO_DIR="${CUROBO_DIR:-$TIPTOP_DIR/../curobo}"
+CUROBO_REPO="${CUROBO_REPO:-https://github.com/SamratSahoo/curobo.git}"
 TIPTOP_EXTRAS="${TIPTOP_EXTRAS:-sam-server,test,dev}"   # add 'ur5' if you use a UR5 arm
 
 # Run a command inside the conda env, streaming output.
