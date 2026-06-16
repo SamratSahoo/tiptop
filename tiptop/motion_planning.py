@@ -162,8 +162,14 @@ def build_curobo_solvers(
     ]
     world_cfg = WorldConfig(cuboid=cuboids)
     ik_solver = get_ik_solver(world_cfg, num_particles)
+    # use_cuda_graph=False: MotionGen is built with a minimal world (1 placeholder cuboid when
+    # include_workspace=False), so update_world() must be able to GROW the collision cache when
+    # the real scene (table + surfaces + movables) is loaded. CUDA graphs pin the cache size
+    # (fix_cache_reference=True), which raises "number of OBB is larger than collision cache".
+    # Disabling graphs lets the cache grow, and also avoids a CUDA-graph driver crash (see README).
     motion_gen = get_motion_gen(
-        world_cfg, collision_activation_distance=collision_activation_distance, num_spheres=num_spheres
+        world_cfg, collision_activation_distance=collision_activation_distance, num_spheres=num_spheres,
+        use_cuda_graph=False,
     )
     return ik_solver, motion_gen, world_cfg
 
