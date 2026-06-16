@@ -1,7 +1,10 @@
 import asyncio
+import json
+import os
 import logging
 import shutil
 import signal
+import subprocess
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -35,6 +38,7 @@ from tiptop.perception.cameras import (
     ZedCamera,
     get_depth_estimator,
     get_external_camera,
+    get_external_camera_2,
     get_hand_camera,
 )
 from tiptop.perception.m2t2 import m2t2_to_tiptop_transform
@@ -60,11 +64,15 @@ from tiptop.utils import (
     remove_file_handler,
     setup_logging,
 )
+from tiptop.lerobot_capture import GripperSampler, dump_lerobot_raw
 from tiptop.viz_utils import get_gripper_mesh, get_heatmap
 from tiptop.workspace import workspace_cuboids
 
 _log = logging.getLogger(__name__)
 tensor_args = TensorDeviceType()
+
+# Sampling rate for the LeRobot DROID-format capture during plan execution (matches DROID).
+LEROBOT_FPS = 15
 
 _executor_pool = None
 
@@ -89,6 +97,7 @@ class _DemoContainer:
     robot: RobotClient
     cam: Camera
     external_cam: Camera | None
+    external_cam_2: Camera | None
     enable_recording: bool
     ee_from_cam: Float[np.ndarray, "4 4"]
     depth_estimator: DepthEstimator
@@ -129,14 +138,28 @@ def get_demo_container(
     # Setup cameras
     cam = get_hand_camera()
     external_cam = get_external_camera()
+    # Second exterior camera (DROID exterior_2). Required when recording; None only if its
+    # config is absent (deliberate 2-camera setup) or it failed to open.
+    external_cam_2 = get_external_camera_2()
     ee_from_cam = load_calibration(cam.serial)
 
-    # External camera for recording (if enabled)
+    # Recording needs all three ZED cameras (hand + two exteriors). Fail fast here, before any
+    # rollout, so we never silently collect data missing a camera.
     if enable_recording:
         if not isinstance(cam, ZedCamera):
             raise NotImplementedError(f"Recording requires a ZED hand camera, got {type(cam).__name__}")
         if not isinstance(external_cam, ZedCamera):
             raise NotImplementedError(f"Recording requires a ZED external camera, got {type(external_cam).__name__}")
+        if not isinstance(external_cam_2, ZedCamera):
+            raise RuntimeError(
+                "Recording requires all 3 cameras, but the second external ZED "
+                "(cameras.external_2, s/n 31425515) is unavailable "
+                f"(got {type(external_cam_2).__name__}). It most likely failed to open "
+                "(e.g. LOW USB BANDWIDTH) — lower the camera fps/resolution in tiptop.yml or move it "
+                "to another USB3 controller; check it is connected. Aborting before the run so no "
+                "rollout is collected with a missing camera. To intentionally run with two cameras, "
+                "comment out cameras.external_2 in tiptop.yml AND run with --no-enable-recording."
+            )
 
     # Create depth estimator once — closed over camera intrinsics
     # Cache the SAM2 client
@@ -148,6 +171,7 @@ def get_demo_container(
         robot=client,
         cam=cam,
         external_cam=external_cam,
+        external_cam_2=external_cam_2,
         enable_recording=enable_recording,
         ee_from_cam=ee_from_cam,
         depth_estimator=get_depth_estimator(cam),
@@ -170,8 +194,10 @@ async def check_server_health(session: aiohttp.ClientSession):
     _log.info("Server health checks successful!")
 
 
-def _label_rollout(save_dir: Path, output_dir: str, date_str: str, timestamp: str) -> None:
-    """Prompt user to label rollout as success/failure, moving it out of eval/. Loops on invalid input."""
+def _label_rollout(save_dir: Path, output_dir: str, timestamp: str) -> Path:
+    """Prompt user to label rollout as success/failure, moving it out of eval/ to
+    <success|failure>/<timestamp>/. Loops on invalid input. Returns the final rollout
+    directory (or the unchanged eval dir if skipped) so it can be post-processed."""
     try:
         while True:
             user_input = (
@@ -181,40 +207,75 @@ def _label_rollout(save_dir: Path, output_dir: str, date_str: str, timestamp: st
                 .strip()
                 .lower()
             )
-            if user_input == "y":
-                dest = Path(output_dir) / "success" / date_str / timestamp
+            if user_input in ("y", "n"):
+                cls = "success" if user_input == "y" else "failure"
+                dest = Path(output_dir) / cls / timestamp
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(save_dir, dest)
-                _log.info(f"Moved rollout to success directory: {dest}")
-                return
-            elif user_input == "n":
-                dest = Path(output_dir) / "failure" / date_str / timestamp
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(save_dir, dest)
-                _log.info(f"Moved rollout to failure directory: {dest}")
-                return
+                _log.info(f"Moved rollout to {cls} directory: {dest}")
+                return dest
             elif user_input == "":
                 _log.info(f"Keeping rollout in eval directory: {save_dir}")
-                return
+                return save_dir
             else:
                 print("Invalid input. Please enter 'y', 'n', or leave empty to skip.")
     except EOFError:
         _log.info("No input received, keeping rollout in eval directory")
+        return save_dir
+
+
+_LAST_TASK: str | None = None
+_postprocess_procs: list[subprocess.Popen] = []
 
 
 def _get_task_instruction() -> str:
-    task_instruction = ""
-    while not task_instruction:
-        try:
-            task_instruction = input(
-                "Enter task instruction (e.g., 'place the red cup on the table', or 'exit' to quit): "
-            ).strip()
-            if task_instruction.lower() == "exit":
-                raise UserExitException("User requested exit")
-        except KeyboardInterrupt:
-            raise UserExitException("User interrupted with Ctrl+C")
+    """Task for the next rollout. The first comes from ``TIPTOP_TASK`` (non-interactive
+    launch); subsequent ones are prompted interactively so the warmed container is reused
+    across rollouts. Enter repeats the last task, typing a new one changes it, and
+    'q'/'exit'/Ctrl-D ends the session (raising UserExitException)."""
+    global _LAST_TASK
+    env_task = os.environ.get('TIPTOP_TASK', '')
+    if env_task:
+        os.environ['TIPTOP_TASK'] = ''  # consume the launch task
+        instr = env_task.strip()
+        if not instr or instr.lower() in ('exit', 'q', 'quit'):
+            raise UserExitException('TIPTOP_TASK empty/exit')
+        _LAST_TASK = instr
+        return instr
+    # Interactive: keep reusing the warm container for back-to-back rollouts.
+    suffix = f" [{_LAST_TASK}]" if _LAST_TASK else ""
+    try:
+        raw = input(f"\nNext task (Enter = repeat{suffix}, 'q' to quit): ").strip()
+    except EOFError:
+        raise UserExitException('EOF; ending session')
+    if raw.lower() in ('q', 'exit', 'quit'):
+        raise UserExitException('user quit')
+    if not raw:
+        if _LAST_TASK:
+            return _LAST_TASK
+        raise UserExitException('no task entered; ending session')
+    _LAST_TASK = raw
+    return raw
 
-    return task_instruction
+
+def _spawn_postprocess(rollout_dir: Path) -> None:
+    """Fire-and-forget background post-processing (gifs + LeRobot export) for one finished
+    rollout, so the next rollout can start immediately. No-op if the launcher didn't set
+    TIPTOP_POSTPROCESS_SCRIPT (e.g. tiptop-run was started directly, not via run-tiptop.sh)."""
+    script = os.environ.get("TIPTOP_POSTPROCESS_SCRIPT")
+    if not script:
+        return
+    try:
+        logf = open(rollout_dir / "postprocess.log", "ab")
+        proc = subprocess.Popen(
+            ["bash", script, str(rollout_dir)],
+            stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
+            start_new_session=True,  # detach so it survives and never blocks the run loop
+        )
+        _postprocess_procs.append(proc)
+        _log.info(f"Post-processing {rollout_dir.name} in background (pid {proc.pid}) -> postprocess.log")
+    except Exception:
+        _log.exception("Failed to launch background post-processing")
 
 
 def create_tamp_environment(
@@ -521,6 +582,62 @@ async def run_perception(
         rr.log("bboxes", rr.Image(bbox_viz))
         rr.log("masks", rr.Image(masks_viz))
 
+    # PATCH: dump scene_objects.json {label: {centroid, extents}} for /drop_above fallback in cortex_tamp_server
+    try:
+        import json as _json
+        import numpy as _np
+        _scene_objs = {}
+        for _name, _m in processed_scene.object_meshes.items():
+            if getattr(_m, "pose", None) is None or len(_m.pose) < 3:
+                continue
+            _centroid = [float(x) for x in _m.pose[:3]]
+            _extents = None
+            try:
+                _v = _np.array(_m.vertices)
+                if _v.size:
+                    _extents = [
+                        float(_v[:, 0].max() - _v[:, 0].min()),
+                        float(_v[:, 1].max() - _v[:, 1].min()),
+                        float(_v[:, 2].max() - _v[:, 2].min()),
+                    ]
+            except Exception:
+                pass
+            _scene_objs[_name] = {"centroid": _centroid, "extents": _extents}
+        # PATCH 2026-06-02: also serialize M2T2 grasp candidates per object (top-K by
+        # confidence) so cortex /pick_cached can pick a real rim/handle grasp without
+        # re-running Gemini/SAM2/M2T2. processed_scene.grasps[label] has the raw M2T2
+        # output; we transform to TCP frame (m2t2_to_tiptop_transform) so the saved
+        # poses are world_from_TCP — directly usable by cuRobo IK in pick_cached.
+        try:
+            from tiptop.perception.m2t2 import m2t2_to_tiptop_transform as _m2t2_xf
+            _xf = _m2t2_xf()
+            _TOP_K = 30
+            for _gname, _gdict in (processed_scene.grasps or {}).items():
+                if _gname not in _scene_objs:
+                    continue
+                _poses = _gdict.get("poses") if isinstance(_gdict, dict) else None
+                _confs = _gdict.get("confidences") if isinstance(_gdict, dict) else None
+                if _poses is None or _confs is None or len(_poses) == 0:
+                    _scene_objs[_gname]["grasps_world_from_tcp"] = []
+                    _scene_objs[_gname]["grasp_confidences"] = []
+                    continue
+                _wfg = _np.asarray(_poses) @ _np.asarray(_xf)
+                _confs = _np.asarray(_confs)
+                _order = _np.argsort(-_confs)[:_TOP_K]
+                _scene_objs[_gname]["grasps_world_from_tcp"] = _wfg[_order].tolist()
+                _scene_objs[_gname]["grasp_confidences"] = _confs[_order].tolist()
+        except Exception as _ge:
+            _log.warning(f"PATCH grasps: failed to serialize M2T2 grasps: {_ge}")
+        (save_dir / "scene_objects.json").write_text(_json.dumps(_scene_objs, indent=2))
+        _log.info(f"PATCH: wrote scene_objects.json with {len(_scene_objs)} entries")
+    except Exception as _e:
+        _log.warning(f"PATCH: failed to dump scene_objects.json: {_e}")
+    # PATCH: detect-only mode for cortex /perceive. scene_objects.json is already
+    # written above; bail out before any motion planning / grasp execution.
+    import os as _os_detect
+    if _os_detect.environ.get("TIPTOP_DETECT_ONLY"):
+        raise UserExitException("TIPTOP_DETECT_ONLY: perception complete; skipping planning/motion")
+
     env, all_surfaces = create_tamp_environment(
         processed_scene.object_meshes,
         processed_scene.table_cuboid,
@@ -544,18 +661,26 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 _log.debug(f"Preparing TiPToP for next run...")
                 await check_server_health(session)
 
-                # Go to capture pose and ask user for instruction
-                _log.debug("Moving robot to capture joint positions")
-                go_to_capture(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
-                container.robot.open_gripper()  # ensure gripper is open
+                # Get the task BEFORE any pre-trial robot motion so that quitting (or an empty
+                # prompt) ends the session without moving to capture + opening the gripper --
+                # which would drop whatever is currently held. Reuses the warmed container.
                 task_instruction = _get_task_instruction()  # Let UserExitException propagate
                 _log.info(f"User entered instruction: {task_instruction}")
+
+                _log.debug("Moving robot to capture joint positions")
+                go_to_capture(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+                # PATCH: wrap in try/except + log so we see hangs
+                try:
+                    _log.info('[DEBUG] About to call open_gripper()')
+                    container.robot.open_gripper()
+                    _log.info('[DEBUG] open_gripper() returned OK')
+                except Exception as _e:
+                    _log.exception('[DEBUG] open_gripper FAILED: ' + str(_e))
 
                 now = datetime.now()
                 timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
                 iso_timestamp = now.isoformat(timespec="seconds")
-                date_str = now.strftime("%Y-%m-%d")
-                rr.init("tiptop_run", recording_id=timestamp, spawn=True)
+                rr.init("tiptop_run", recording_id=timestamp, spawn=False)  # PATCH: no DISPLAY in headless subprocess
                 # Log workspace for visualization purposes
                 robot_rr = get_robot_rerun()
                 for obj in workspace_cuboids():
@@ -587,7 +712,14 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                     cutamp_plan = None
                     planning_duration = None
                     failure_reason = None
+                    if os.environ.get("TIPTOP_DRY_RUN"):
+                        _log.info("PATCH: TIPTOP_DRY_RUN=1 -> skipping planning/execute (perception-only)")
+                        failure_reason = "dry_run"
+                    else:
+                        pass
                     try:
+                        if os.environ.get("TIPTOP_DRY_RUN"):
+                            raise RuntimeError("dry_run skip")
                         _log.info("Running Planning...")
                         cutamp_plan, planning_duration, failure_reason = run_planning(
                             env,
@@ -609,6 +741,8 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                             _log.info("Executing plan...")
                             # Execute with optional recording
                             if container.enable_recording:
+                                # Convert SVO -> MP4 after execution. Depth is disabled during
+                                # conversion (see convert_svo_to_mp4) so it won't OOM the GPU.
                                 cameras_to_record = [
                                     (
                                         container.external_cam,
@@ -616,12 +750,58 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                                         save_dir / "external_cam.mp4",
                                     ),
                                 ]
+                                if container.external_cam_2 is not None:
+                                    cameras_to_record.append(
+                                        (
+                                            container.external_cam_2,
+                                            save_dir / "external_cam_2.svo",
+                                            save_dir / "external_cam_2.mp4",
+                                        ),
+                                    )
                                 if isinstance(container.cam, ZedCamera):
                                     cameras_to_record.append(
                                         (container.cam, save_dir / "hand_cam.svo", save_dir / "hand_cam.mp4"),
                                     )
+                                # Record cameras while executing; capture per-step wall-clock times so
+                                # the LeRobot export can align camera frames to the control timeline,
+                                # and sample the measured gripper width over its own socket.
+                                exec_timeline: list[dict] = []
                                 with record_cameras(cameras_to_record):
-                                    execute_cutamp_plan(cutamp_plan, client=container.robot)
+                                    with GripperSampler(container.robot) as gripper_sampler:
+                                        execute_cutamp_plan(
+                                            cutamp_plan, client=container.robot, timeline=exec_timeline
+                                        )
+                                # Save the raw measured gripper trace (wall_seconds, width_m) so the
+                                # open<->close shape can be inspected directly (snap vs ramp).
+                                try:
+                                    (save_dir / "_gripper_trace.json").write_text(
+                                        json.dumps({"width_samples": gripper_sampler.width_samples})
+                                    )
+                                except Exception:
+                                    _log.exception("Failed to write gripper trace")
+                                # mp4s are written on record_cameras exit; map them to DROID image keys.
+                                lerobot_cameras = {"observation.images.exterior_1_left": "external_cam.mp4"}
+                                if container.external_cam_2 is not None:
+                                    lerobot_cameras["observation.images.exterior_2_left"] = "external_cam_2.mp4"
+                                if isinstance(container.cam, ZedCamera):
+                                    lerobot_cameras["observation.images.wrist_left"] = "hand_cam.mp4"
+                                try:
+                                    # Export the dense plan (not a live sample) to LeRobot DROID format,
+                                    # built post-hoc by the robot env from this _lerobot_raw.json.
+                                    dump_lerobot_raw(
+                                        save_dir,
+                                        plan_path,
+                                        motion_gen=container.motion_gen,
+                                        tensor_args=tensor_args,
+                                        instruction=task_instruction,
+                                        cameras=lerobot_cameras,
+                                        fps=LEROBOT_FPS,
+                                        robot_type=cfg.robot.type,
+                                        timeline=exec_timeline,
+                                        gripper_samples=gripper_sampler.samples,
+                                    )
+                                except Exception:
+                                    _log.exception("Failed to dump LeRobot raw capture")
                             else:
                                 execute_cutamp_plan(cutamp_plan, client=container.robot)
                             _log.info("Finished executing plan!")
@@ -649,20 +829,15 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         _log.info(f"Logs, results, and visualizations saved to {save_dir}")
 
                     if execute_plan:
-                        _label_rollout(save_dir, output_dir, date_str, timestamp)
-
-                        # If the goal was just to pick an object (i.e., goal contains Holding), ask the user to confirm before
-                        # opening the gripper so the object can drop safely
-                        if cutamp_plan is not None and any(atom.fluent.name == Holding.name for atom in env.goal_state):
-                            print("WARNING: object will drop when gripper opens, so be ready to catch it.")
-                            while True:
-                                try:
-                                    response = input("Open gripper? [y]: ").strip().lower()
-                                except KeyboardInterrupt:
-                                    raise UserExitException("User interrupted with Ctrl+C")
-                                if response == "y":
-                                    break
-                            container.robot.open_gripper()
+                        final_dir = _label_rollout(save_dir, output_dir, timestamp)
+                        # Post-process this rollout (gifs + LeRobot export) in the background so
+                        # the next rollout can start immediately instead of blocking on it.
+                        _spawn_postprocess(final_dir)
+                        # PATCH (cortex v3): DO NOT auto-open the gripper after Pick.
+                        # The original tiptop demo opened the gripper post-pick for
+                        # standalone "did the grasp work?" tests. For cortex we WANT
+                        # to keep the object held so Haiku can decide whether to Place
+                        # next. Removing the open_gripper() call here.
                 except Exception:
                     _log.exception("TiPToP run failed")
                     raise
@@ -741,9 +916,21 @@ def _sync_entrypoint(
             container.cam.close()
             if container.external_cam is not None:
                 container.external_cam.close()
+            if container.external_cam_2 is not None:
+                container.external_cam_2.close()
             container.robot.close()
         if _executor_pool is not None:
             _executor_pool.shutdown(wait=False, cancel_futures=True)
+        # Wait for any background per-rollout post-processing (gifs + LeRobot export) to finish
+        # so the session doesn't exit mid-export. Ctrl-C here leaves them running detached.
+        pending = [p for p in _postprocess_procs if p.poll() is None]
+        if pending:
+            _log.info(f"Waiting for {len(pending)} background post-processing job(s) to finish...")
+            try:
+                for p in pending:
+                    p.wait()
+            except KeyboardInterrupt:
+                _log.info("Leaving post-processing running in the background; exiting now.")
         sys.exit(exit_code)
 
 

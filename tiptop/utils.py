@@ -62,9 +62,8 @@ def get_tiptop_cache_dir() -> Path:
     return cache_dir
 
 
-@cache
-def get_bamboo_client() -> BambooFrankaClient:
-    """Get a BambooFrankaClient instance using the current config."""
+def _build_bamboo_client() -> BambooFrankaClient:
+    """Construct a fresh BambooFrankaClient (new ZMQ connection) from the config."""
     cfg = tiptop_cfg()
 
     if cfg.robot.type in {"fr3_robotiq", "panda_robotiq"}:
@@ -79,6 +78,12 @@ def get_bamboo_client() -> BambooFrankaClient:
     )
 
 
+@cache
+def get_bamboo_client() -> BambooFrankaClient:
+    """Get the shared BambooFrankaClient instance using the current config."""
+    return _build_bamboo_client()
+
+
 RobotClient = BambooFrankaClient | UR5Client
 
 
@@ -91,6 +96,23 @@ def get_robot_client() -> RobotClient:
         from tiptop.ur5.ur5_client import get_ur5_client
 
         return get_ur5_client()
+    else:
+        raise ValueError(f"Unknown robot type: {cfg.robot.type}")
+
+
+def new_robot_client() -> RobotClient:
+    """Build a fresh, uncached RobotClient with its own connection/sockets.
+
+    Unlike get_robot_client(), this does NOT return the shared cached instance.
+    Use it when a second thread needs to talk to the robot concurrently: ZMQ REQ
+    sockets are not thread-safe, so a background state poller must own a separate
+    connection rather than share the main command client's socket.
+    """
+    cfg = tiptop_cfg()
+    if cfg.robot.type in {"fr3_robotiq", "panda_robotiq", "panda", "fr3"}:
+        return _build_bamboo_client()
+    elif cfg.robot.type == "ur5":
+        return UR5Client(cfg.robot.host)
     else:
         raise ValueError(f"Unknown robot type: {cfg.robot.type}")
 
@@ -121,11 +143,6 @@ def load_gripper_mask() -> Bool[np.ndarray, "h w"]:
 
 
 def setup_logging(level: int = logging.INFO):
-    """Configure root logger and stdout console handler. Call once per entrypoint.
-
-    The root logger is set to DEBUG so handlers added later (file handlers, etc.) can
-    filter at their own level. `level` controls only the stdout console handler.
-    """
     # Ensure stdout and stderr use UTF-8 encoding to handle Unicode characters
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -157,18 +174,18 @@ def setup_logging(level: int = logging.INFO):
     log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     formatter = CustomFormatter(log_format, datefmt="%Y-%m-%d %H:%M:%S")
 
-    # Root at DEBUG so later-added handlers (e.g. per-run file handler) can capture DEBUG
+    # Configure the root logger (force reconfiguration)
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
+    root_logger.setLevel(level)
 
     # Remove only default StreamHandlers (stdout/stderr), keep other handlers (files, etc.)
     for handler in root_logger.handlers[:]:
         if isinstance(handler, logging.StreamHandler) and handler.stream in (sys.stdout, sys.stderr):
             root_logger.removeHandler(handler)
 
+    # Add our custom handler
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(formatter)
-    handler.setLevel(level)
     root_logger.addHandler(handler)
 
     # Bamboo can be INFO level
@@ -202,18 +219,22 @@ def add_file_handler(log_file: Path, level: int = logging.DEBUG) -> logging.File
         level: Logging level for the file handler
 
     Returns:
-        The FileHandler instance so it can be removed later via remove_file_handler().
+        The FileHandler instance so it can be removed later
     """
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Plain formatter (no ANSI colors) and UTF-8 encoding so the file stays readable
+    # Create file handler with plain formatting (no colors) and UTF-8 encoding
     file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
     file_handler.setLevel(level)
+
+    # Use same format as console but without colors
     log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     formatter = logging.Formatter(log_format, datefmt="%Y-%m-%d %H:%M:%S")
     file_handler.setFormatter(formatter)
 
-    logging.getLogger().addHandler(file_handler)
+    # Add to root logger
+    root_logger = logging.getLogger()
+    root_logger.addHandler(file_handler)
     return file_handler
 
 
@@ -221,9 +242,10 @@ def remove_file_handler(handler: logging.FileHandler):
     """Remove a file handler from the root logger and close it.
 
     Args:
-        handler: The FileHandler previously returned by add_file_handler().
+        handler: The FileHandler to remove
     """
-    logging.getLogger().removeHandler(handler)
+    root_logger = logging.getLogger()
+    root_logger.removeHandler(handler)
     handler.close()
 
 

@@ -18,7 +18,7 @@ from jaxtyping import Bool, Float, UInt8
 from PIL import Image
 
 import tiptop
-from tiptop.config import get_tiptop_cfg_path
+from tiptop.config import tiptop_config_path
 from tiptop.perception.cameras.zed_camera import ZedCamera, convert_svo_to_mp4
 from tiptop.perception.utils import get_o3d_pcd
 from tiptop.perception.visualization import visualize_detections, visualize_masks
@@ -34,7 +34,7 @@ def _get_git_root() -> Path:
         ["git", "rev-parse", "--show-toplevel"],
         cwd=Path(__file__).parent,
         stderr=subprocess.DEVNULL,
-        text=True,
+        encoding="utf-8", errors="replace",
     ).strip())
 
 
@@ -49,17 +49,17 @@ def _collect_git_info() -> dict:
             ["git", "rev-parse", "HEAD"],
             cwd=root,
             stderr=subprocess.DEVNULL,
-            text=True,
+            encoding="utf-8", errors="replace",
         ).strip()
         porcelain = subprocess.check_output(
             ["git", "status", "--porcelain", "--", ".", ":(exclude)pixi.lock"],
             cwd=root,
             stderr=subprocess.DEVNULL,
-            text=True,
+            encoding="utf-8", errors="replace",
         )
         dirty = bool(porcelain.strip())
         return {"commit": commit, "dirty": dirty, "porcelain": porcelain.strip() if dirty else None}
-    except (FileNotFoundError, subprocess.CalledProcessError):
+    except (FileNotFoundError, subprocess.CalledProcessError, UnicodeDecodeError):
         _log.warning("Failed to collect git info", exc_info=True)
         return {"commit": None, "dirty": None, "porcelain": None}
 
@@ -72,10 +72,10 @@ def _get_git_diff() -> str | None:
             ["git", "diff", "HEAD", "--", ".", ":(exclude)pixi.lock"],
             cwd=root,
             stderr=subprocess.DEVNULL,
-            text=True,
+            encoding="utf-8", errors="replace",
         )
         return diff if diff else None
-    except (FileNotFoundError, subprocess.CalledProcessError):
+    except (FileNotFoundError, subprocess.CalledProcessError, UnicodeDecodeError):
         _log.warning("Failed to get git diff", exc_info=True)
         return None
 
@@ -213,7 +213,7 @@ def save_run_outputs(save_dir: Path, env, grasps: dict) -> None:
     _log.info(f"Saved grasps to {perception_dir}/grasps.pt")
 
     # tiptop config for reproducibility
-    shutil.copy2(get_tiptop_cfg_path(), save_dir / "tiptop.yml")
+    shutil.copy2(tiptop_config_path, save_dir / "tiptop.yml")
     _log.info(f"Saved tiptop config to {save_dir}/tiptop.yml")
 
 

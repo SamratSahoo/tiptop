@@ -1,5 +1,6 @@
 """Modified from https://github.com/droid-dataset/droid/blob/main/droid/camera_utils/camera_readers/zed_camera.py"""
 
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -72,6 +73,8 @@ class ZedCamera:
         resolution: str = "HD720",
         fps: int = 60,
         flip: bool = False,
+        open_retries: int = 3,
+        open_retry_delay: float = 2.0,
     ):
         import pyzed.sl as sl
 
@@ -89,14 +92,37 @@ class ZedCamera:
         self._pcd = sl.Mat()
         self._runtime = sl.RuntimeParameters()
 
-        # Open the camera
+        # Open the camera. Opening several ZEDs in quick succession can hit a transient
+        # USB enumeration/claim race ("can't claim interface", "Unable to capture
+        # images"); the SDK's own 5 s retry isn't always enough, so retry from a fresh
+        # Camera handle a few times before giving up.
         _log.info(f"Opening ZED camera {self.serial}")
         self._params = _custom_params(resolution, fps, flip=flip)
         sl_params = sl.InitParameters(**self._params)
         sl_params.set_from_serial_number(int(self.serial))
         status = self._cam.open(sl_params)
+        attempt = 1
+        while status != sl.ERROR_CODE.SUCCESS and attempt < open_retries:
+            _log.warning(
+                f"ZED camera (s/n: {self.serial}) open failed ({status}); "
+                f"retry {attempt}/{open_retries - 1} in {open_retry_delay:.1f}s"
+            )
+            self._cam.close()
+            # "can't claim interface: -6 (LIBUSB_ERROR_BUSY)" means the camera is still claimed
+            # by a stale handle from a previous run that didn't release it (crash / kill -9 /
+            # interrupted teardown). A hardware reboot of the camera over USB clears that and a
+            # wedged video module. Targets this serial only, so sibling cameras are unaffected.
+            try:
+                _log.info(f"Rebooting ZED camera {self.serial} over USB to recover...")
+                sl.Camera.reboot(int(self.serial))
+            except Exception as e:
+                _log.warning(f"ZED reboot({self.serial}) failed (continuing to retry): {e}")
+            time.sleep(open_retry_delay)
+            self._cam = sl.Camera()
+            status = self._cam.open(sl_params)
+            attempt += 1
         if status != sl.ERROR_CODE.SUCCESS:
-            raise RuntimeError(f"ZED camera (s/n: {self.serial}) failed to open")
+            raise RuntimeError(f"ZED camera (s/n: {self.serial}) failed to open after {attempt} attempt(s): {status}")
 
         # Cache the intrinsics
         _ = self.get_intrinsics()
@@ -233,8 +259,21 @@ async def zed_infer_depth_async(
     return depth
 
 
+class CorruptSVOError(RuntimeError):
+    """Raised when an SVO file is corrupted/truncated and yields no usable video.
+
+    Typically happens when a `tiptop-run` recording is killed mid-write (e.g. a
+    crash), leaving the SVO truncated past the point ZED's auto-repair can fix.
+    """
+
+
 def convert_svo_to_mp4(svo_path: Path, mp4_path: Path, crf: int = 20):
-    """Convert SVO file to MP4 video (left RGB only) using ffmpeg for efficient compression."""
+    """Convert SVO file to MP4 video (left RGB only) using ffmpeg for efficient compression.
+
+    Raises CorruptSVOError if the SVO cannot be opened or yields zero frames. If the
+    SVO opens but truncates partway through, the frames decoded before the corruption
+    are still written and a warning is logged (partial recovery).
+    """
     import shutil
     import subprocess
 
@@ -250,10 +289,16 @@ def convert_svo_to_mp4(svo_path: Path, mp4_path: Path, crf: int = 20):
     init_params = sl.InitParameters()
     init_params.set_from_svo_file(str(svo_path))
     init_params.svo_real_time_mode = False
+    # Only the left RGB image is extracted, so disable depth to avoid loading the
+    # NEURAL depth net onto the GPU (it OOMs when other models are still resident).
+    init_params.depth_mode = sl.DEPTH_MODE.NONE
     zed = sl.Camera()
     err = zed.open(init_params)
     if err != sl.ERROR_CODE.SUCCESS:
-        raise RuntimeError(f"Failed to open SVO file: {err}")
+        # A truncated/corrupted recording (ZED auto-repair already tried and failed)
+        # reports INVALID_SVO_FILE here. Surface it as recoverable so batch
+        # conversion can skip this file and still process the others.
+        raise CorruptSVOError(f"Cannot open SVO file (corrupted or truncated): {svo_path} ({err})")
 
     image_size = zed.get_camera_information().camera_configuration.resolution
     width = image_size.width
@@ -291,6 +336,11 @@ def convert_svo_to_mp4(svo_path: Path, mp4_path: Path, crf: int = 20):
     left_image = sl.Mat()
     rt_param = sl.RuntimeParameters()
     nb_frames = zed.get_svo_number_of_frames()
+    frames_written = 0
+    truncated = False
+    # Per-frame hardware capture times (epoch seconds), one per written frame. Used by
+    # the LeRobot export to align camera frames to the control timeline by timestamp.
+    timestamps_s: list[float] = []
     try:
         with tqdm(total=nb_frames, desc="Converting SVO to MP4", unit="frame") as pbar:
             while True:
@@ -303,18 +353,37 @@ def convert_svo_to_mp4(svo_path: Path, mp4_path: Path, crf: int = 20):
                         proc.stdin.write(frame_bgr.tobytes())
                     except BrokenPipeError:
                         break  # ffmpeg died; returncode check below will raise
+                    timestamps_s.append(zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds() / 1e9)
+                    frames_written += 1
                     pbar.update(1)
                 elif err == sl.ERROR_CODE.END_OF_SVOFILE_REACHED:
                     break
                 else:
-                    raise RuntimeError(f"Failed to grab frame at position {zed.get_svo_position()}: {err}")
+                    # Corruption mid-stream (e.g. truncated recording): keep the frames
+                    # decoded so far rather than discarding the whole video.
+                    _log.warning(
+                        f"Stopping early at frame {zed.get_svo_position()} of {svo_path.name}: {err}. "
+                        f"Saving the {frames_written} frame(s) recovered so far."
+                    )
+                    truncated = True
+                    break
     finally:
         proc.stdin.close()
         stderr = proc.stderr.read()
         proc.wait()
         zed.close()
 
+    if frames_written == 0:
+        mp4_path.unlink(missing_ok=True)
+        raise CorruptSVOError(f"SVO yielded no decodable frames (corrupted or truncated): {svo_path}")
     if proc.returncode != 0:
         stderr_msg = stderr.decode(errors="replace").strip()
         raise RuntimeError(f"ffmpeg exited with code {proc.returncode}: {stderr_msg}")
-    _log.info(f"Conversion complete: {mp4_path}")
+    # Sidecar of per-frame capture times, aligned 1:1 with the mp4's frames.
+    ts_path = mp4_path.with_suffix(".timestamps.json")
+    with open(ts_path, "w") as f:
+        json.dump({"unit": "epoch_seconds", "timestamps": timestamps_s}, f)
+    if truncated:
+        _log.info(f"Partial conversion complete ({frames_written} frames): {mp4_path}")
+    else:
+        _log.info(f"Conversion complete: {mp4_path}")

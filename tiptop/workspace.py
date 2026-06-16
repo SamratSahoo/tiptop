@@ -15,32 +15,15 @@ tensor_args = TensorDeviceType()
 
 
 def fr3_workspace() -> tuple[Cuboid, ...]:
-    vention_table = Cuboid(
-        "vention",
-        dims=[0.86, 1.24, 0.7],
-        pose=[0.19 - 0.86 / 2, 0.525, -0.35, *unit_quat],
-        color=[2, 48, 117],
+    # PATCH: minimal workspace — single far-away ceiling so cuRobo has at least one obstacle
+    # to satisfy its sphere-collision init (it errors on empty obstacles).
+    ceiling = Cuboid(
+        "ceiling",
+        dims=[3.0, 3.0, 0.05],
+        pose=[0.0, 0.0, 1.50, *unit_quat],
+        color=[200, 200, 200],
     )
-    nishanth = Cuboid(
-        "nishanth",
-        dims=[2.5, 0.25, 1.8],
-        pose=[-0.25, -0.55, 0.0, *unit_quat],
-        color=[255, 0, 255],
-    )
-    ipad = Cuboid(
-        "ipad",
-        dims=[0.25, 0.3, 0.2],
-        pose=[0.05, 0.25, 0.1, *unit_quat],
-        color=[255, 0, 0],
-    )
-    camera = Cuboid(
-        name="camera",
-        dims=[0.36, 0.2, 0.76],
-        pose=[0.0, 0.525, 0.76 / 2, *unit_quat],
-        color=[0, 87, 217],
-    )
-    obstacles = (vention_table, camera, nishanth, ipad)
-    return obstacles
+    return (ceiling,)
 
 
 def ur5_workspace() -> tuple[Cuboid, ...]:

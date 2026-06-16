@@ -1,3 +1,4 @@
+import logging
 from typing import Awaitable, Callable, Protocol
 
 import aiohttp
@@ -15,6 +16,8 @@ from tiptop.perception.cameras.zed_camera import (
     ZedFrame,
     zed_infer_depth_async,
 )
+
+_log = logging.getLogger(__name__)
 
 # Callable that takes an aiohttp session and a camera frame and returns a float depth map (H, W) in metres.
 DepthEstimator = Callable[[aiohttp.ClientSession, Frame], Awaitable[np.ndarray]]
@@ -80,3 +83,26 @@ def get_external_camera() -> Camera:
         return RealsenseCamera(str(cam_cfg.serial))
     else:
         raise ValueError(f"Unknown camera type: {cam_type}")
+
+
+def get_external_camera_2() -> Camera | None:
+    """Get the optional second external camera (DROID exterior_2).
+
+    Returns None if no ``cameras.external_2`` is configured or the camera can't be
+    opened (e.g. not connected), so single-exterior rigs keep working unchanged.
+    """
+    cfg = tiptop_cfg()
+    cam_cfg = cfg.cameras.get("external_2")
+    if cam_cfg is None:
+        return None
+    cam_type = cam_cfg.type
+    try:
+        if cam_type == "zed":
+            return _get_zed_camera(cam_cfg)
+        elif cam_type == "realsense":
+            return RealsenseCamera(str(cam_cfg.serial))
+        else:
+            raise ValueError(f"Unknown camera type: {cam_type}")
+    except Exception as e:
+        _log.warning(f"Second external camera (s/n {cam_cfg.get('serial')}) unavailable ({e}); skipping exterior_2")
+        return None

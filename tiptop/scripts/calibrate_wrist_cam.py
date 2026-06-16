@@ -1,6 +1,7 @@
 """Modified from DROID repo: https://github.com/droid-dataset/droid"""
 
 import logging
+import os
 import time
 from collections import defaultdict
 
@@ -22,6 +23,10 @@ from tiptop.perception.cameras.rs_camera import RealsenseIntrinsics
 from tiptop.perception.cameras.zed_camera import ZedIntrinsics
 from tiptop.utils import get_robot_client, setup_logging
 from tiptop.workspace import workspace_cuboids
+
+# Set TIPTOP_CALIB_VIZ=1 to show the live OpenCV windows + interactive 'y'/'n' prompt.
+# Default is headless (no cv2.imshow), so automated/SSH runs are unchanged.
+_VIZ = os.environ.get("TIPTOP_CALIB_VIZ", "0") == "1"
 
 # Charuco Board Params #
 CHARUCOBOARD_ROWCOUNT = SQUARES_Y = 9
@@ -290,7 +295,8 @@ class CharucoDetector:
 
         if readings is None:
             if visualize:
-                cv2.imshow("Charuco board: {0}".format(cam_id), image)
+                if _VIZ:
+                    cv2.imshow("Charuco board: {0}".format(cam_id), image)
                 cv2.waitKey(20)
             return image
 
@@ -332,7 +338,8 @@ class CharucoDetector:
 
         # Visualize
         if visualize:
-            cv2.imshow("Charuco board: {0}".format(cam_id), image)
+            if _VIZ:
+                cv2.imshow("Charuco board: {0}".format(cam_id), image)
             cv2.waitKey(20)
 
         return image
@@ -524,29 +531,37 @@ def calibrate_wrist_camera():
     motion_gen = get_motion_gen(world_cfg, collision_activation_distance=0.01, warmup_iters=4)
     plan_config = MotionGenPlanConfig(time_dilation_factor=0.4)
 
-    # Visualize the camera feed
-    while True:
+    if _VIZ:
+        # Visualize the camera feed; move the robot so the board is visible, then press 'y'.
+        while True:
+            frame = cam.read_camera()
+            viz_img = frame.bgr
+            viz_img = calibrator.augment_image(cam_id=cam_id, image=viz_img)
+            viz_img = cv2.putText(
+                viz_img,
+                "Move robot s.t. calibration board is visible.",
+                (15, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 0),
+                2,
+            )
+            viz_img = cv2.putText(
+                viz_img, "Press 'y' to continue, 'n' to exit", (15, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2
+            )
+            cv2.imshow("Calibration View", viz_img)
+            key = cv2.waitKey(1)
+            if key == ord("y"):
+                break
+            elif key == ord("n"):
+                return
+    else:
+        # PATCH: headless mode — skip the manual 'y' prompt, just capture one frame as detection check
+        import time as _time
+        _log.info('HEADLESS: skipping cv2.imshow; auto-continuing in 3s')
+        _time.sleep(3)
         frame = cam.read_camera()
-        viz_img = frame.bgr
-        viz_img = calibrator.augment_image(cam_id=cam_id, image=viz_img)
-        viz_img = cv2.putText(
-            viz_img,
-            "Move robot s.t. calibration board is visible.",
-            (15, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 255, 0),
-            2,
-        )
-        viz_img = cv2.putText(
-            viz_img, "Press 'y' to continue, 'n' to exit", (15, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2
-        )
-        cv2.imshow("Calibration View", viz_img)
-        key = cv2.waitKey(1)
-        if key == ord("y"):
-            break
-        elif key == ord("n"):
-            return
+        calibrator.augment_image(cam_id=cam_id, image=frame.bgr)
 
     def get_q_curr() -> Float[torch.Tensor, "d"]:
         _q_curr = client.get_joint_positions()
@@ -623,7 +638,8 @@ def calibrate_wrist_camera():
             (0, 255, 0),
             2,
         )
-        cv2.imshow("Calibration View", augmented_image)
+        if _VIZ:
+            cv2.imshow("Calibration View", augmented_image)
         cv2.waitKey(1)
 
         # Check if cycle is complete
