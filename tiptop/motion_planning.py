@@ -73,12 +73,63 @@ def get_ik_solver(world_cfg: WorldConfig, num_particles: int, warmup_iters: int 
     return ik_solver
 
 
+def apply_cost_overrides(cost: dict, overrides: dict | None) -> None:
+    """Mutate a gradient-trajopt ``cost`` dict in place with UI overrides (if present).
+
+    Single source of truth for how UI knobs map onto gradient_trajopt.yml cost weights,
+    used both to build MotionGen (get_motion_gen) and to summarize the config for saving
+    (summarize_curobo_config), so the recorded config always matches what was applied.
+    """
+    if not overrides:
+        return
+    if overrides.get("uniform_velocity_weight") is not None:
+        cost["uniform_velocity_cfg"]["weight"] = float(overrides["uniform_velocity_weight"])
+    for idx, val in (overrides.get("smooth_weight") or {}).items():
+        cost["bound_cfg"]["smooth_weight"][int(idx)] = float(val)
+    if overrides.get("primitive_collision_activation_distance") is not None:
+        cost["primitive_collision_cfg"]["activation_distance"] = float(
+            overrides["primitive_collision_activation_distance"]
+        )
+    if overrides.get("self_collision_weight") is not None:
+        cost["self_collision_cfg"]["weight"] = float(overrides["self_collision_weight"])
+    if overrides.get("cspace_weight") is not None:
+        cost["cspace_cfg"]["weight"] = float(overrides["cspace_weight"])
+
+
+def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dict:
+    """Resolved cuRobo trajopt config used for a plan, for saving with each run.
+
+    Loads gradient_trajopt.yml (the deciding phase here), applies the same overrides
+    used at build time, and returns a compact, JSON-serializable summary.
+    """
+    import copy
+
+    from curobo.util_file import get_task_configs_path, join_path, load_yaml
+
+    grad = copy.deepcopy(load_yaml(join_path(get_task_configs_path(), "gradient_trajopt.yml")))
+    apply_cost_overrides(grad["cost"], overrides or {})
+    c = grad["cost"]
+    return {
+        "source_yaml": "gradient_trajopt.yml",
+        "overrides": overrides or {},
+        "resolved": {
+            "uniform_velocity_weight": c["uniform_velocity_cfg"]["weight"],
+            "bound_smooth_weight": c["bound_cfg"]["smooth_weight"],
+            "self_collision_weight": c["self_collision_cfg"]["weight"],
+            "cspace_weight": c["cspace_cfg"]["weight"],
+            "primitive_collision_activation_distance": c["primitive_collision_cfg"]["activation_distance"],
+        },
+        "plan_overrides": {"enable_finetune_trajopt": False, "time_dilation_factor": time_dilation_factor},
+    }
+
+
 def get_motion_gen(
     world_cfg: WorldConfig,
     collision_activation_distance: float,
     num_spheres: int | None = None,
     warmup_iters: int = 16,
     use_cuda_graph: bool = True,
+    cost_overrides: dict | None = None,
 ):
     """Get the motion generator and warm it up.
 
@@ -111,6 +162,21 @@ def get_motion_gen(
         robot_cfg["robot_cfg"]["kinematics"]["extra_collision_spheres"]["attached_object"] = num_spheres
         _log.debug(f"Setting number of spheres for attachments to {num_spheres}")
 
+    # Apply UI cuRobo cost overrides by substituting a modified gradient-trajopt config DICT
+    # for the gradient_trajopt_file kwarg (a non-str passes straight through cuRobo's
+    # load_yaml). This bakes weights in at build time — no runtime cost re-enable bug, no
+    # cuda-graph staleness — and targets the GRADIENT phase, which decides here because
+    # cuTAMP plans with enable_finetune_trajopt=False.
+    grad_file = "gradient_trajopt.yml"
+    if cost_overrides:
+        import copy
+
+        from curobo.util_file import get_task_configs_path, join_path, load_yaml
+
+        grad_cfg = copy.deepcopy(load_yaml(join_path(get_task_configs_path(), "gradient_trajopt.yml")))
+        apply_cost_overrides(grad_cfg["cost"], cost_overrides)
+        grad_file = grad_cfg  # dict, not str
+
     with patch_log_level("curobo", logging.ERROR):
         motion_gen_cfg = MotionGenConfig.load_from_robot_config(
             robot_cfg=robot_cfg,
@@ -119,6 +185,7 @@ def get_motion_gen(
             collision_activation_distance=collision_activation_distance,
             position_threshold=0.01,
             rotation_threshold=0.1,
+            gradient_trajopt_file=grad_file,
         )
         motion_gen = MotionGen(motion_gen_cfg)
 
@@ -140,6 +207,7 @@ def build_curobo_solvers(
     num_spheres: int,
     collision_activation_distance: float = 0.0,
     include_workspace: bool = True,
+    cost_overrides: dict | None = None,
 ) -> tuple:
     """Build and warm up the IK solver and motion generator.
 
@@ -169,7 +237,7 @@ def build_curobo_solvers(
     # Disabling graphs lets the cache grow, and also avoids a CUDA-graph driver crash (see README).
     motion_gen = get_motion_gen(
         world_cfg, collision_activation_distance=collision_activation_distance, num_spheres=num_spheres,
-        use_cuda_graph=False,
+        use_cuda_graph=False, cost_overrides=cost_overrides,
     )
     return ik_solver, motion_gen, world_cfg
 

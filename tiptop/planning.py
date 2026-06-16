@@ -37,6 +37,8 @@ def load_tiptop_plan(path: Path) -> dict:
         if step["type"] == "trajectory":
             step["positions"] = np.array(step["positions"], dtype=np.float32)
             step["velocities"] = np.array(step["velocities"], dtype=np.float32)
+            if "cost" in step:  # optional, schema >= 1.1.0
+                step["cost"] = {k: np.array(v, dtype=np.float32) for k, v in step["cost"].items()}
     return plan
 
 
@@ -124,6 +126,25 @@ def run_planning(
     return cutamp_plan, elapsed, failure_reason
 
 
+def _per_timestep_cost(velocity) -> dict:
+    """Per-timestep trajectory-cost arrays for plotting / validation.
+
+    Derived from the joint velocities of a single trajectory segment. Mirrors the
+    cuRobo ``UniformVelocityCost``: squared joint speed ``e_t = sum_dof(v_t**2)``, its
+    squared deviation from the per-segment (trajopt-horizon) mean ``(e_t - mean_t e)**2``,
+    and the joint speed ``||v_t||``. The mean is taken over the segment to match how
+    cuRobo computes the cost per trajopt horizon. ``velocity`` is a torch tensor [T, dof].
+    """
+    speed_sq = (velocity * velocity).sum(dim=-1)  # [T]
+    speed = speed_sq.sqrt()  # [T] joint speed ||v_t||
+    uniform_velocity = (speed_sq - speed_sq.mean()).square()  # [T] (cost shape, weight = 1)
+    return {
+        "speed": speed.cpu().numpy(),
+        "uniform_velocity": uniform_velocity.cpu().numpy(),
+        "dof_speed_sq": speed_sq.cpu().numpy(),
+    }
+
+
 def serialize_plan(cutamp_plan: list[dict], q_init: Float[np.ndarray, "d"]) -> dict:
     """Serialize a cuTAMP plan to a dict.
 
@@ -140,8 +161,9 @@ def serialize_plan(cutamp_plan: list[dict], q_init: Float[np.ndarray, "d"]) -> d
                     "positions": step["plan"].position.cpu().numpy(),
                     "velocities": step["plan"].velocity.cpu().numpy(),
                     "dt": step["dt"],
+                    "cost": _per_timestep_cost(step["plan"].velocity),
                 }
             )
         elif step["type"] == "gripper":
             steps.append({"type": "gripper", "label": step["label"], "action": step["action"]})
-    return {"version": "1.0.0", "q_init": q_init, "steps": steps}
+    return {"version": "1.1.0", "q_init": q_init, "steps": steps}
