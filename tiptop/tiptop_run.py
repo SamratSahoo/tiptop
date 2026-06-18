@@ -138,27 +138,30 @@ def get_demo_container(
     # Setup cameras
     cam = get_hand_camera()
     external_cam = get_external_camera()
-    # Second exterior camera (DROID exterior_2). Required when recording; None only if its
-    # config is absent (deliberate 2-camera setup) or it failed to open.
+    # Second exterior camera (DROID exterior_2). None if its config is commented out
+    # (deliberate 2-camera setup) or if a configured camera failed to open.
     external_cam_2 = get_external_camera_2()
     ee_from_cam = load_calibration(cam.serial)
 
-    # Recording needs all three ZED cameras (hand + two exteriors). Fail fast here, before any
-    # rollout, so we never silently collect data missing a camera.
+    # Recording needs every camera that is configured (uncommented) in tiptop.yml. Fail fast
+    # here, before any rollout, so we never silently collect data missing a configured camera.
     if enable_recording:
         if not isinstance(cam, ZedCamera):
             raise NotImplementedError(f"Recording requires a ZED hand camera, got {type(cam).__name__}")
         if not isinstance(external_cam, ZedCamera):
             raise NotImplementedError(f"Recording requires a ZED external camera, got {type(external_cam).__name__}")
-        if not isinstance(external_cam_2, ZedCamera):
+        # external_2 is only required when it's uncommented in tiptop.yml. If it's configured but
+        # failed to open, abort; if it's commented out, record with the two remaining cameras.
+        external_2_configured = tiptop_cfg().cameras.get("external_2") is not None
+        if external_2_configured and not isinstance(external_cam_2, ZedCamera):
             raise RuntimeError(
-                "Recording requires all 3 cameras, but the second external ZED "
-                "(cameras.external_2, s/n 31425515) is unavailable "
+                "Recording requires the configured second external ZED "
+                "(cameras.external_2, s/n 31425515), but it is unavailable "
                 f"(got {type(external_cam_2).__name__}). It most likely failed to open "
                 "(e.g. LOW USB BANDWIDTH) — lower the camera fps/resolution in tiptop.yml or move it "
                 "to another USB3 controller; check it is connected. Aborting before the run so no "
-                "rollout is collected with a missing camera. To intentionally run with two cameras, "
-                "comment out cameras.external_2 in tiptop.yml AND run with --no-enable-recording."
+                "rollout is collected with a missing camera. To intentionally record with two cameras, "
+                "comment out cameras.external_2 in tiptop.yml."
             )
 
     # Create depth estimator once — closed over camera intrinsics

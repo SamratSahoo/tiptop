@@ -37,14 +37,14 @@ cameras:
     resolution: HD720
     fps: 15
 
-  # Second external camera — recorded as DROID exterior_2. REQUIRED when recording: tiptop
-  # aborts at startup if it can't open, so no rollout is collected missing a camera. For a
-  # deliberate 2-camera setup, comment this out AND run with --no-enable-recording.
-  external_2:
-    serial: "31425515"
-    type: zed
-    resolution: HD720
-    fps: 15
+  # Second external camera — recorded as DROID exterior_2. Only required when uncommented:
+  # tiptop aborts at startup if a configured camera can't open, so no rollout is collected
+  # missing a camera. For a deliberate 2-camera setup, just leave this commented out.
+  # external_2:
+  #   serial: "31425515"
+  #   type: zed
+  #   resolution: HD720
+  #   fps: 15
 
 perception:
   foundation_stereo:
