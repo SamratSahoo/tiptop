@@ -497,7 +497,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/widgetsnbextension-4.0.15-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-3.23.0-pyhcf101f3_1.conda
       - pypi: .
-      - pypi: git+https://github.com/facebookresearch/segment-anything-2.git#2b90b9f5ceec907a1c18123530e92e794ad901a4
+      - pypi: git+https://github.com/facebookresearch/segment-anything-2#2b90b9f5ceec907a1c18123530e92e794ad901a4
       - pypi: https://files.pythonhosted.org/packages/04/4b/29cac41a4d98d144bf5f6d33995617b185d14b22401f75ca86f384e87ff1/h11-0.16.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/04/96/92447566d16df59b2a776c0fb82dbc4d9e07cd95062562af01e408583fc4/itsdangerous-2.2.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/07/6c/aa3f2f849e01cb6a001cd8554a88d4c77c5c1a31c95bdf1cf9301e6d9ef4/defusedxml-0.7.1-py2.py3-none-any.whl
@@ -7399,7 +7399,7 @@ packages:
   - supervision>=0.17.0
   - tyro
   - websockets>=12.0
-  - sam-2 @ git+https://github.com/facebookresearch/segment-anything-2.git
+  - sam-2 @ git+https://github.com/facebookresearch/segment-anything-2
   - ur-rtde ; extra == 'ur5'
   - fastapi ; extra == 'sam-server'
   - pydantic ; extra == 'sam-server'
@@ -7409,7 +7409,7 @@ packages:
   - pre-commit ; extra == 'dev'
   - ruff ; extra == 'dev'
   requires_python: '>=3.10'
-- pypi: git+https://github.com/facebookresearch/segment-anything-2.git#2b90b9f5ceec907a1c18123530e92e794ad901a4
+- pypi: git+https://github.com/facebookresearch/segment-anything-2#2b90b9f5ceec907a1c18123530e92e794ad901a4
   name: sam-2
   version: '1.0'
   requires_dist:
