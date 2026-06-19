@@ -5,6 +5,26 @@ Runs on the NUC where polymetis is local (gRPC 50051). Listens on:
   gripper_port (5559): open_gripper, close_gripper (Robotiq 2F-85 via /dev/ttyUSB0)
 
 Wire format mirrors bamboo-franka-client 0.1.1 (msgpack-encoded REQ/REP).
+
+----------------------------------------------------------------------------------
+FIX (gripper proprioception): RobotiqDriver._read_status() previously read the gripper
+position as `r.registers[1] & 0xFF`. That byte is **gPR** (the Position *Request* echo =
+the last commanded target), NOT the actual position. So `width` always reported exactly
+the commanded value (0.085 open / 0.000 closed) even while holding an object -- useless as
+proprioception. The actual measured position **gPO** is the high byte of register 2.
+
+Robotiq 2F-85 input/status block at 0x07D0 (3 x 16-bit regs, big-endian bytes):
+  registers[0] = [ GRIPPER STATUS (gACT/gGTO/gSTA/gOBJ) | reserved ]
+  registers[1] = [ gFLT                                  | gPR  (commanded echo) ]
+  registers[2] = [ gPO  (ACTUAL position)                | gCU  (motor current)  ]
+
+Changed: gPO now reads (r.registers[2] >> 8) & 0xFF, and gCU (current) is also exposed.
+
+Two unrelated corrections vs. the previous file (these were syntax/name errors that would
+stop the file importing/running -- likely copy artifacts; verify against your copy):
+  * `_gripper_handler` open_gripper: the `try:` was under-indented -> fixed.
+  * `start_joint_velocity`: `_torch.flt32` -> `_torch.float32`.
+----------------------------------------------------------------------------------
 """
 from __future__ import annotations
 import argparse, logging, os, sys, threading, time
@@ -89,12 +109,19 @@ class RobotiqDriver:
             try:
                 r = self.client.read_input_registers(0x07D0, 3, unit=self.slave)
                 if r is not None and not r.isError():
+                    # Robotiq input/status registers (big-endian bytes within each register):
+                    #   registers[0] = [ GRIPPER STATUS (high) | reserved (low) ]
+                    #   registers[1] = [ gFLT (high)           | gPR  (low)  ]  gPR = commanded echo
+                    #   registers[2] = [ gPO  (high)           | gCU  (low)  ]  gPO = ACTUAL position
                     return {
                         "gOBJ": (r.registers[0] >> 14) & 0x03,
                         "gSTA": (r.registers[0] >> 12) & 0x03,
                         "gGTO": (r.registers[0] >> 11) & 0x01,
                         "gACT": (r.registers[0] >> 8) & 0x01,
-                        "gPO":  r.registers[1] & 0xFF,   # current position (0-255)
+                        # FIX: actual position gPO is the HIGH byte of register 2 (byte 4),
+                        # NOT `registers[1] & 0xFF` (which is gPR, the commanded-position echo).
+                        "gPO":  (r.registers[2] >> 8) & 0xFF,   # actual position (0-255)
+                        "gCU":  r.registers[2] & 0xFF,          # motor current (0-255), ~0.1 units
                     }
             except Exception:
                 pass
@@ -146,11 +173,18 @@ class RobotiqDriver:
         return float(255 - max(0, min(255, int(pos)))) / 255.0 * 0.085
 
     def get_state(self) -> dict:
-        st = self._read_status() or {"gPO": 255, "gOBJ": 0, "gSTA": 0, "gACT": 0, "gGTO": 0}
-        width = self.pos_to_width(st["gPO"])
+        st = self._read_status() or {"gPO": 255, "gCU": 0, "gOBJ": 0, "gSTA": 0, "gACT": 0, "gGTO": 0}
+        width = self.pos_to_width(st["gPO"])  # now derived from the ACTUAL position (gPO)
         is_grasped = st["gOBJ"] in (1, 2)
         is_moving = st["gOBJ"] == 0 and st["gGTO"] == 1
-        return {"width": width, "is_grasped": is_grasped, "is_moving": is_moving}
+        # `current` is the motor current (~grasp force proxy); harmless extra field for clients
+        # that ignore it (e.g. bamboo client reads only width/is_grasped/is_moving).
+        return {
+            "width": width,
+            "is_grasped": is_grasped,
+            "is_moving": is_moving,
+            "current": float(st.get("gCU", 0)) * 0.1,
+        }
 
     def close(self):
         try:
@@ -255,6 +289,7 @@ def _control_handler(socket: zmq.Socket, robot, gripper, robotiq_only: bool):
             elif cmd == "start_joint_velocity":
                 try:
                     import torch as _torch
+                    # NOTE: corrected `_torch.flt32` -> `_torch.float32` (the former is not a valid dtype).
                     robot.start_joint_velocity_control(joint_vel_desired=_torch.zeros(7, dtype=_torch.float32))
                     resp = {"success": True}
                 except Exception as e:
@@ -350,6 +385,7 @@ def _gripper_handler(socket: zmq.Socket, gripper):
                             "width": float(st["width"]),
                             "is_grasped": bool(st["is_grasped"]),
                             "is_moving": bool(st["is_moving"]),
+                            "current": float(st.get("current", 0.0)),
                         },
                     }
                 except Exception as e:
