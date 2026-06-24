@@ -84,6 +84,18 @@ def apply_cost_overrides(cost: dict, overrides: dict | None) -> None:
         return
     if overrides.get("uniform_velocity_weight") is not None:
         cost["uniform_velocity_cfg"]["weight"] = float(overrides["uniform_velocity_weight"])
+    # VAE motion-manifold cost (see curobo cost/vae_manifold_cost.py). The block may be
+    # absent on older configs, so create it on demand when an override is provided.
+    if any(overrides.get(k) is not None for k in
+           ("vae_manifold_weight", "vae_manifold_mode", "vae_manifold_target")):
+        vm = cost.setdefault("vae_manifold_cfg", {"weight": 0.0, "mode": "kl_hinge",
+                                                  "n_joints": 7, "source_dt": 0.15})
+        if overrides.get("vae_manifold_weight") is not None:
+            vm["weight"] = float(overrides["vae_manifold_weight"])
+        if overrides.get("vae_manifold_mode") is not None:
+            vm["mode"] = str(overrides["vae_manifold_mode"])
+        if overrides.get("vae_manifold_target") is not None:
+            vm["target"] = float(overrides["vae_manifold_target"])
     for idx, val in (overrides.get("smooth_weight") or {}).items():
         cost["bound_cfg"]["smooth_weight"][int(idx)] = float(val)
     if overrides.get("primitive_collision_activation_distance") is not None:
@@ -114,6 +126,9 @@ def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dic
         "overrides": overrides or {},
         "resolved": {
             "uniform_velocity_weight": c["uniform_velocity_cfg"]["weight"],
+            "vae_manifold_weight": c.get("vae_manifold_cfg", {}).get("weight", 0.0),
+            "vae_manifold_mode": c.get("vae_manifold_cfg", {}).get("mode"),
+            "vae_manifold_target": c.get("vae_manifold_cfg", {}).get("target"),
             "bound_smooth_weight": c["bound_cfg"]["smooth_weight"],
             "self_collision_weight": c["self_collision_cfg"]["weight"],
             "cspace_weight": c["cspace_cfg"]["weight"],

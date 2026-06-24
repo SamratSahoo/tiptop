@@ -126,7 +126,7 @@ def run_planning(
     return cutamp_plan, elapsed, failure_reason
 
 
-def _per_timestep_cost(velocity) -> dict:
+def _per_timestep_cost(velocity, position=None, dt=None, vae_cfg=None) -> dict:
     """Per-timestep trajectory-cost arrays for plotting / validation.
 
     Derived from the joint velocities of a single trajectory segment. Mirrors the
@@ -134,22 +134,57 @@ def _per_timestep_cost(velocity) -> dict:
     squared deviation from the per-segment (trajopt-horizon) mean ``(e_t - mean_t e)**2``,
     and the joint speed ``||v_t||``. The mean is taken over the segment to match how
     cuRobo computes the cost per trajopt horizon. ``velocity`` is a torch tensor [T, dof].
+
+    When ``position`` (torch tensor [T, dof]) + ``dt`` are given and ``vae_cfg`` is set,
+    also emits the per-timestep VAE motion-manifold cost (weight = 1), computed with the
+    SAME encoder/mode the trajopt used (see curobo cost/vae_manifold_cost.py). It is best
+    effort: if the VAE artifact is missing it is silently omitted so plotting still works.
     """
     speed_sq = (velocity * velocity).sum(dim=-1)  # [T]
     speed = speed_sq.sqrt()  # [T] joint speed ||v_t||
     uniform_velocity = (speed_sq - speed_sq.mean()).square()  # [T] (cost shape, weight = 1)
-    return {
+    out = {
         "speed": speed.cpu().numpy(),
         "uniform_velocity": uniform_velocity.cpu().numpy(),
         "dof_speed_sq": speed_sq.cpu().numpy(),
     }
+    if vae_cfg is not None and position is not None and dt is not None:
+        try:
+            from curobo.rollout.cost.vae_manifold_cost import (
+                DEFAULT_VAE_MANIFOLD_CKPT,
+                VALID_MODES,
+                trajectory_score_traces,
+            )
+
+            # Compute EVERY variant on each generated trajectory (encode once) so all of them can
+            # be compared, regardless of which (if any) variant was enforced during planning.
+            active = vae_cfg.get("mode", "kl_hinge")
+            tgt = vae_cfg.get("target")
+            traces = trajectory_score_traces(
+                position,
+                float(dt),
+                checkpoint_path=vae_cfg.get("checkpoint_path") or DEFAULT_VAE_MANIFOLD_CKPT,
+                modes=VALID_MODES,
+                target_overrides=({active: tgt} if tgt is not None else None),
+                n_joints=int(vae_cfg.get("n_joints", 7)),
+            )
+            for m, tr in traces.items():
+                out[f"vae_manifold_{m}"] = tr
+            if active in traces:  # generic key -> the enforced/selected variant (live single plot / back-compat)
+                out["vae_manifold"] = traces[active]
+        except Exception as exc:  # missing artifact / load error -> skip the traces
+            _log.warning(f"VAE-manifold cost traces skipped: {exc}")
+    return out
 
 
-def serialize_plan(cutamp_plan: list[dict], q_init: Float[np.ndarray, "d"]) -> dict:
+def serialize_plan(cutamp_plan: list[dict], q_init: Float[np.ndarray, "d"], vae_cfg: dict | None = None) -> dict:
     """Serialize a cuTAMP plan to a dict.
 
     Schema versioning follows semver: bump minor for new optional fields, major for breaking changes.
     If the schema changes, update load_tiptop_plan accordingly.
+
+    ``vae_cfg`` (optional) selects the VAE motion-manifold cost variant to record as a
+    per-timestep trace, e.g. ``{"mode": "kl_hinge", "target": None, "n_joints": 7}``.
     """
     steps = []
     for step in cutamp_plan:
@@ -161,9 +196,12 @@ def serialize_plan(cutamp_plan: list[dict], q_init: Float[np.ndarray, "d"]) -> d
                     "positions": step["plan"].position.cpu().numpy(),
                     "velocities": step["plan"].velocity.cpu().numpy(),
                     "dt": step["dt"],
-                    "cost": _per_timestep_cost(step["plan"].velocity),
+                    "cost": _per_timestep_cost(
+                        step["plan"].velocity, position=step["plan"].position,
+                        dt=step["dt"], vae_cfg=vae_cfg,
+                    ),
                 }
             )
         elif step["type"] == "gripper":
             steps.append({"type": "gripper", "label": step["label"], "action": step["action"]})
-    return {"version": "1.1.0", "q_init": q_init, "steps": steps}
+    return {"version": "1.2.0", "q_init": q_init, "steps": steps}
