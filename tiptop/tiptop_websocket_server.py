@@ -54,6 +54,8 @@ class TiptopPlanningServer:
         max_planning_time: float = 60.0,
         rerun_mode: str = "disabled",
         include_workspace: bool = False,
+        overlap_perception: bool = True,
+        max_concurrent_perception: int = 8,
     ) -> None:
         if rerun_mode not in {"stream", "save", "disabled"}:
             raise ValueError(f"Invalid rerun mode: {rerun_mode}")
@@ -82,7 +84,17 @@ class TiptopPlanningServer:
             time_dilation_factor=self._cfg.robot.time_dilation_factor,
         )
         self._output_dir = Path("tiptop_server_outputs")
+        # Concurrency model. The slow part of a plan is I/O-bound perception (Gemini / SAM2 / M2T2
+        # over HTTP, ~4-7s); the cuRobo/GPU solve is only ~1.5s. Running multiple cuRobo solves
+        # concurrently (esp. across processes) trips a power transient on high-TDP GPUs, so we keep
+        # the GPU solve single-flight under _gpu_lock while letting concurrent requests overlap
+        # their perception. _perception_sem bounds that overlap so we don't stampede the Gemini API
+        # / M2T2 server. _pipeline_lock restores whole-pipeline serialization when overlap is off.
+        self._overlap_perception = overlap_perception
+        self._gpu_lock = asyncio.Lock()
         self._pipeline_lock = asyncio.Lock()
+        self._perception_sem = asyncio.Semaphore(max(1, max_concurrent_perception))
+        self._run_counter = 0
 
     def _reset_motion_planning(self) -> None:
         """Reset collision world to initial state to clear stale cached state between runs."""
@@ -140,10 +152,15 @@ class TiptopPlanningServer:
 
                 _log.info(f"Received planning request: task='{obs.get('task', 'unknown')}'")
 
-                # Serialize pipeline runs: shared cuRobo/GPU state is not safe for concurrent use.
+                # In overlap mode, concurrent requests interleave their I/O-bound perception and
+                # serialize only the GPU critical section inside _run_pipeline (_gpu_lock). With
+                # overlap disabled, fall back to serializing the whole pipeline (legacy behavior).
                 infer_start = time.monotonic()
-                async with self._pipeline_lock:
+                if self._overlap_perception:
                     result = await self._run_pipeline(obs)
+                else:
+                    async with self._pipeline_lock:
+                        result = await self._run_pipeline(obs)
                 infer_time = time.monotonic() - infer_start
 
                 # Add timing info
@@ -188,7 +205,11 @@ class TiptopPlanningServer:
                 - save_dir: absolute path to the per-run output directory (logs, metadata, plan, rerun .rrd)
         """
         now = datetime.now()
-        timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
+        # Unique per-run suffix: with overlap on, concurrent requests can share the same wall-clock
+        # second, and a second-resolution directory name would collide (clobbering each other's
+        # outputs). The counter increments on the single event-loop thread, so it's race-free.
+        self._run_counter += 1
+        timestamp = f"{now.strftime('%Y-%m-%d_%H-%M-%S')}_{self._run_counter:04d}"
         iso_timestamp = now.isoformat(timespec="seconds")
         save_dir = self._output_dir / timestamp
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -204,9 +225,6 @@ class TiptopPlanningServer:
         failure_reason = None
         cutamp_plan = None
         try:
-            # Reset collision world to clear stale cuTAMP state from previous run
-            self._reset_motion_planning()
-
             # Extract and preprocess observation
             rgb = obs["rgb"].astype(np.uint8)
             depth = obs["depth"].copy().astype(np.float32)
@@ -238,18 +256,21 @@ class TiptopPlanningServer:
 
             connector = aiohttp.TCPConnector(limit=10, force_close=True)
             timeout = aiohttp.ClientTimeout(total=120.0)
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                perception_start = time.monotonic()
-                env, all_surfaces, processed_scene, grounded_atoms = await run_perception(
-                    session,
-                    observation,
-                    task_instruction,
-                    save_dir,
-                    depth_estimator=None,
-                    gripper_mask=None,
-                    include_workspace=self._include_workspace,
-                )
-                perception_duration = time.monotonic() - perception_start
+            # Bound how many perceptions run at once so concurrent requests don't stampede the
+            # Gemini API / M2T2 server; the cuRobo solve is serialized separately below.
+            async with self._perception_sem:
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                    perception_start = time.monotonic()
+                    env, all_surfaces, processed_scene, grounded_atoms = await run_perception(
+                        session,
+                        observation,
+                        task_instruction,
+                        save_dir,
+                        depth_estimator=None,
+                        gripper_mask=None,
+                        include_workspace=self._include_workspace,
+                    )
+                    perception_duration = time.monotonic() - perception_start
             # Log camera intrinsics and pose to rerun if enabled
             if self._rerun_mode != "disabled":
                 rr.log("cam", rr.Pinhole(image_from_camera=K))
@@ -258,18 +279,24 @@ class TiptopPlanningServer:
                     rr.Transform3D(translation=world_from_cam[:3, 3], mat3x3=world_from_cam[:3, :3], axis_length=0.05),
                 )
 
-            # Run cuTAMP planning
+            # Run cuTAMP planning. Serialize the GPU critical section (collision-world reset + the
+            # cuRobo solve) under _gpu_lock: concurrent cuRobo replays are what trip the power
+            # transient, so GPU work stays single-flight in this process even while other requests'
+            # perception overlaps. The reset clears stale cuTAMP world state from the previous solve
+            # and must stay paired with the solve under the same lock.
             _log.info("Running cuTAMP planning...")
-            cutamp_plan, planning_duration, failure_reason = await asyncio.to_thread(
-                run_planning,
-                env,
-                self._config,
-                q_init,
-                self._ik_solver,
-                processed_scene.grasps,
-                self._motion_gen,
-                all_surfaces,
-            )
+            async with self._gpu_lock:
+                self._reset_motion_planning()
+                cutamp_plan, planning_duration, failure_reason = await asyncio.to_thread(
+                    run_planning,
+                    env,
+                    self._config,
+                    q_init,
+                    self._ik_solver,
+                    processed_scene.grasps,
+                    self._motion_gen,
+                    all_surfaces,
+                )
 
             if cutamp_plan is None:
                 return {
@@ -327,6 +354,8 @@ def _run_server(
     max_planning_time: float = 60.0,
     rerun_mode: str = "disabled",
     include_workspace: bool = False,
+    overlap_perception: bool = True,
+    max_concurrent_perception: int = 8,
 ) -> None:
     """Tiptop websocket planning server.
 
@@ -337,6 +366,12 @@ def _run_server(
         max_planning_time: Max planning time in seconds.
         rerun_mode: Rerun visualization mode. 'stream' spawns the Rerun viewer; 'save' writes .rrd files to disk; 'disabled' skips all Rerun logging.
         include_workspace: If True, include real-robot workspace cuboids in the collision world.
+        overlap_perception: If True (default), concurrent planning requests overlap their I/O-bound
+            perception while the cuRobo/GPU solve stays serialized; lets one server feed many
+            parallel sim envs without running concurrent cuRobo (the cause of GPU power-transient
+            crashes). Set False to serialize the whole pipeline (legacy single-flight behavior).
+        max_concurrent_perception: Max perceptions running at once when overlap is on; bounds load
+            on the Gemini API / M2T2 grasp server.
     """
     print_tiptop_banner()
     check_cutamp_version()
@@ -350,6 +385,8 @@ def _run_server(
         max_planning_time=max_planning_time,
         rerun_mode=rerun_mode,
         include_workspace=include_workspace,
+        overlap_perception=overlap_perception,
+        max_concurrent_perception=max_concurrent_perception,
     )
     exit_code = 1
     try:

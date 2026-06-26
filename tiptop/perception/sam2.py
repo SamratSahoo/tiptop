@@ -4,7 +4,7 @@ import base64
 import io
 import logging
 import os
-from functools import cache
+import threading
 
 import numpy as np
 import requests
@@ -49,16 +49,34 @@ def download_sam2_checkpoint(model_name: str = "sam2.1_hiera_large.pt") -> str:
     return dest_path
 
 
-@cache
-def _sam2_predictor(checkpoint: str, device: str):
-    """Load and cache the SAM2 image predictor."""
-    from sam2.build_sam import build_sam2
-    from sam2.sam2_image_predictor import SAM2ImagePredictor
+# Module-level singleton cache for the SAM2 predictor, guarded by a lock. functools.cache is NOT
+# safe here: on a cold cache, concurrent callers (overlapping perception requests dispatched via
+# asyncio.to_thread) all run the body at once and race inside torch.jit.script when building
+# SAM2Transforms -> "Can't redefine method: forward on class ...torchvision...Resize".
+_sam2_predictor_cache: dict[tuple[str, str], object] = {}
+_sam2_build_lock = threading.Lock()
+# The SAM2 predictor is stateful (set_image stores per-image features that predict() reads), so a
+# single shared instance can't run set_image/predict from two threads at once. Serialize inference.
+_sam2_infer_lock = threading.Lock()
 
-    config = os.environ.get("SAM2_CONFIG", "configs/sam2.1/sam2.1_hiera_l.yaml")
-    _log.info(f"Loading SAM2 with checkpoint={checkpoint}, config={config}, device={device}")
-    predictor = SAM2ImagePredictor(build_sam2(config, checkpoint, device=device))
-    _log.info("Successfully loaded SAM2")
+
+def _sam2_predictor(checkpoint: str, device: str):
+    """Load and cache the SAM2 image predictor (thread-safe, built exactly once)."""
+    key = (checkpoint, device)
+    predictor = _sam2_predictor_cache.get(key)
+    if predictor is not None:
+        return predictor
+    with _sam2_build_lock:
+        predictor = _sam2_predictor_cache.get(key)  # re-check: another thread may have built it
+        if predictor is None:
+            from sam2.build_sam import build_sam2
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+            config = os.environ.get("SAM2_CONFIG", "configs/sam2.1/sam2.1_hiera_l.yaml")
+            _log.info(f"Loading SAM2 with checkpoint={checkpoint}, config={config}, device={device}")
+            predictor = SAM2ImagePredictor(build_sam2(config, checkpoint, device=device))
+            _sam2_predictor_cache[key] = predictor
+            _log.info("Successfully loaded SAM2")
     return predictor
 
 
@@ -66,13 +84,15 @@ def _segment_local(image: Image.Image, boxes: np.ndarray, checkpoint: str) -> tu
     """Run SAM2 segmentation locally."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     predictor = _sam2_predictor(checkpoint, device)
-    predictor.set_image(image)
-    masks, scores, _ = predictor.predict(
-        point_coords=None,
-        point_labels=None,
-        box=boxes,
-        multimask_output=False,
-    )
+    # Shared stateful predictor: set_image + predict must be atomic across concurrent requests.
+    with _sam2_infer_lock:
+        predictor.set_image(image)
+        masks, scores, _ = predictor.predict(
+            point_coords=None,
+            point_labels=None,
+            box=boxes,
+            multimask_output=False,
+        )
     return masks, scores
 
 

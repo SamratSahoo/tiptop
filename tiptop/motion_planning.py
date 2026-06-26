@@ -100,6 +100,56 @@ def apply_cost_overrides(cost: dict, overrides: dict | None) -> None:
         cost["self_collision_cfg"]["weight"] = float(overrides["self_collision_weight"])
     if overrides.get("cspace_weight") is not None:
         cost["cspace_cfg"]["weight"] = float(overrides["cspace_weight"])
+    # bound_cfg vector knobs — per-index dicts like smooth_weight (idx -> value), for the
+    # [position, velocity, acceleration, jerk] limit-violation weights and activation margins.
+    for idx, val in (overrides.get("bound_weight") or {}).items():
+        cost["bound_cfg"]["weight"][int(idx)] = float(val)
+    for idx, val in (overrides.get("bound_activation_distance") or {}).items():
+        cost["bound_cfg"]["activation_distance"][int(idx)] = float(val)
+    if overrides.get("run_weight_acceleration") is not None:
+        cost["bound_cfg"]["run_weight_acceleration"] = float(overrides["run_weight_acceleration"])
+    if overrides.get("run_weight_jerk") is not None:
+        cost["bound_cfg"]["run_weight_jerk"] = float(overrides["run_weight_jerk"])
+    # pose_cfg knobs — the EE goal-pose cost. weight is [terminal-orient, terminal-pos,
+    # run-orient, run-pos]; run_vec_weight is a single scalar applied to all 6 running components.
+    for idx, val in (overrides.get("pose_weight") or {}).items():
+        cost["pose_cfg"]["weight"][int(idx)] = float(val)
+    if overrides.get("run_vec_weight") is not None:
+        cost["pose_cfg"]["run_vec_weight"] = [float(overrides["run_vec_weight"])] * 6
+
+
+def apply_model_overrides(model: dict, overrides: dict | None) -> None:
+    """Mutate a gradient-trajopt ``model`` dict in place with UI overrides (if present).
+
+    Companion to apply_cost_overrides for the non-cost trajopt knobs that live under
+    gradient_trajopt.yml's ``model`` section (horizon, trajopt timestep). The horizon and dt
+    must ALSO be passed to MotionGenConfig.load_from_robot_config (trajopt_tsteps/trajopt_dt),
+    since those kwargs have non-None defaults that otherwise win — get_motion_gen does that.
+    """
+    if not overrides:
+        return
+    if overrides.get("horizon") is not None:
+        model["horizon"] = int(overrides["horizon"])
+    if overrides.get("base_dt") is not None:
+        # base_dt is the trajopt timestep; keep max_dt equal to it (as in the YAML) so the whole
+        # optimization runs at the requested resolution rather than the default 0.15 ceiling.
+        dt = float(overrides["base_dt"])
+        model["dt_traj_params"]["base_dt"] = dt
+        model["dt_traj_params"]["max_dt"] = dt
+
+
+def _scale_kwargs(overrides: dict | None, n_cspace_joints: int) -> dict:
+    """Joint-limit scale kwargs for MotionGenConfig.load_from_robot_config, pulled from overrides.
+
+    cuRobo broadcasts a 1-element list to shape (n, 1) (a latent bug), so we always pass a
+    full per-joint list of length ``n_cspace_joints`` — that hits cuRobo's List branch and also
+    keeps its feasibility maximum_trajectory_dt handling for scales < 1.0.
+    """
+    kw = {}
+    for key in ("velocity_scale", "acceleration_scale", "jerk_scale"):
+        if (overrides or {}).get(key) is not None:
+            kw[key] = [float(overrides[key])] * n_cspace_joints
+    return kw
 
 
 def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dict:
@@ -114,17 +164,34 @@ def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dic
 
     grad = copy.deepcopy(load_yaml(join_path(get_task_configs_path(), "gradient_trajopt.yml")))
     apply_cost_overrides(grad["cost"], overrides or {})
-    c = grad["cost"]
+    apply_model_overrides(grad["model"], overrides or {})
+    c, m = grad["cost"], grad["model"]
+    ov = overrides or {}
     return {
         "source_yaml": "gradient_trajopt.yml",
-        "overrides": overrides or {},
+        "overrides": ov,
         "resolved": {
             "uniform_velocity_weight": c["uniform_velocity_cfg"]["weight"],
             "vae_manifold_weight": c.get("vae_manifold_cfg", {}).get("weight", 0.0),
             "bound_smooth_weight": c["bound_cfg"]["smooth_weight"],
+            "bound_weight": c["bound_cfg"]["weight"],
+            "bound_activation_distance": c["bound_cfg"]["activation_distance"],
+            "run_weight_acceleration": c["bound_cfg"]["run_weight_acceleration"],
+            "run_weight_jerk": c["bound_cfg"]["run_weight_jerk"],
+            "pose_weight": c["pose_cfg"]["weight"],
+            "pose_run_vec_weight": c["pose_cfg"]["run_vec_weight"],
             "self_collision_weight": c["self_collision_cfg"]["weight"],
             "cspace_weight": c["cspace_cfg"]["weight"],
             "primitive_collision_activation_distance": c["primitive_collision_cfg"]["activation_distance"],
+            "horizon": m["horizon"],
+            "base_dt": m["dt_traj_params"]["base_dt"],
+            # joint-limit scales aren't in gradient_trajopt.yml — echo the override (default 1.0).
+            "velocity_scale": ov.get("velocity_scale", 1.0),
+            "acceleration_scale": ov.get("acceleration_scale", 1.0),
+            "jerk_scale": ov.get("jerk_scale", 1.0),
+            # planning-time knobs (read by tiptop_gt_plan.py), echoed for a self-describing record.
+            "num_particles": ov.get("num_particles"),
+            "opt_steps_per_skeleton": ov.get("opt_steps_per_skeleton"),
         },
         "plan_overrides": {"enable_finetune_trajopt": False, "time_dilation_factor": time_dilation_factor},
     }
@@ -175,6 +242,7 @@ def get_motion_gen(
     # cuda-graph staleness — and targets the GRADIENT phase, which decides here because
     # cuTAMP plans with enable_finetune_trajopt=False.
     grad_file = "gradient_trajopt.yml"
+    extra_kwargs: dict = {}
     if cost_overrides:
         import copy
 
@@ -182,7 +250,20 @@ def get_motion_gen(
 
         grad_cfg = copy.deepcopy(load_yaml(join_path(get_task_configs_path(), "gradient_trajopt.yml")))
         apply_cost_overrides(grad_cfg["cost"], cost_overrides)
+        apply_model_overrides(grad_cfg["model"], cost_overrides)
         grad_file = grad_cfg  # dict, not str
+
+        # horizon and trajopt dt also have to be set as load_from_robot_config kwargs: its
+        # trajopt_tsteps default (32) and trajopt_dt fallback (max_trajectory_dt) otherwise win
+        # over the gradient_trajopt model dict. Joint-limit scales aren't in that dict at all.
+        n_cspace = len(robot_cfg["robot_cfg"]["kinematics"]["cspace"]["joint_names"])
+        extra_kwargs.update(_scale_kwargs(cost_overrides, n_cspace))
+        if cost_overrides.get("horizon") is not None:
+            extra_kwargs["trajopt_tsteps"] = int(cost_overrides["horizon"])
+        if cost_overrides.get("base_dt") is not None:
+            dt = float(cost_overrides["base_dt"])
+            extra_kwargs["trajopt_dt"] = dt
+            extra_kwargs["js_trajopt_dt"] = dt
 
     with patch_log_level("curobo", logging.ERROR):
         motion_gen_cfg = MotionGenConfig.load_from_robot_config(
@@ -193,6 +274,7 @@ def get_motion_gen(
             position_threshold=0.01,
             rotation_threshold=0.1,
             gradient_trajopt_file=grad_file,
+            **extra_kwargs,
         )
         motion_gen = MotionGen(motion_gen_cfg)
 
