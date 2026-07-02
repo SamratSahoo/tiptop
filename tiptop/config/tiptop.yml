@@ -53,7 +53,9 @@ perception:
     url: "http://localhost:1234"
 
   m2t2:
-    url: "http://localhost:8123"
+    # Port overridable per process via env (TIPTOP_M2T2_PORT) so multi-instance runs can each point
+    # at their own M2T2 server; defaults to 8123 (single-instance / full_eval). See datagen launcher.
+    url: "http://localhost:${oc.env:TIPTOP_M2T2_PORT,8123}"
     apply_bounds: true
 
   sam:
