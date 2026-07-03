@@ -30,7 +30,7 @@ from curobo.wrap.reacher.ik_solver import IKSolver
 from curobo.wrap.reacher.motion_gen import MotionGen
 
 from tiptop.config import tiptop_cfg
-from tiptop.motion_planning import build_curobo_solvers
+from tiptop.motion_planning import build_curobo_solvers, resolve_time_dilation_factor
 from tiptop.perception.cameras import Frame
 from tiptop.planning import build_tamp_config, run_planning, save_tiptop_plan, serialize_plan
 from tiptop.recording import save_run_metadata, save_run_outputs
@@ -38,6 +38,25 @@ from tiptop.tiptop_run import Observation, run_perception
 from tiptop.utils import NumpyEncoder, add_file_handler, check_cutamp_version, get_robot_rerun, print_tiptop_banner, remove_file_handler, setup_logging
 
 _log = logging.getLogger(__name__)
+
+
+def _load_curobo_overrides(spec: str | None) -> dict:
+    """Parse cuRobo cost overrides from a JSON file path OR an inline JSON string.
+
+    Returns {} when ``spec`` is falsy. These are the same override keys the parameter sweep and
+    the tiptop-viz UI use (vae_manifold_weight, rnd_novelty_weight, smooth_weight, self_collision_weight,
+    time_dilation_factor[_literal], ...) -- see motion_planning.apply_cost_overrides. Applying them at
+    server build time makes every plan this server produces use those tamp parameters, so e.g. a
+    data-gen job can generate a dataset with a chosen manifold/novelty/smoothness regime.
+    """
+    if not spec:
+        return {}
+    p = Path(spec)
+    text = p.read_text() if p.exists() else spec
+    overrides = json.loads(text)
+    if not isinstance(overrides, dict):
+        raise ValueError(f"cuRobo overrides must be a JSON object, got {type(overrides).__name__}")
+    return overrides
 
 
 class TiptopPlanningServer:
@@ -56,6 +75,7 @@ class TiptopPlanningServer:
         include_workspace: bool = False,
         overlap_perception: bool = True,
         max_concurrent_perception: int = 8,
+        curobo_overrides: str | None = None,
     ) -> None:
         if rerun_mode not in {"stream", "save", "disabled"}:
             raise ValueError(f"Invalid rerun mode: {rerun_mode}")
@@ -64,13 +84,26 @@ class TiptopPlanningServer:
         self._port = port
         self._rerun_mode = rerun_mode
         self._include_workspace = include_workspace
+        self._cfg = tiptop_cfg()
+
+        # cuRobo cost/tamp-parameter overrides (empty by default -> stock gradient_trajopt.yml +
+        # tiptop.yml behavior). Applied at solver build time so every plan uses these tamp params.
+        self._curobo_overrides = _load_curobo_overrides(curobo_overrides)
+        time_dilation_factor = resolve_time_dilation_factor(
+            self._curobo_overrides, self._cfg.robot.time_dilation_factor
+        )
+        if self._curobo_overrides:
+            _log.info(f"cuRobo cost overrides active: {self._curobo_overrides}")
+            _log.info(f"Resolved time_dilation_factor={time_dilation_factor}")
+
         self._metadata = {
             "server": "tiptop",
             "version": "0.1.0",
             "num_particles": num_particles,
             "max_planning_time": max_planning_time,
+            "curobo_overrides": self._curobo_overrides,
+            "time_dilation_factor": time_dilation_factor,
         }
-        self._cfg = tiptop_cfg()
 
         # Motion planning components (initialized during warmup)
         self._ik_solver: IKSolver | None = None
@@ -81,7 +114,7 @@ class TiptopPlanningServer:
             max_planning_time=max_planning_time,
             opt_steps=500,
             robot_type=self._cfg.robot.type,
-            time_dilation_factor=self._cfg.robot.time_dilation_factor,
+            time_dilation_factor=time_dilation_factor,
         )
         self._output_dir = Path("tiptop_server_outputs")
         # Concurrency model. The slow part of a plan is I/O-bound perception (Gemini / SAM2 / M2T2
@@ -121,6 +154,7 @@ class TiptopPlanningServer:
             self._config.num_particles,
             self._config.coll_n_spheres,
             include_workspace=self._include_workspace,
+            cost_overrides=self._curobo_overrides,
         )
 
         _log.info(f"Starting TiptopPlanningServer on ws://{self._host}:{self._port}")
@@ -356,6 +390,7 @@ def _run_server(
     include_workspace: bool = False,
     overlap_perception: bool = True,
     max_concurrent_perception: int = 8,
+    curobo_overrides: str | None = None,
 ) -> None:
     """Tiptop websocket planning server.
 
@@ -372,6 +407,11 @@ def _run_server(
             crashes). Set False to serialize the whole pipeline (legacy single-flight behavior).
         max_concurrent_perception: Max perceptions running at once when overlap is on; bounds load
             on the Gemini API / M2T2 grasp server.
+        curobo_overrides: cuRobo cost/tamp-parameter overrides as a JSON file path OR an inline JSON
+            object string (e.g. '{"vae_manifold_weight": 5000, "rnd_novelty_weight": 100000,
+            "time_dilation_factor_literal": 0.5}'). Applied at solver build time so every plan this
+            server produces uses those tamp parameters. Keys match motion_planning.apply_cost_overrides.
+            Absent -> stock gradient_trajopt.yml / tiptop.yml defaults.
     """
     print_tiptop_banner()
     check_cutamp_version()
@@ -387,6 +427,7 @@ def _run_server(
         include_workspace=include_workspace,
         overlap_perception=overlap_perception,
         max_concurrent_perception=max_concurrent_perception,
+        curobo_overrides=curobo_overrides,
     )
     exit_code = 1
     try:

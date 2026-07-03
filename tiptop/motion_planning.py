@@ -90,6 +90,17 @@ def apply_cost_overrides(cost: dict, overrides: dict | None) -> None:
     if overrides.get("vae_manifold_weight") is not None:
         vm = cost.setdefault("vae_manifold_cfg", {"weight": 0.0, "n_joints": 7, "source_dt": 0.15})
         vm["weight"] = float(overrides["vae_manifold_weight"])
+    # RND novelty cost (see curobo cost/rnd_novelty_cost.py): a single weight knob that MAXIMIZES how
+    # poorly DROID covers the motion (the opposite of vae_manifold_weight). rnd_novelty_log toggles
+    # maximizing log(novelty) (default) vs raw novelty. Block may be absent -> create on demand.
+    if overrides.get("rnd_novelty_weight") is not None or overrides.get("rnd_novelty_log") is not None:
+        rn = cost.setdefault(
+            "rnd_novelty_cfg", {"weight": 0.0, "n_joints": 7, "source_dt": 0.15, "use_log": True}
+        )
+        if overrides.get("rnd_novelty_weight") is not None:
+            rn["weight"] = float(overrides["rnd_novelty_weight"])
+        if overrides.get("rnd_novelty_log") is not None:
+            rn["use_log"] = bool(overrides["rnd_novelty_log"])
     for idx, val in (overrides.get("smooth_weight") or {}).items():
         cost["bound_cfg"]["smooth_weight"][int(idx)] = float(val)
     if overrides.get("primitive_collision_activation_distance") is not None:
@@ -152,6 +163,22 @@ def _scale_kwargs(overrides: dict | None, n_cspace_joints: int) -> dict:
     return kw
 
 
+def resolve_time_dilation_factor(overrides: dict | None, config_default: float) -> float:
+    """Effective time_dilation_factor from UI/sweep overrides.
+
+    ``time_dilation_factor_literal`` bypasses the 1.0 sentinel (used by the parameter sweep) so a
+    requested value is applied verbatim. Otherwise a ``time_dilation_factor`` of None or 1.0 means
+    "no extra scaling" and we fall back to the config default (tiptop.yml robot.time_dilation_factor).
+    """
+    overrides = overrides or {}
+    if overrides.get("time_dilation_factor_literal") is not None:
+        return float(overrides["time_dilation_factor_literal"])
+    tdf = overrides.get("time_dilation_factor")
+    if tdf is None or abs(float(tdf) - 1.0) < 1e-6:
+        return float(config_default)
+    return float(tdf)
+
+
 def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dict:
     """Resolved cuRobo trajopt config used for a plan, for saving with each run.
 
@@ -173,6 +200,8 @@ def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dic
         "resolved": {
             "uniform_velocity_weight": c["uniform_velocity_cfg"]["weight"],
             "vae_manifold_weight": c.get("vae_manifold_cfg", {}).get("weight", 0.0),
+            "rnd_novelty_weight": c.get("rnd_novelty_cfg", {}).get("weight", 0.0),
+            "rnd_novelty_log": c.get("rnd_novelty_cfg", {}).get("use_log", True),
             "bound_smooth_weight": c["bound_cfg"]["smooth_weight"],
             "bound_weight": c["bound_cfg"]["weight"],
             "bound_activation_distance": c["bound_cfg"]["activation_distance"],
