@@ -280,6 +280,16 @@ def get_motion_gen(
         grad_cfg = copy.deepcopy(load_yaml(join_path(get_task_configs_path(), "gradient_trajopt.yml")))
         apply_cost_overrides(grad_cfg["cost"], cost_overrides)
         apply_model_overrides(grad_cfg["model"], cost_overrides)
+        # Verification: log the RESOLVED cost weights that MotionGen is actually built with, so a
+        # data-gen run can confirm the overrides propagated all the way into the cuRobo solver (not
+        # just that the CLI arg parsed). Grep tiptop_*.log for "RESOLVED cuRobo cost".
+        _gc = grad_cfg["cost"]
+        _log.info(
+            "RESOLVED cuRobo cost after overrides: vae_manifold_weight=%s rnd_novelty_weight=%s | overrides=%s",
+            _gc.get("vae_manifold_cfg", {}).get("weight"),
+            _gc.get("rnd_novelty_cfg", {}).get("weight"),
+            cost_overrides,
+        )
         grad_file = grad_cfg  # dict, not str
 
         # horizon and trajopt dt also have to be set as load_from_robot_config kwargs: its
