@@ -233,6 +233,8 @@ def get_motion_gen(
     warmup_iters: int = 16,
     use_cuda_graph: bool = True,
     cost_overrides: dict | None = None,
+    collision_cache: dict | None = None,
+    batch_env: int | None = None,
 ):
     """Get the motion generator and warm it up.
 
@@ -243,9 +245,29 @@ def get_motion_gen(
             Passed to cuRobo's extra_collision_spheres for the attached_object slot.
         warmup_iters: Number of warmup iterations to run after construction.
         use_cuda_graph: Whether to use CUDA graphs for faster repeated inference.
+        collision_cache: Optional pre-sized collision cache (e.g. {"obb": N, "mesh": M}) passed to
+            MotionGenConfig. REQUIRED when use_cuda_graph=True if the world grows via update_world():
+            CUDA graphs pin the cache (fix_cache_reference=True), so it must be sized to the
+            worst-case scene up front or update_world() raises "number of OBB is larger than cache".
+        batch_env: if set, build a BATCHED-env MotionGen for solving this many scenes in one
+            plan_batch_env() call. world_cfg must then be a list of `batch_env` WorldConfigs (one per
+            env). plan_batch_env bakes env/seed counts and force-disables graph search, so CUDA graphs
+            (the single-plan Phase-1 win) are unsupported here -- use_cuda_graph is forced False and a
+            single batched warmup replaces the warmup loop. Default None = single-plan behavior.
     """
     if warmup_iters < 0:
         raise ValueError(f"warmup_iters must be non-negative, got {warmup_iters}")
+
+    if batch_env is not None:
+        if not isinstance(world_cfg, (list, tuple)):
+            raise ValueError("batch_env set but world_cfg is not a list of per-env WorldConfigs")
+        if len(world_cfg) != batch_env:
+            raise ValueError(f"batch_env={batch_env} but got {len(world_cfg)} world configs")
+        if use_cuda_graph:
+            # plan_batch_env bakes env/seed counts and force-disables graph search; CUDA graphs are
+            # unsupported in batch-env mode (unlike the single-plan path). Fall back to re-trace.
+            _log.warning("Forcing use_cuda_graph=False: CUDA graphs are unsupported in batch-env mode")
+            use_cuda_graph = False
 
     cfg = tiptop_cfg()
     if cfg.robot.type == "fr3_robotiq":
@@ -272,6 +294,10 @@ def get_motion_gen(
     # cuTAMP plans with enable_finetune_trajopt=False.
     grad_file = "gradient_trajopt.yml"
     extra_kwargs: dict = {}
+    if batch_env is not None:
+        # A list world_model already sets n_envs=len(list); pass n_collision_envs explicitly too so
+        # the per-env collision buffers are sized to the batch (belt-and-suspenders, world.py:637-638).
+        extra_kwargs["n_collision_envs"] = batch_env
     if cost_overrides:
         import copy
 
@@ -309,6 +335,7 @@ def get_motion_gen(
             robot_cfg=robot_cfg,
             world_model=world_cfg,
             use_cuda_graph=use_cuda_graph,
+            collision_cache=collision_cache,
             collision_activation_distance=collision_activation_distance,
             position_threshold=0.01,
             rotation_threshold=0.1,
@@ -321,8 +348,13 @@ def get_motion_gen(
         _log.info("Warming up MotionGen... Might take a few seconds")
         torch.cuda.synchronize()
         warmup_start = time.perf_counter()
-        for _ in range(warmup_iters):
-            motion_gen.warmup()
+        if batch_env is not None:
+            # One batched warmup captures the batch-env solve path (batch_env_mode is ignored unless
+            # batch is a concrete int). No CUDA-graph replay, so no repeated-warmup loop is needed.
+            motion_gen.warmup(enable_graph=False, batch=batch_env, warmup_js_trajopt=False, batch_env_mode=True)
+        else:
+            for _ in range(warmup_iters):
+                motion_gen.warmup()
         torch.cuda.synchronize()
         warmup_dur = time.perf_counter() - warmup_start
         _log.debug(f"Warming up MotionGen took {warmup_dur:.2f}s")
@@ -336,6 +368,8 @@ def build_curobo_solvers(
     collision_activation_distance: float = 0.0,
     include_workspace: bool = True,
     cost_overrides: dict | None = None,
+    use_cuda_graph: bool = False,
+    collision_cache: dict | None = None,
 ) -> tuple:
     """Build and warm up the IK solver and motion generator.
 
@@ -344,6 +378,13 @@ def build_curobo_solvers(
         num_spheres: number of collision spheres for attached objects
         collision_activation_distance: distance at which collision cost activates (metres)
         include_workspace: if False, skip the real-robot workspace cuboids (e.g. for sim)
+        use_cuda_graph: if True, build MotionGen with CUDA graphs so each plan_single replays a
+            captured graph instead of re-tracing (the dominant per-plan cost). REQUIRES a pre-sized
+            collision_cache (CG pins the cache), so update_world() must stay within capacity. Suits
+            the bounded sim scene-6 world (datagen sets this True); the real-robot path leaves it
+            False so update_world() can grow the cache dynamically. Default False = legacy behavior.
+        collision_cache: pre-sized cache (e.g. {"obb": N, "mesh": M}) for CUDA graphs; defaulted to a
+            generous scene-6 worst case when use_cuda_graph=True and not provided.
 
     Returns:
         Tuple of (ik_solver, motion_gen, initial_world_cfg). The WorldConfig is returned
@@ -358,16 +399,63 @@ def build_curobo_solvers(
     ]
     world_cfg = WorldConfig(cuboid=cuboids)
     ik_solver = get_ik_solver(world_cfg, num_particles)
-    # use_cuda_graph=False: MotionGen is built with a minimal world (1 placeholder cuboid when
-    # include_workspace=False), so update_world() must be able to GROW the collision cache when
-    # the real scene (table + surfaces + movables) is loaded. CUDA graphs pin the cache size
-    # (fix_cache_reference=True), which raises "number of OBB is larger than collision cache".
-    # Disabling graphs lets the cache grow, and also avoids a CUDA-graph driver crash (see README).
+    # MotionGen is built with a minimal world (1 placeholder "table" cuboid when include_workspace=
+    # False); the real scene (table + surfaces + movables) is swapped in later via update_world().
+    # With use_cuda_graph=False (default / real robot) the collision cache GROWS on that update.
+    # With use_cuda_graph=True (sim datagen) CUDA graphs pin the cache (fix_cache_reference=True), so
+    # we must PRE-SIZE it to the worst-case scene up front -- else update_world() raises "number of
+    # OBB is larger than collision cache". Scene-6 worst case is small (table + plate + 3 toys +
+    # detected surfaces); default a generous cache so pose-only obstacle swaps + attach/detach (which
+    # stay within capacity) keep the graph valid, giving fast plan_single replay.
+    if use_cuda_graph and collision_cache is None:
+        collision_cache = {"obb": 48, "mesh": 24}
     motion_gen = get_motion_gen(
         world_cfg, collision_activation_distance=collision_activation_distance, num_spheres=num_spheres,
-        use_cuda_graph=False, cost_overrides=cost_overrides,
+        use_cuda_graph=use_cuda_graph, cost_overrides=cost_overrides, collision_cache=collision_cache,
     )
     return ik_solver, motion_gen, world_cfg
+
+
+def build_batched_curobo_solvers(
+    n_envs: int,
+    world_cfgs: list[WorldConfig],
+    num_spheres: int,
+    collision_activation_distance: float = 0.0,
+    cost_overrides: dict | None = None,
+    collision_cache: dict | None = None,
+) -> tuple:
+    """Build a batched-env MotionGen that solves n_envs scenes in one plan_batch_env() call (Phase 2).
+
+    Collapses the serial per-scene cuRobo refinement into one batched solve. plan_batch_env bakes
+    env/seed counts and force-disables graph search, so CUDA graphs (the Phase-1 single-plan win) are
+    NOT used here -- the payoff is n_envs-wide parallelism instead. Callers must supply one WorldConfig
+    per env (len(world_cfgs) == n_envs); every movable name that any env will pick/place should
+    pre-exist (enabled or disabled) in EVERY env so later per-env pose-only obstacle swaps stay
+    allocation-stable (update_obstacle_pose/enable_obstacle are keyed by name+env_idx).
+
+    Args:
+        n_envs: number of scenes solved together in one batched call.
+        world_cfgs: list of n_envs WorldConfigs (one collision world per env).
+        num_spheres: reserved attached-object sphere slots (shared across envs -> size to the
+            conservative shared-blob budget for the largest held object).
+        collision_cache: per-env cache (e.g. {"obb": N, "mesh": M}); the buffer is allocated
+            (n_envs, cache, ...) so size it to the worst-case SINGLE scene, not the aggregate.
+
+    Returns:
+        Tuple of (motion_gen, world_cfgs). No separate IK solver is built (the batched particle
+        optimizer is Phase 2b); the batched MotionGen is the refinement engine.
+    """
+    if len(world_cfgs) != n_envs:
+        raise ValueError(f"n_envs={n_envs} but got {len(world_cfgs)} world configs")
+    if collision_cache is None:
+        # Worst-case SINGLE scene-6 (table + plate + 3 toys + a little margin); buffers are per-env.
+        collision_cache = {"obb": 48, "mesh": 24}
+    motion_gen = get_motion_gen(
+        world_cfgs, collision_activation_distance=collision_activation_distance, num_spheres=num_spheres,
+        use_cuda_graph=False, cost_overrides=cost_overrides, collision_cache=collision_cache,
+        batch_env=n_envs,
+    )
+    return motion_gen, world_cfgs
 
 
 def go_to_q(

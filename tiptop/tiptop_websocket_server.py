@@ -76,6 +76,8 @@ class TiptopPlanningServer:
         overlap_perception: bool = True,
         max_concurrent_perception: int = 8,
         curobo_overrides: str | None = None,
+        use_cuda_graph: bool = False,
+        collision_cache: dict | None = None,
     ) -> None:
         if rerun_mode not in {"stream", "save", "disabled"}:
             raise ValueError(f"Invalid rerun mode: {rerun_mode}")
@@ -84,6 +86,11 @@ class TiptopPlanningServer:
         self._port = port
         self._rerun_mode = rerun_mode
         self._include_workspace = include_workspace
+        # CUDA graphs for the cuRobo MotionGen: fast plan_single replay, but pins the collision cache
+        # so it must be pre-sized (collision_cache) to the worst-case scene. Enabled for sim datagen
+        # (bounded scene-6 world); off by default so the real-robot dynamic-world path is unaffected.
+        self._use_cuda_graph = use_cuda_graph
+        self._collision_cache = collision_cache
         self._cfg = tiptop_cfg()
 
         # cuRobo cost/tamp-parameter overrides (empty by default -> stock gradient_trajopt.yml +
@@ -129,11 +136,90 @@ class TiptopPlanningServer:
         self._perception_sem = asyncio.Semaphore(max(1, max_concurrent_perception))
         self._run_counter = 0
 
+        # Phase-2 server-side dynamic batching (opt-in via TIPTOP_BATCH_PLAN=1). Collect concurrent
+        # post-perception requests and solve them together via run_cutamp_batched (one batched
+        # particle-opt + refinement). Clients/worker are unchanged: each still awaits its own plan.
+        # The coordinator + shared cost_reducer/constraint_checker are created in run().
+        self._batch_plan = os.environ.get("TIPTOP_BATCH_PLAN", "0").lower() in ("1", "true")
+        self._batch_size = int(os.environ.get("TIPTOP_BATCH_SIZE", "16"))
+        self._batch_window_s = float(os.environ.get("TIPTOP_BATCH_WINDOW_S", "3.0"))
+        self._batch_queue: asyncio.Queue | None = None
+
     def _reset_motion_planning(self) -> None:
         """Reset collision world to initial state to clear stale cached state between runs."""
         self._ik_solver.update_world(self._initial_world_cfg)
         self._motion_gen.update_world(self._initial_world_cfg)
         self._motion_gen.reset(reset_seed=False)
+
+    async def _batch_loop(self) -> None:
+        """Server-side dynamic batching coordinator (only when TIPTOP_BATCH_PLAN=1).
+
+        Collects up to batch_size post-perception requests (whatever arrives within batch_window_s of
+        the first) and solves them together with run_cutamp_batched: ONE batched particle optimization
+        + ONE batched cuRobo refinement over the N scenes. Sets each request's future to its plan (or
+        None on failure). GPU work stays single-flight under _gpu_lock. A whole-batch exception (e.g.
+        heterogeneous skeletons -> run_cutamp_batched returns all-None, or an unexpected error) fails
+        just that batch's requests, so the datagen simply retries those envs.
+        """
+        from cutamp.algorithm import run_cutamp_batched
+        from cutamp.constraint_checker import ConstraintChecker
+        from cutamp.cost_reduction import CostReducer
+        from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
+        from cutamp.task_planning.constraints import StablePlacement
+
+        while True:
+            items = [await self._batch_queue.get()]  # (env, q_init, grasps, all_surfaces, future)
+            deadline = time.monotonic() + self._batch_window_s
+            while len(items) < self._batch_size:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    items.append(await asyncio.wait_for(self._batch_queue.get(), remaining))
+                except asyncio.TimeoutError:
+                    break
+
+            envs = [it[0] for it in items]
+            q_inits = [it[1] for it in items]
+            grasps_list = [it[2] for it in items]
+            # Loosen placement tolerances per detected surface across the whole batch, exactly as the
+            # single-scene run_planning does (else default tolerances are too tight -> 0 satisfying).
+            constraint_to_tol = default_constraint_to_tol.copy()
+            constraint_to_mult = default_constraint_to_mult.copy()
+            for it in items:
+                for surface in it[3]:
+                    constraint_to_tol[StablePlacement.type][f"{surface.name}_in_xy"] = 1e-2
+                    constraint_to_tol[StablePlacement.type][f"{surface.name}_support"] = 1e-2
+                    constraint_to_mult[StablePlacement.type][f"{surface.name}_support"] = 1.0
+            # cutamp canonicalizes placement-surface names (plate/white_plate -> CUTAMP_CANON_SURFACE,
+            # default 'plate') so scenes share one batchable group; alias the loosened tolerances under
+            # the canonical name too, else the renamed surface would silently get tolerance 0.
+            canon_surface = os.environ.get("CUTAMP_CANON_SURFACE", "plate")
+            if canon_surface:
+                constraint_to_tol[StablePlacement.type][f"{canon_surface}_in_xy"] = 1e-2
+                constraint_to_tol[StablePlacement.type][f"{canon_surface}_support"] = 1e-2
+                constraint_to_mult[StablePlacement.type][f"{canon_surface}_support"] = 1.0
+            cost_reducer = CostReducer(constraint_to_mult)
+            constraint_checker = ConstraintChecker(constraint_to_tol)
+
+            _log.info(f"Batched planning: solving {len(items)} scenes together")
+            t0 = time.monotonic()
+            try:
+                async with self._gpu_lock:
+                    plans = await asyncio.to_thread(
+                        run_cutamp_batched, envs, self._config, cost_reducer, constraint_checker,
+                        q_inits, grasps_list, None,
+                    )
+            except Exception:
+                _log.exception("Batched planning failed for the whole batch")
+                plans = [None] * len(items)
+            n_ok = sum(1 for p in plans if p is not None)
+            _log.info(f"Batched planning: {n_ok}/{len(items)} plans in {time.monotonic() - t0:.1f}s "
+                      f"({(time.monotonic() - t0) / max(1, len(items)):.2f}s/scene)")
+            for it, plan in zip(items, plans):
+                fut = it[4]
+                if not fut.done():
+                    fut.set_result(plan)
 
     @staticmethod
     def _health_check(connection: ws_server.ServerConnection, request: ws_server.Request) -> ws_server.Response | None:
@@ -155,7 +241,17 @@ class TiptopPlanningServer:
             self._config.coll_n_spheres,
             include_workspace=self._include_workspace,
             cost_overrides=self._curobo_overrides,
+            use_cuda_graph=self._use_cuda_graph,
+            collision_cache=self._collision_cache,
         )
+
+        if self._batch_plan:
+            self._batch_queue = asyncio.Queue()
+            asyncio.create_task(self._batch_loop())
+            _log.info(
+                f"Server-side batched planning ENABLED (batch_size={self._batch_size}, "
+                f"window={self._batch_window_s}s). Ensure max_concurrent_perception >= batch_size."
+            )
 
         _log.info(f"Starting TiptopPlanningServer on ws://{self._host}:{self._port}")
         async with ws_server.serve(
@@ -319,18 +415,27 @@ class TiptopPlanningServer:
             # perception overlaps. The reset clears stale cuTAMP world state from the previous solve
             # and must stay paired with the solve under the same lock.
             _log.info("Running cuTAMP planning...")
-            async with self._gpu_lock:
-                self._reset_motion_planning()
-                cutamp_plan, planning_duration, failure_reason = await asyncio.to_thread(
-                    run_planning,
-                    env,
-                    self._config,
-                    q_init,
-                    self._ik_solver,
-                    processed_scene.grasps,
-                    self._motion_gen,
-                    all_surfaces,
-                )
+            if self._batch_plan:
+                # Hand the perceived scene to the batch coordinator and await this request's plan.
+                # The coordinator groups concurrent requests and solves them via run_cutamp_batched.
+                fut = asyncio.get_running_loop().create_future()
+                await self._batch_queue.put((env, q_init, processed_scene.grasps, all_surfaces, fut))
+                cutamp_plan = await fut
+                planning_duration = 0.0
+                failure_reason = None if cutamp_plan is not None else "batched planning found no plan"
+            else:
+                async with self._gpu_lock:
+                    self._reset_motion_planning()
+                    cutamp_plan, planning_duration, failure_reason = await asyncio.to_thread(
+                        run_planning,
+                        env,
+                        self._config,
+                        q_init,
+                        self._ik_solver,
+                        processed_scene.grasps,
+                        self._motion_gen,
+                        all_surfaces,
+                    )
 
             if cutamp_plan is None:
                 return {
@@ -391,6 +496,9 @@ def _run_server(
     overlap_perception: bool = True,
     max_concurrent_perception: int = 8,
     curobo_overrides: str | None = None,
+    use_cuda_graph: bool = False,
+    collision_cache_obb: int = 48,
+    collision_cache_mesh: int = 24,
 ) -> None:
     """Tiptop websocket planning server.
 
@@ -412,6 +520,13 @@ def _run_server(
             "time_dilation_factor_literal": 0.5}'). Applied at solver build time so every plan this
             server produces uses those tamp parameters. Keys match motion_planning.apply_cost_overrides.
             Absent -> stock gradient_trajopt.yml / tiptop.yml defaults.
+        use_cuda_graph: If True, build the cuRobo MotionGen with CUDA graphs (fast plan_single
+            replay -- cuts the dominant per-plan refinement time). Only safe for a bounded world
+            (e.g. sim scene-6) because the collision cache is pinned; the cache is pre-sized from
+            collision_cache_obb/mesh. Off by default (real-robot dynamic-world path unaffected).
+        collision_cache_obb: OBB slots reserved when use_cuda_graph=True (worst-case scene obstacle
+            count + margin). Sized too small -> update_world() raises "OBB larger than cache".
+        collision_cache_mesh: Mesh slots reserved when use_cuda_graph=True.
     """
     print_tiptop_banner()
     check_cutamp_version()
@@ -428,6 +543,8 @@ def _run_server(
         overlap_perception=overlap_perception,
         max_concurrent_perception=max_concurrent_perception,
         curobo_overrides=curobo_overrides,
+        use_cuda_graph=use_cuda_graph,
+        collision_cache=({"obb": collision_cache_obb, "mesh": collision_cache_mesh} if use_cuda_graph else None),
     )
     exit_code = 1
     try:
