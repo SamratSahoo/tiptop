@@ -64,7 +64,7 @@ from tiptop.utils import (
     remove_file_handler,
     setup_logging,
 )
-from tiptop.lerobot_capture import GripperSampler, dump_lerobot_raw
+from tiptop.lerobot_capture import GripperSampler, JointSampler, dump_raw_episode
 from tiptop.viz_utils import get_gripper_mesh, get_heatmap
 from tiptop.workspace import workspace_cuboids
 
@@ -79,6 +79,20 @@ _executor_pool = None
 
 class UserExitException(Exception):
     """Raised when user explicitly requests to exit."""
+
+
+def _emit_event(payload: dict) -> None:
+    """Append one JSON event line to ``$TIPTOP_EVENTS_FILE`` (the data-collection server's rollout
+    state feed). No-op if the env var is unset; never raises, so it can wrap any control-flow point."""
+    path = os.environ.get("TIPTOP_EVENTS_FILE")
+    if not path:
+        return
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps({"ts": time.time(), **payload}) + "\n")
+            f.flush()
+    except Exception:
+        pass
 
 
 @dataclass(frozen=True)
@@ -129,7 +143,11 @@ def capture_live_observation(container: _DemoContainer) -> Observation:
 
 
 def get_demo_container(
-    num_particles: int, num_spheres: int, collision_activation_distance: float, enable_recording: bool = False
+    num_particles: int,
+    num_spheres: int,
+    collision_activation_distance: float,
+    enable_recording: bool = False,
+    cost_overrides: dict | None = None,
 ) -> _DemoContainer:
     """Cache and warm-up everything needed for the live demo."""
     _log.info("Starting demo warmup...")
@@ -168,8 +186,10 @@ def get_demo_container(
     # Cache the SAM2 client
     sam2_client()
 
-    # Warm-up IK solver and motion generator
-    ik_solver, motion_gen, _ = build_curobo_solvers(num_particles, num_spheres, collision_activation_distance)
+    # Warm-up IK solver and motion generator (cost_overrides applies the cfg/tamp/*.yml cost knobs).
+    ik_solver, motion_gen, _ = build_curobo_solvers(
+        num_particles, num_spheres, collision_activation_distance, cost_overrides=cost_overrides
+    )
     return _DemoContainer(
         robot=client,
         cam=cam,
@@ -201,6 +221,7 @@ def _label_rollout(save_dir: Path, output_dir: str, timestamp: str) -> Path:
     """Prompt user to label rollout as success/failure, moving it out of eval/ to
     <success|failure>/<timestamp>/. Loops on invalid input. Returns the final rollout
     directory (or the unchanged eval dir if skipped) so it can be post-processed."""
+    _emit_event({"event": "awaiting_label", "dir": str(save_dir)})
     try:
         while True:
             user_input = (
@@ -216,6 +237,7 @@ def _label_rollout(save_dir: Path, output_dir: str, timestamp: str) -> Path:
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(save_dir, dest)
                 _log.info(f"Moved rollout to {cls} directory: {dest}")
+                _emit_event({"event": "labeled", "dir": str(dest), "success": user_input == "y"})
                 return dest
             elif user_input == "":
                 _log.info(f"Keeping rollout in eval directory: {save_dir}")
@@ -247,6 +269,7 @@ def _get_task_instruction() -> str:
         return instr
     # Interactive: keep reusing the warm container for back-to-back rollouts.
     suffix = f" [{_LAST_TASK}]" if _LAST_TASK else ""
+    _emit_event({"event": "awaiting_task"})
     try:
         raw = input(f"\nNext task (Enter = repeat{suffix}, 'q' to quit): ").strip()
     except EOFError:
@@ -661,7 +684,7 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
     async with aiohttp.ClientSession(connector=connector) as session:
         while True:
             try:
-                _log.debug(f"Preparing TiPToP for next run...")
+                _log.debug("Preparing TiPToP for next run...")
                 await check_server_health(session)
 
                 # Get the task BEFORE any pre-trial robot motion so that quitting (or an empty
@@ -691,6 +714,7 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
 
                 save_dir = Path(output_dir) / "eval" / timestamp
                 _log.info(f"Saving logs, results, and visualizations to {save_dir}")
+                _emit_event({"event": "rollout_start", "dir": str(save_dir)})
 
                 # Add log file handler for this run
                 file_handler = add_file_handler(save_dir / "tiptop_run.log")
@@ -765,12 +789,19 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                                     cameras_to_record.append(
                                         (container.cam, save_dir / "hand_cam.svo", save_dir / "hand_cam.mp4"),
                                     )
-                                # Record cameras while executing; capture per-step wall-clock times so
-                                # the LeRobot export can align camera frames to the control timeline,
-                                # and sample the measured gripper width over its own socket.
+                                # Sample the measured arm + gripper state over their own sockets while
+                                # the cameras record and the plan executes; capture per-step wall-clock
+                                # times so the export can align camera frames to the control timeline.
+                                # The samplers are OUTER and record_cameras INNER so the cameras stop the
+                                # instant execution returns: were the cameras outer, their exit would run
+                                # while the ~2 s sampler-thread joins finished, padding the video tail
+                                # with stationary frames past the last state frame.
                                 exec_timeline: list[dict] = []
-                                with record_cameras(cameras_to_record):
-                                    with GripperSampler(container.robot) as gripper_sampler:
+                                with (
+                                    GripperSampler(container.robot) as gripper_sampler,
+                                    JointSampler() as joint_sampler,
+                                ):
+                                    with record_cameras(cameras_to_record) as rec_window:
                                         execute_cutamp_plan(
                                             cutamp_plan, client=container.robot, timeline=exec_timeline
                                         )
@@ -788,23 +819,28 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                                     lerobot_cameras["observation.images.exterior_2_left"] = "external_cam_2.mp4"
                                 if isinstance(container.cam, ZedCamera):
                                     lerobot_cameras["observation.images.wrist_left"] = "hand_cam.mp4"
+                                # Data-collection raw episode (robot_state.npz + _meta.json, ARCHITECTURE §3):
+                                # MEASURED proprioception from the samplers + COMMANDED plan actions, decoupled.
+                                n_frames = 0
                                 try:
-                                    # Export the dense plan (not a live sample) to LeRobot DROID format,
-                                    # built post-hoc by the robot env from this _lerobot_raw.json.
-                                    dump_lerobot_raw(
+                                    raw_path = dump_raw_episode(
                                         save_dir,
                                         plan_path,
-                                        motion_gen=container.motion_gen,
-                                        tensor_args=tensor_args,
+                                        timeline=exec_timeline,
+                                        joint_samples=joint_sampler.samples,
+                                        gripper_samples=gripper_sampler.samples,
                                         instruction=task_instruction,
                                         cameras=lerobot_cameras,
                                         fps=LEROBOT_FPS,
-                                        robot_type=cfg.robot.type,
-                                        timeline=exec_timeline,
-                                        gripper_samples=gripper_sampler.samples,
+                                        config_id=os.environ.get("TIPTOP_CONFIG_ID"),
+                                        record_start=rec_window.get("t_start"),
+                                        record_stop=rec_window.get("t_stop"),
                                     )
+                                    if raw_path is not None:
+                                        n_frames = json.loads((save_dir / "_meta.json").read_text()).get("n_frames", 0)
                                 except Exception:
-                                    _log.exception("Failed to dump LeRobot raw capture")
+                                    _log.exception("Failed to dump raw episode")
+                                _emit_event({"event": "rollout_saved", "dir": str(save_dir), "n_frames": n_frames})
                             else:
                                 execute_cutamp_plan(cutamp_plan, client=container.robot)
                             _log.info("Finished executing plan!")
@@ -863,6 +899,7 @@ def _sync_entrypoint(
     cutamp_visualize: bool = False,
     num_particles: int = 256,
     enable_recording: bool = False,
+    curobo_overrides: str | None = None,
 ):
     """
     TiPToP live robot runner. Runs continuously on the real robot.
@@ -875,6 +912,8 @@ def _sync_entrypoint(
         cutamp_visualize: Whether to visualize cuTAMP optimization.
         num_particles: Number of particles for cuTAMP; decrease if running out of GPU memory.
         enable_recording: Whether to record external camera video during execution.
+        curobo_overrides: cuRobo cost overrides as a JSON file path OR inline JSON (the cfg/tamp/*.yml
+            cost knobs, e.g. vae_manifold_weight); applied at solver build time so every plan uses them.
     """
     assert max_planning_time > 0
     assert opt_steps_per_skeleton > 0
@@ -882,6 +921,14 @@ def _sync_entrypoint(
 
     print_tiptop_banner()
     check_cutamp_version()
+    _emit_event({"event": "session_start"})
+
+    # Lazy import breaks the tiptop_run <-> tiptop_websocket_server import cycle.
+    from tiptop.tiptop_websocket_server import _load_curobo_overrides
+
+    cost_overrides = _load_curobo_overrides(curobo_overrides)
+    if cost_overrides:
+        _log.info(f"cuRobo cost overrides active: {cost_overrides}")
 
     cfg = tiptop_cfg()
     config = build_tamp_config(
@@ -897,7 +944,7 @@ def _sync_entrypoint(
     global _executor_pool
     setup_logging(level=logging.DEBUG)
 
-    container = get_demo_container(num_particles, config.coll_n_spheres, 0.0, enable_recording)
+    container = get_demo_container(num_particles, config.coll_n_spheres, 0.0, enable_recording, cost_overrides)
     # Workers ignore SIGINT so only the main process handles Ctrl+C for clean shutdown
     _executor_pool = ProcessPoolExecutor(
         max_workers=4, initializer=signal.signal, initargs=(signal.SIGINT, signal.SIG_IGN)
@@ -934,6 +981,7 @@ def _sync_entrypoint(
                     p.wait()
             except KeyboardInterrupt:
                 _log.info("Leaving post-processing running in the background; exiting now.")
+        _emit_event({"event": "session_end"})
         sys.exit(exit_code)
 
 

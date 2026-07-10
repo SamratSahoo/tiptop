@@ -81,17 +81,25 @@ def _get_git_diff() -> str | None:
 
 
 @contextmanager
-def record_cameras(recordings: list[tuple[ZedCamera, Path, Path | None]]) -> Generator[None, None, None]:
+def record_cameras(recordings: list[tuple[ZedCamera, Path, Path | None]]) -> Generator[dict, None, None]:
     """Context manager for recording multiple ZED cameras simultaneously.
 
     All cameras stop collecting frames at the same time on exit, then MP4
     conversion runs sequentially afterwards.
+
+    Yields a mutable ``window`` dict bracketing the recording with epoch-second wall clocks:
+    ``window["t_start"]`` is set once every camera has started, ``window["t_stop"]`` once every
+    camera has stopped (before MP4 conversion, which is not part of the recording window). These
+    let the LeRobot build map state frames -- whose ``frame_time`` is the master timeline -- onto
+    camera frames by wall clock (see ARCHITECTURE.md "Camera <-> state alignment"). Using the
+    context manager without ``as`` still works; the yielded dict is simply ignored.
 
     Args:
         recordings: List of (camera, svo_path, mp4_path) tuples
     """
     stop_events: list[threading.Event] = []
     threads: list[threading.Thread] = []
+    window: dict[str, float] = {}
 
     for camera, svo_path, _ in recordings:
         stop_event = threading.Event()
@@ -111,8 +119,9 @@ def record_cameras(recordings: list[tuple[ZedCamera, Path, Path | None]]) -> Gen
         stop_events.append(stop_event)
         threads.append(thread)
 
+    window["t_start"] = time.time()
     try:
-        yield
+        yield window
     finally:
         # Signal all cameras to stop simultaneously so recordings are the same length
         for event in stop_events:
@@ -121,6 +130,9 @@ def record_cameras(recordings: list[tuple[ZedCamera, Path, Path | None]]) -> Gen
             thread.join(timeout=3.0)
             camera.stop_recording()
             _log.info(f"Stopped recording camera {camera.serial}")
+        # Recording window closes when the cameras stop; the SVO->MP4 conversion below must NOT
+        # count as recording time, so stamp t_stop before it.
+        window["t_stop"] = time.time()
 
         # Convert to MP4 after all cameras have stopped
         for camera, svo_path, mp4_path in recordings:

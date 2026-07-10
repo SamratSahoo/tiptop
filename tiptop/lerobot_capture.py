@@ -1,34 +1,34 @@
-"""Build raw per-frame data for the LeRobot DROID export from a tiptop plan.
+"""Build ``robot_state.npz`` + ``_meta.json`` for the data-collection LeRobot export.
 
-tiptop executes a TAMP plan as a sequence of dense joint-impedance trajectories,
-so the ground-truth per-frame stream is the plan itself (``tiptop_plan.json``):
-each ``trajectory`` step stores dense 50 Hz joint ``positions`` + ``velocities``,
-and ``gripper`` steps mark open/close events.
+tiptop executes a TAMP plan as a sequence of dense joint-impedance trajectories. The recorded
+episode keeps the MEASURED robot state and the COMMANDED plan strictly decoupled (ARCHITECTURE.md
+§3), which is the whole point of this module: an earlier design wrote plan positions as
+"proprioception" and a lead-shifted copy of the measured gripper as the gripper action -- a
+feedback trap that is deliberately gone.
 
-:func:`dense_frames_from_plan` flattens that plan into a dense, resampled per-frame
-trajectory (default 15 Hz, matching DROID): joint positions and the plan's own
-instantaneous velocities become the state/action, and the gripper channel is
-reconstructed from the open/close events (0 = open, 1 = closed, DROID convention).
-:func:`dump_lerobot_raw` writes the result to ``_lerobot_raw.json`` together with
-each frame's wall-clock time (from the execution timeline, see
-``execute_cutamp_plan``) so ``scripts/lerobot_export.py`` can align camera frames
-to the control timeline by ZED hardware timestamp.
-
-This replaces an earlier approach that polled the robot from a background thread
-during execution; sharing the busy command socket starved it to ~20 frames per
-episode and yielded finite-difference velocities far over the robot's joint limits
-and a gripper stuck at a constant value.
+:class:`JointSampler` and :class:`GripperSampler` are background threads that sample the measured
+arm state (over the shim's dedicated state port) and gripper width (over the gripper port) during
+execution, each with wall-clock timestamps. :func:`dump_raw_episode` resamples everything onto a
+uniform 15 Hz wall-clock grid: the COMMANDED arrays come from the plan (``tiptop_plan.json``,
+spread across each step's measured ``[t_start, t_end]``), the MEASURED arrays come from the samplers
+by nearest timestamp, and ``frame_time`` (float64 epoch seconds) is the master timeline the build
+uses to align camera frames.
 """
 
 import json
 import logging
+import os
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
 _log = logging.getLogger(__name__)
+
+# State-port default; the shim's background-poller REP socket that JointSampler reads from.
+DEFAULT_STATE_PORT = 5557
 
 # Robot control / DROID target rate. The plan is stored at 50 Hz; we resample to this.
 DEFAULT_TARGET_FPS = 15
@@ -36,13 +36,6 @@ DEFAULT_TARGET_FPS = 15
 # Robotiq 2F-85 fully-open width in metres; used to normalise the measured width to the
 # DROID gripper convention (0 = open, 1 = closed).
 GRIPPER_MAX_WIDTH = 0.085
-
-# DROID models the gripper ACTION (command) as leading the measured gripper POSITION: the
-# fingers lag the command, so the action ramps a couple of frames before the observed state.
-# We emulate that by shifting the action's gripper channel ahead of the measured state by this
-# many seconds (~2 frames at 15 Hz, matching DROID-100's observed command-to-position lead).
-# The observation/proprioception gripper is left as the true measured position (unshifted).
-GRIPPER_ACTION_LEAD_S = 0.13
 
 
 def _read_gripper_width(robot) -> float | None:
@@ -143,13 +136,96 @@ class GripperSampler:
         return False
 
 
-def _matrix_to_xyzrpy(mat: np.ndarray) -> np.ndarray:
-    """Convert a 4x4 homogeneous transform to [x, y, z, roll, pitch, yaw]."""
-    from scipy.spatial.transform import Rotation
+class JointSampler:
+    """Background thread sampling the *measured* arm state during execution, over the STATE port.
 
-    xyz = mat[:3, 3]
-    rpy = Rotation.from_matrix(mat[:3, :3]).as_euler("xyz")
-    return np.concatenate([xyz, rpy]).astype(np.float32)
+    Talks to the shim's dedicated state socket (``bamboo_polymetis_shim._state_handler``) with its
+    own ZMQ REQ + msgpack connection -- NOT a :class:`BambooFrankaClient`, whose get_robot_state
+    goes to the control port that is blocked inside the trajectory execution. The state port serves
+    a cache filled by a background poller, so it answers even mid-motion.
+
+    ``samples`` holds ``(wall_seconds, q[7], dq[7])`` tuples (measured joint positions/velocities).
+    A dead/absent state server degrades to a warning + empty ``samples`` (RCVTIMEO), never a hang.
+    Use as a context manager around plan execution::
+
+        with JointSampler() as j:
+            execute_cutamp_plan(plan, client=robot)
+        # j.samples now holds the measured joint trace
+    """
+
+    def __init__(self, fps: int = 30):
+        import msgpack
+        import zmq
+
+        from tiptop.config import tiptop_cfg
+
+        self._msgpack = msgpack
+        self._zmq = zmq
+        self.host = tiptop_cfg().robot.host
+        self.port = int(os.environ.get("TIPTOP_STATE_PORT", DEFAULT_STATE_PORT))
+        self.fps = int(fps)
+        self.samples: list[tuple[float, np.ndarray, np.ndarray]] = []  # (wall_seconds, q[7], dq[7])
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._unavailable_logged = False
+        self._ctx = zmq.Context()
+        self._sock: "zmq.Socket | None" = None
+        self._connect()
+
+    def _connect(self) -> None:
+        """(Re)create the REQ socket. A timed-out recv leaves REQ unusable, so recover by reconnecting."""
+        if self._sock is not None:
+            self._sock.close(linger=0)
+        self._sock = self._ctx.socket(self._zmq.REQ)
+        self._sock.setsockopt(self._zmq.RCVTIMEO, 300)  # ms; a dead server degrades to empty samples
+        self._sock.setsockopt(self._zmq.LINGER, 0)
+        self._sock.connect(f"tcp://{self.host}:{self.port}")
+
+    def _warn_unavailable(self, detail: str) -> None:
+        if not self._unavailable_logged:
+            _log.warning(
+                "Joint state server tcp://%s:%d unavailable (%s); measured joint samples will be empty "
+                "-- the raw episode dump will be skipped. Is the shim's --state-port running?",
+                self.host, self.port, detail,
+            )
+            self._unavailable_logged = True
+
+    def _loop(self) -> None:
+        period = 1.0 / self.fps
+        req = self._msgpack.packb({"command": "get_robot_state"})
+        while not self._stop.is_set():
+            tick = time.perf_counter()
+            try:
+                self._sock.send(req)
+                reply = self._msgpack.unpackb(self._sock.recv(), raw=False)
+                data = reply.get("data") if isinstance(reply, dict) and reply.get("success") else None
+                if data:
+                    q = np.asarray(data.get("q", []), dtype=np.float32).reshape(-1)
+                    dq = np.asarray(data.get("dq", []), dtype=np.float32).reshape(-1)
+                    if q.shape == (7,) and dq.shape == (7,):
+                        self.samples.append((time.time(), q, dq))
+            except self._zmq.Again:
+                self._warn_unavailable("recv timeout")
+                self._connect()
+            except Exception as e:  # noqa: BLE001 - degrade to empty samples, never crash the rollout
+                self._warn_unavailable(str(e))
+                self._connect()
+            time.sleep(max(0.0, period - (time.perf_counter() - tick)))
+
+    def __enter__(self) -> "JointSampler":
+        self._thread = threading.Thread(target=self._loop, name="lerobot-joint-sampler", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        _log.info("Joint sampler: %d measured samples", len(self.samples))
+        if self._sock is not None:
+            self._sock.close(linger=0)
+        self._ctx.term()
+        return False
 
 
 def _load_plan(plan_path: Path) -> dict:
@@ -259,140 +335,116 @@ def _gripper_from_measurements(frame_wall: np.ndarray, gripper_samples: list | N
     return gv[nearest].astype(np.float32)
 
 
-def dense_frames_from_plan(
-    plan: dict,
-    *,
-    motion_gen,
-    tensor_args,
-    target_fps: int = DEFAULT_TARGET_FPS,
-    timeline: list | None = None,
-    gripper_samples: list | None = None,
-) -> dict:
-    """Resample a tiptop plan to ``target_fps`` dense per-frame DROID-style arrays.
-
-    Returns joint_position[N,7], gripper_position[N,1], cartesian_position[N,6],
-    action[N,8] (= 7 plan joint-velocities + gripper), and frame_time[N] (wall-clock
-    seconds, or None if no execution timeline was supplied). Velocities come straight
-    from the plan -- never a finite difference -- so they stay within the robot's
-    joint-velocity limits. The gripper channel is the *measured* width (continuous,
-    DROID convention 0 = open, 1 = closed) when ``gripper_samples`` is supplied and the
-    frames have wall-clock times; otherwise it is reconstructed from the plan's
-    open/close events as a binary step. ``gripper_position`` is the true measured
-    position; the action's gripper channel leads it by ``GRIPPER_ACTION_LEAD_S``
-    (DROID-style: the command precedes the finger motion).
-    """
-    dense = _flatten_plan(plan, timeline=timeline)
-    positions = dense["positions"]
-    M = len(positions)
-    if M < 2:
-        return {"n_frames": M}
-
-    duration = float(dense["t_plan"][-1] + dense["dt"][-1])
-    N = max(2, round(duration * target_fps))
-    target_t = np.minimum(np.arange(N) / float(target_fps), dense["t_plan"][-1])
-    # Nearest preceding dense row for each uniform target time (t_plan is increasing).
-    idx = np.clip(np.searchsorted(dense["t_plan"], target_t, side="right") - 1, 0, M - 1)
-
-    joint = positions[idx].astype(np.float32)  # [N, 7]
-    vel = dense["velocities"][idx].astype(np.float32)  # [N, 7]
-
-    frame_wall = dense["t_wall"][idx]  # wall-clock time per output frame (may be NaN)
-    grip_meas = _gripper_from_measurements(frame_wall, gripper_samples)
-    if grip_meas is not None:
-        grip = grip_meas.reshape(N, 1)
-        _log.info("Gripper channel from measured width (%d samples)", len(gripper_samples))
-    else:
-        grip = dense["gripper"][idx].reshape(N, 1).astype(np.float32)  # plan-event fallback (binary)
-        _log.info("Gripper channel reconstructed from plan open/close events (no measured trace)")
-    # observation gripper = true measured position; action gripper leads it (DROID-style), i.e.
-    # action[t] = measured[t + lead], so the command precedes the finger motion. Tail clamps.
-    lead = max(1, round(GRIPPER_ACTION_LEAD_S * target_fps))
-    action_grip = grip[np.minimum(np.arange(N) + lead, N - 1)]  # [N, 1]
-    action = np.concatenate([vel, action_grip], axis=1).astype(np.float32)  # [N, 8]
-
-    frame_time = None if not np.all(np.isfinite(frame_wall)) else frame_wall.tolist()
-
-    # Cartesian pose for every frame via one batched forward-kinematics call.
-    try:
-        q_pt = tensor_args.to_device(joint)
-        mats = motion_gen.kinematics.get_state(q_pt).ee_pose.get_numpy_matrix()  # [N, 4, 4]
-        cartesian = np.stack([_matrix_to_xyzrpy(m) for m in mats]).astype(np.float32)  # [N, 6]
-    except Exception as e:
-        _log.warning("Forward kinematics for cartesian state failed (%s); writing zeros", e)
-        cartesian = np.zeros((N, 6), dtype=np.float32)
-
-    return {
-        "n_frames": N,
-        "joint_position": joint,
-        "gripper_position": grip,
-        "cartesian_position": cartesian,
-        "action": action,
-        "frame_time": frame_time,
-        "duration": duration,
-    }
+def _nearest_by_wall(sample_t: np.ndarray, sample_v: np.ndarray, grid: np.ndarray) -> np.ndarray:
+    """Nearest ``sample_v`` row for each grid time by wall clock (sample_t need not be uniform)."""
+    nearest = np.abs(sample_t[None, :] - grid[:, None]).argmin(axis=1)
+    return sample_v[nearest]
 
 
-def dump_lerobot_raw(
+def dump_raw_episode(
     save_dir: Path,
     plan_path: Path,
     *,
-    motion_gen,
-    tensor_args,
+    timeline: list,
+    joint_samples: list,
+    gripper_samples: list,
     instruction: str,
     cameras: dict[str, str],
     fps: int = DEFAULT_TARGET_FPS,
-    robot_type: str = "franka",
-    timeline: list | None = None,
-    gripper_samples: list | None = None,
+    config_id: str | None = None,
+    record_start: float | None = None,
+    record_stop: float | None = None,
 ) -> Path | None:
-    """Write ``<save_dir>/_lerobot_raw.json`` from a saved ``tiptop_plan.json``.
+    """Write ``robot_state.npz`` + ``_meta.json`` (ARCHITECTURE.md §3) for one executed rollout.
 
-    ``cameras`` maps LeRobot image keys (e.g. observation.images.exterior_1_left) to
-    mp4 filenames relative to ``save_dir``. ``timeline`` is the per-step wall-clock
-    record from :func:`execute_cutamp_plan` (used for frame-accurate camera alignment).
-    ``gripper_samples`` is the measured gripper trace from a :class:`GripperSampler`
-    (used for the gripper channel; falls back to plan events if absent).
-    Returns the json path, or None if the plan was too short to export.
+    Resamples everything onto a uniform ``fps`` wall-clock grid over the execution timeline:
+      * COMMANDED arrays (cmd_joint_position/velocity, binary cmd_gripper) come from the tiptop
+        plan, spread across each step's measured [t_start, t_end] by :func:`_flatten_plan`, taken at
+        the nearest-preceding dense row per grid time.
+      * MEASURED arrays (joint_position, gripper_position) come from the samplers by nearest
+        wall-clock sample -- proprioception is the true measured state, decoupled from the command.
+
+    ``record_start`` / ``record_stop`` (epoch seconds bracketing the camera recording window from
+    :func:`recording.record_cameras`) are written into ``_meta.json`` so the build can align each
+    state frame to a camera frame by wall clock (ARCHITECTURE.md "Camera <-> state alignment"); each
+    is written as a float, or ``None`` when unavailable.
+
+    Returns the npz path, or None if the plan is too short, has no execution timeline, or the
+    measured joint trace is missing (in which case we REFUSE to fall back to plan positions -- that
+    silent fallback is the exact proprioception bug this rewrite fixes).
     """
     save_dir = Path(save_dir)
     plan_path = Path(plan_path)
     if not plan_path.is_file():
-        _log.warning("No plan at %s; skipping LeRobot raw dump", plan_path)
+        _log.warning("No plan at %s; skipping raw episode dump", plan_path)
         return None
 
-    plan = _load_plan(plan_path)
-    frames = dense_frames_from_plan(
-        plan,
-        motion_gen=motion_gen,
-        tensor_args=tensor_args,
-        target_fps=fps,
-        timeline=timeline,
-        gripper_samples=gripper_samples,
+    dense = _flatten_plan(_load_plan(plan_path), timeline=timeline)
+    t_wall = dense["t_wall"]
+    m = len(t_wall)
+    if m < 2 or not np.all(np.isfinite(t_wall)):
+        _log.warning("Plan has no usable execution timeline (%d rows, finite=%s); skipping raw episode dump",
+                     m, bool(m) and np.all(np.isfinite(t_wall)))
+        return None
+
+    # Uniform fps grid over the measured wall-clock span; the last frame clamps to t_wall[-1].
+    t0, t1 = float(t_wall[0]), float(t_wall[-1])
+    n = max(2, int(round((t1 - t0) * fps)) + 1)
+    grid = np.minimum(t0 + np.arange(n) / float(fps), t1)
+
+    # COMMANDED: nearest-preceding dense row (t_wall is non-decreasing across steps).
+    idx = np.clip(np.searchsorted(t_wall, grid, side="right") - 1, 0, m - 1)
+    cmd_joint_position = dense["positions"][idx].astype(np.float32)  # [n, 7]
+    cmd_joint_velocity = dense["velocities"][idx].astype(np.float32)  # [n, 7]
+    cmd_gripper = dense["gripper"][idx].astype(np.float32)  # [n], plan command
+    assert np.all((cmd_gripper == 0.0) | (cmd_gripper == 1.0)), "plan gripper command is not binary 0/1"
+
+    # MEASURED joints: refuse to fabricate proprioception from the plan if the trace is missing.
+    js = list(joint_samples or [])
+    if not js:
+        _log.error("MEASURED joint trace is EMPTY; refusing to dump raw episode (would falsely record "
+                   "plan positions as proprioception -- the bug this rewrite fixes). save_dir=%s", save_dir)
+        return None
+    js_t = np.asarray([s[0] for s in js], dtype=np.float64)
+    js_q = np.stack([np.asarray(s[1], dtype=np.float32).reshape(-1) for s in js])  # [K, 7]
+    if js_q.ndim != 2 or js_q.shape[1] != 7:
+        _log.error("MEASURED joint trace is unusable (shape %s); refusing to dump raw episode. save_dir=%s",
+                   js_q.shape, save_dir)
+        return None
+    joint_position = _nearest_by_wall(js_t, js_q, grid).astype(np.float32)  # [n, 7]
+
+    # MEASURED gripper: nearest closedness in [0, 1] from the gripper sampler.
+    gripper_position = _gripper_from_measurements(grid, gripper_samples)
+    if gripper_position is None:
+        _log.error("MEASURED gripper trace is unavailable; refusing to dump raw episode (proprioception "
+                   "must be measured, not a plan copy). save_dir=%s", save_dir)
+        return None
+    gripper_position = np.clip(gripper_position, 0.0, 1.0).astype(np.float32)  # [n]
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    npz_path = save_dir / "robot_state.npz"
+    np.savez(
+        npz_path,
+        joint_position=joint_position,
+        gripper_position=gripper_position,
+        cmd_joint_position=cmd_joint_position,
+        cmd_joint_velocity=cmd_joint_velocity,
+        cmd_gripper=cmd_gripper,
+        # float64: epoch seconds (~1.78e9) in float32 have 128 s resolution, collapsing every
+        # frame to one timestamp. frame_time is the master timeline, so it must stay float64.
+        frame_time=grid.astype(np.float64),
     )
-    N = frames.get("n_frames", 0)
-    if N < 2:
-        _log.warning("Plan flattened to too few frames (%d); skipping LeRobot raw dump", N)
-        return None
-
-    raw = {
-        "fps": int(fps),
+    meta = {
         "instruction": instruction,
-        "robot_type": robot_type,
+        "fps": int(fps),
+        "n_frames": int(n),
+        "config_id": config_id,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "source": "tiptop",
         "cameras": cameras,
-        "joint_position": frames["joint_position"].tolist(),
-        "gripper_position": frames["gripper_position"].tolist(),
-        "cartesian_position": frames["cartesian_position"].tolist(),
-        "action": frames["action"].tolist(),
-        "frame_time": frames["frame_time"],  # wall-clock seconds per frame, or None
+        "record_start": float(record_start) if record_start is not None else None,
+        "record_stop": float(record_stop) if record_stop is not None else None,
     }
-    out_path = save_dir / "_lerobot_raw.json"
-    with open(out_path, "w") as f:
-        json.dump(raw, f)
-    _log.info(
-        "Wrote LeRobot raw capture (%d frames, %.1fs, frame_time=%s) to %s",
-        N,
-        frames["duration"],
-        "yes" if raw["frame_time"] is not None else "no",
-        out_path,
-    )
-    return out_path
+    (save_dir / "_meta.json").write_text(json.dumps(meta, indent=2))
+    _log.info("Wrote raw episode (%d frames @ %d Hz, %.1fs) to %s", n, fps, t1 - t0, npz_path)
+    return npz_path

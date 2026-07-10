@@ -25,9 +25,19 @@ stop the file importing/running -- likely copy artifacts; verify against your co
   * `_gripper_handler` open_gripper: the `try:` was under-indented -> fixed.
   * `start_joint_velocity`: `_torch.flt32` -> `_torch.float32`.
 ----------------------------------------------------------------------------------
+DATA-FIDELITY CAVEAT (execute_trajectory): the control handler collapses a cuRobo trajectory
+to its FINAL waypoint and lets polymetis min-jerk there over the summed duration -- the
+intermediate waypoints are discarded, so the executed arm path is NOT the planned one (fine
+in free workspace). Anyone recording plan-derived commanded actions should treat the plan
+waypoints, not the executed motion, as the command source.
+
+The state_port (5557) serves get_robot_state from a cache filled by a ~100 Hz background
+poller, so encoders stay readable while _control_handler is parked inside a blocking
+move_to_joint_positions (the control socket cannot answer during motion).
+----------------------------------------------------------------------------------
 """
 from __future__ import annotations
-import argparse, logging, os, sys, threading, time
+import argparse, logging, sys, threading, time
 
 import msgpack
 import numpy as np
@@ -67,6 +77,7 @@ class RobotiqDriver:
     def __init__(self, port: str = "/dev/ttyUSB0", slave: int = 9):
         from pymodbus.client.sync import ModbusSerialClient
         self.slave = slave
+        self._last_state: dict | None = None  # last successful get_state, reused on transient read failure
         self.client = ModbusSerialClient(
             method="rtu", port=port,
             baudrate=115200, stopbits=1, bytesize=8, parity="N", timeout=1.0,
@@ -173,18 +184,34 @@ class RobotiqDriver:
         return float(255 - max(0, min(255, int(pos)))) / 255.0 * 0.085
 
     def get_state(self) -> dict:
-        st = self._read_status() or {"gPO": 255, "gCU": 0, "gOBJ": 0, "gSTA": 0, "gACT": 0, "gGTO": 0}
-        width = self.pos_to_width(st["gPO"])  # now derived from the ACTUAL position (gPO)
+        st = self._read_status()
+        if st is None:
+            # Transient Modbus read failure. Do NOT synthesize a fully-closed reading (the old
+            # gPO=255 fallback -> width 0.0), which would land in recorded gripper proprioception
+            # as a false grasp. Reuse the last good sample; if there has never been one, flag the
+            # reply stale rather than fabricate a position.
+            if self._last_state is not None:
+                return dict(self._last_state)
+            return {
+                "width": self.pos_to_width(self.OPEN_POS),
+                "is_grasped": False,
+                "is_moving": False,
+                "current": 0.0,
+                "stale": True,
+            }
+        width = self.pos_to_width(st["gPO"])  # derived from the ACTUAL position (gPO)
         is_grasped = st["gOBJ"] in (1, 2)
         is_moving = st["gOBJ"] == 0 and st["gGTO"] == 1
         # `current` is the motor current (~grasp force proxy); harmless extra field for clients
         # that ignore it (e.g. bamboo client reads only width/is_grasped/is_moving).
-        return {
+        state = {
             "width": width,
             "is_grasped": is_grasped,
             "is_moving": is_moving,
             "current": float(st.get("gCU", 0)) * 0.1,
         }
+        self._last_state = state
+        return state
 
     def close(self):
         try:
@@ -217,6 +244,7 @@ def _connect_robot(ip, port, robotiq_port: str | None = "/dev/ttyUSB0"):
 def _control_handler(socket: zmq.Socket, robot, gripper, robotiq_only: bool):
     log.info("Control loop listening...")
     while True:
+        replied = False
         try:
             req_raw = socket.recv()
             req = msgpack.unpackb(req_raw, raw=False)
@@ -317,13 +345,18 @@ def _control_handler(socket: zmq.Socket, robot, gripper, robotiq_only: bool):
                 resp = {"success": False, "error": "Franka-hand commands on control socket are not implemented (Robotiq-only setup)."}
             else:
                 resp = {"success": False, "error": f"Unknown command on control socket: {cmd}"}
+            replied = True
             socket.send(msgpack.packb(resp))
         except Exception as e:
             log.exception("control handler error")
-            try:
-                socket.send(msgpack.packb({"success": False, "error": f"shim error: {e}"}))
-            except Exception:
-                pass
+            # Only reply on error if no reply already went out. A second send on a REP socket
+            # that already sent raises EFSM (swallowed here) and wedges the socket so every later
+            # recv() throws and this thread busy-loops on errors.
+            if not replied:
+                try:
+                    socket.send(msgpack.packb({"success": False, "error": f"shim error: {e}"}))
+                except Exception:
+                    pass
 
 
 def _gripper_handler(socket: zmq.Socket, gripper):
@@ -332,6 +365,7 @@ def _gripper_handler(socket: zmq.Socket, gripper):
     STUB_WIDTH = 0.085  # max-open width (Robotiq 2F-85)
     stub_state = {"width": STUB_WIDTH, "is_grasped": False, "is_moving": False}
     while True:
+        replied = False
         try:
             req_raw = socket.recv()
             req = msgpack.unpackb(req_raw, raw=False)
@@ -351,6 +385,7 @@ def _gripper_handler(socket: zmq.Socket, gripper):
                     resp = {"success": True}
                 else:
                     resp = {"success": False, "error": f"Unknown gripper command: {cmd}"}
+                replied = True
                 socket.send(msgpack.packb(resp))
                 continue
             elif cmd == "open_gripper":
@@ -392,13 +427,92 @@ def _gripper_handler(socket: zmq.Socket, gripper):
                     resp = {"success": False, "error": str(e)}
             else:
                 resp = {"success": False, "error": f"Unknown gripper command: {cmd}"}
+            replied = True
             socket.send(msgpack.packb(resp))
         except Exception as e:
             log.exception("gripper handler error")
-            try:
-                socket.send(msgpack.packb({"success": False, "error": f"shim error: {e}"}))
-            except Exception:
-                pass
+            # Only reply on error if no reply already went out (a double send wedges the REP socket).
+            if not replied:
+                try:
+                    socket.send(msgpack.packb({"success": False, "error": f"shim error: {e}"}))
+                except Exception:
+                    pass
+
+
+class _StateCache:
+    """Thread-safe holder for the most recent robot-state sample (poller -> state handler)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._data: dict | None = None
+
+    def set(self, data: dict) -> None:
+        with self._lock:
+            self._data = data
+
+    def get(self) -> dict | None:
+        with self._lock:
+            return self._data
+
+
+def _state_poller(robot, cache: _StateCache, period_s: float = 0.01) -> None:
+    """~100 Hz background loop caching q/dq/ee-pose so the state socket never touches the robot.
+
+    polymetis get_* are independent gRPC reads, so they succeed even while _control_handler is
+    parked inside a blocking move_to_joint_positions on the control socket. A transient read error
+    keeps the last good sample rather than clearing the cache.
+    """
+    from scipy.spatial.transform import Rotation as R
+
+    while True:
+        t0 = time.time()
+        try:
+            q = robot.get_joint_positions().tolist()
+            dq = robot.get_joint_velocities().tolist()
+            ee_pos, ee_quat = robot.get_ee_pose()
+            pose = np.eye(4)
+            pose[:3, 3] = ee_pos.numpy()
+            pose[:3, :3] = R.from_quat(ee_quat.numpy()).as_matrix()
+            cache.set({
+                "q": q,
+                "dq": dq,
+                "tau_J": [0.0] * 7,
+                # bamboo expects O_T_EE as 16-float COLUMN-MAJOR (same shape as _control_handler).
+                "O_T_EE": pose.T.flatten().tolist(),
+                "time_sec": time.time(),
+            })
+        except Exception:
+            pass  # keep last good sample; gRPC hiccups during motion are transient
+        time.sleep(max(0.0, period_s - (time.time() - t0)))
+
+
+def _state_handler(socket: zmq.Socket, cache: _StateCache) -> None:
+    """Answer get_robot_state/ping instantly from ``cache`` on its own thread (never blocks)."""
+    log.info("State loop listening...")
+    while True:
+        replied = False
+        try:
+            req = msgpack.unpackb(socket.recv(), raw=False)
+            cmd = (req or {}).get("command", "")
+            if cmd == "get_robot_state":
+                data = cache.get()
+                resp = {"success": True, "data": data} if data is not None else {
+                    "success": False, "error": "state cache not warmed yet"
+                }
+            elif cmd == "ping":
+                resp = {"success": True}
+            else:
+                resp = {"success": False, "error": f"Unknown command on state socket: {cmd}"}
+            replied = True
+            socket.send(msgpack.packb(resp))
+        except Exception as e:
+            log.exception("state handler error")
+            # Only reply on error if no reply already went out (a double send wedges the REP socket).
+            if not replied:
+                try:
+                    socket.send(msgpack.packb({"success": False, "error": f"shim error: {e}"}))
+                except Exception:
+                    pass
 
 
 def main():
@@ -406,6 +520,7 @@ def main():
     p.add_argument("--bind", default="0.0.0.0")
     p.add_argument("--control-port", type=int, default=5555)
     p.add_argument("--gripper-port", type=int, default=5559)
+    p.add_argument("--state-port", type=int, default=5557)
     p.add_argument("--polymetis-ip", default="localhost")
     p.add_argument("--polymetis-port", type=int, default=50051)
     p.add_argument("--robotiq-port", default="/dev/ttyUSB0", help="serial device (set '' to stub)")
@@ -416,12 +531,19 @@ def main():
     ctx = zmq.Context.instance()
     ctrl_sock = ctx.socket(zmq.REP); ctrl_sock.bind(f"tcp://{args.bind}:{args.control_port}")
     grip_sock = ctx.socket(zmq.REP); grip_sock.bind(f"tcp://{args.bind}:{args.gripper_port}")
-    log.info(f"Bamboo-polymetis shim ready: control=tcp://{args.bind}:{args.control_port} gripper=tcp://{args.bind}:{args.gripper_port}")
+    state_sock = ctx.socket(zmq.REP); state_sock.bind(f"tcp://{args.bind}:{args.state_port}")
+    log.info(
+        f"Bamboo-polymetis shim ready: control=tcp://{args.bind}:{args.control_port} "
+        f"gripper=tcp://{args.bind}:{args.gripper_port} state=tcp://{args.bind}:{args.state_port}"
+    )
 
+    cache = _StateCache()
+    poller = threading.Thread(target=_state_poller, args=(robot, cache), daemon=True)
     t1 = threading.Thread(target=_control_handler, args=(ctrl_sock, robot, gripper, True), daemon=True)
     t2 = threading.Thread(target=_gripper_handler, args=(grip_sock, gripper), daemon=True)
-    t1.start(); t2.start()
-    t1.join(); t2.join()
+    t3 = threading.Thread(target=_state_handler, args=(state_sock, cache), daemon=True)
+    poller.start(); t1.start(); t2.start(); t3.start()
+    t1.join(); t2.join(); t3.join()
 
 
 if __name__ == "__main__":
