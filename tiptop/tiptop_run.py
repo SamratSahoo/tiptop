@@ -30,7 +30,12 @@ from scipy.spatial import KDTree
 
 from tiptop.config import load_calibration, tiptop_cfg
 from tiptop.execute_plan import execute_cutamp_plan
-from tiptop.motion_planning import build_curobo_solvers, go_to_capture
+from tiptop.motion_planning import (
+    build_curobo_solvers,
+    go_to_capture,
+    resolve_time_dilation_factor,
+    summarize_curobo_config,
+)
 from tiptop.perception.cameras import (
     Camera,
     DepthEstimator,
@@ -121,6 +126,11 @@ class _DemoContainer:
     ik_solver: IKSolver
     motion_gen: MotionGen
 
+    # Resolved cuRobo cost/tamp-parameter config the solvers were built with (summarize_curobo_config).
+    # Logged and saved per rollout so "did my cfg/tamp/*.yml override apply" is auditable after the
+    # fact, not just live in the warmup console (see async_entrypoint).
+    curobo_config_summary: dict
+
 
 @dataclass
 class ProcessedScene:
@@ -148,6 +158,7 @@ def get_demo_container(
     collision_activation_distance: float,
     enable_recording: bool = False,
     cost_overrides: dict | None = None,
+    curobo_config_summary: dict | None = None,
 ) -> _DemoContainer:
     """Cache and warm-up everything needed for the live demo."""
     _log.info("Starting demo warmup...")
@@ -201,6 +212,7 @@ def get_demo_container(
         gripper_mask=load_gripper_mask(),
         ik_solver=ik_solver,
         motion_gen=motion_gen,
+        curobo_config_summary=curobo_config_summary or {},
     )
 
 
@@ -718,6 +730,12 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
 
                 # Add log file handler for this run
                 file_handler = add_file_handler(save_dir / "tiptop_run.log")
+                # Record the resolved cuRobo override config INTO this rollout's log (the warmup-time
+                # "RESOLVED cuRobo cost" line predates this handler, so it never lands on disk). Also
+                # drop a curobo_config.json alongside it so applied overrides are auditable per episode.
+                _resolved = container.curobo_config_summary or {}
+                _log.info(f"cuRobo config for this rollout: {json.dumps(_resolved)}")
+                (save_dir / "curobo_config.json").write_text(json.dumps(_resolved, indent=2))
                 try:
                     # Capture robot state and compute camera pose
                     observation = capture_live_observation(container)
@@ -889,6 +907,14 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 else:
                     _log.info("User requested exit")
                 break
+            except Exception as e:
+                # A single rollout failing (a transient Gemini/perception 503, a planning
+                # error, a health-check blip, ...) must NOT tear down the warmed session --
+                # otherwise "collect another" would lose the whole warmed container and force
+                # a full re-warm. Log it (the traceback streams to the data-collection UI),
+                # then loop back to the task prompt so the user can just retry.
+                _log.exception(f"Rollout failed ({type(e).__name__}: {e}); keeping session warm, returning to task prompt")
+                continue
 
 
 def _sync_entrypoint(
@@ -927,16 +953,25 @@ def _sync_entrypoint(
     from tiptop.tiptop_websocket_server import _load_curobo_overrides
 
     cost_overrides = _load_curobo_overrides(curobo_overrides)
+    cfg = tiptop_cfg()
+    # time_dilation_factor[_literal] is a plan-time knob (not a cuRobo cost weight), so it is NOT
+    # handled by build_curobo_solvers/apply_cost_overrides — resolve it here and thread it into the
+    # TAMP config, mirroring tiptop_websocket_server. Without this, cfg/tamp/{tdf,vae_tdf}.yml's
+    # time_dilation_factor_literal would be silently dropped.
+    time_dilation_factor = resolve_time_dilation_factor(cost_overrides, cfg.robot.time_dilation_factor)
+    # Resolved cost/tamp-param config the solvers get built with; stashed on the container so each
+    # rollout can record it (async_entrypoint), making override application auditable per episode.
+    curobo_config_summary = summarize_curobo_config(cost_overrides, time_dilation_factor)
     if cost_overrides:
         _log.info(f"cuRobo cost overrides active: {cost_overrides}")
+        _log.info(f"Resolved time_dilation_factor={time_dilation_factor}")
 
-    cfg = tiptop_cfg()
     config = build_tamp_config(
         num_particles=num_particles,
         max_planning_time=max_planning_time,
         opt_steps=opt_steps_per_skeleton,
         robot_type=cfg.robot.type,
-        time_dilation_factor=cfg.robot.time_dilation_factor,
+        time_dilation_factor=time_dilation_factor,
         collision_activation_distance=0.0,
         enable_visualizer=cutamp_visualize,
     )
@@ -944,7 +979,9 @@ def _sync_entrypoint(
     global _executor_pool
     setup_logging(level=logging.DEBUG)
 
-    container = get_demo_container(num_particles, config.coll_n_spheres, 0.0, enable_recording, cost_overrides)
+    container = get_demo_container(
+        num_particles, config.coll_n_spheres, 0.0, enable_recording, cost_overrides, curobo_config_summary
+    )
     # Workers ignore SIGINT so only the main process handles Ctrl+C for clean shutdown
     _executor_pool = ProcessPoolExecutor(
         max_workers=4, initializer=signal.signal, initargs=(signal.SIGINT, signal.SIG_IGN)

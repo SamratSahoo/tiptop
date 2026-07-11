@@ -25,11 +25,13 @@ stop the file importing/running -- likely copy artifacts; verify against your co
   * `_gripper_handler` open_gripper: the `try:` was under-indented -> fixed.
   * `start_joint_velocity`: `_torch.flt32` -> `_torch.float32`.
 ----------------------------------------------------------------------------------
-DATA-FIDELITY CAVEAT (execute_trajectory): the control handler collapses a cuRobo trajectory
-to its FINAL waypoint and lets polymetis min-jerk there over the summed duration -- the
-intermediate waypoints are discarded, so the executed arm path is NOT the planned one (fine
-in free workspace). Anyone recording plan-derived commanded actions should treat the plan
-waypoints, not the executed motion, as the command source.
+EXECUTION MODE (execute_trajectory): by default the control handler streams every cuRobo waypoint
+through joint impedance so the arm tracks the planned path -- including the DROID-manifold
+jerkiness that vae_manifold_weight induces. Pass --endpoint-exec to revert to the legacy behavior,
+which collapses a trajectory to its FINAL waypoint and lets polymetis min-jerk there over the
+summed duration (intermediate waypoints discarded, so the executed arm path is NOT the planned one
+-- fine in free workspace). Under --endpoint-exec, anyone recording plan-derived commanded actions
+should treat the plan waypoints, not the executed motion, as the command source.
 
 The state_port (5557) serves get_robot_state from a cache filled by a ~100 Hz background
 poller, so encoders stay readable while _control_handler is parked inside a blocking
@@ -241,8 +243,8 @@ def _connect_robot(ip, port, robotiq_port: str | None = "/dev/ttyUSB0"):
     return robot, gripper
 
 
-def _control_handler(socket: zmq.Socket, robot, gripper, robotiq_only: bool):
-    log.info("Control loop listening...")
+def _control_handler(socket: zmq.Socket, robot, gripper, robotiq_only: bool, dense_exec: bool = True):
+    log.info(f"Control loop listening... (dense_exec={dense_exec})")
     while True:
         replied = False
         try:
@@ -274,10 +276,40 @@ def _control_handler(socket: zmq.Socket, robot, gripper, robotiq_only: bool):
                 default_duration = float(data.get("default_duration", 0.5))
                 if not waypoints:
                     resp = {"success": False, "error": "empty waypoints"}
+                elif dense_exec and len(waypoints) > 1:
+                    # Dense execution: stream EVERY cuRobo waypoint through a joint-impedance
+                    # controller so the arm tracks the planned path -- including the DROID-manifold
+                    # jerkiness that vae_manifold_weight induces. Contrast with the endpoint path
+                    # below, which min-jerks to the final waypoint and discards the plan's shape.
+                    import torch
+                    try:
+                        robot.start_joint_impedance()
+                        streamed = 0
+                        for wp in waypoints:
+                            q = wp.get("q_goal") or []
+                            if len(q) != 7:
+                                raise ValueError(f"waypoint {streamed} q_goal len {len(q)} != 7")
+                            d = float(wp.get("duration", default_duration))
+                            robot.update_desired_joint_positions(torch.tensor(q, dtype=torch.float32))
+                            time.sleep(d if d > 0 else default_duration)
+                            streamed += 1
+                        # Leave the arm holding the final setpoint for the next command.
+                        robot.terminate_current_policy()
+                        log.info(f"  trajectory: streamed {streamed} dense waypoints (joint impedance)")
+                        resp = {"success": True}
+                    except Exception as e:
+                        log.exception("dense trajectory exec failed")
+                        try:
+                            robot.terminate_current_policy()  # don't leave a half-run policy active
+                        except Exception:
+                            pass
+                        resp = {"success": False, "error": str(e)}
                 else:
-                    # Sum the per-waypoint durations to get total trajectory time, then send only the FINAL
-                    # waypoint to polymetis. Polymetis will min-jerk to the goal in `total_dur` seconds.
-                    # cuRobo's intermediate waypoints are lost — fine in free workspace.
+                    # Endpoint execution (legacy, --endpoint-exec): sum the per-waypoint durations to
+                    # get total trajectory time, then send only the FINAL waypoint to polymetis, which
+                    # min-jerks to the goal in `total_dur` seconds. cuRobo's intermediate waypoints are
+                    # lost -- fine in free workspace, but it erases the planned trajectory shape (the
+                    # default dense path above tracks it instead).
                     total_dur = 0.0
                     for wp in waypoints:
                         d = float(wp.get("duration", default_duration))
@@ -524,7 +556,16 @@ def main():
     p.add_argument("--polymetis-ip", default="localhost")
     p.add_argument("--polymetis-port", type=int, default=50051)
     p.add_argument("--robotiq-port", default="/dev/ttyUSB0", help="serial device (set '' to stub)")
+    p.add_argument(
+        "--endpoint-exec",
+        action="store_true",
+        help="revert to the legacy endpoint behavior: min-jerk to each segment's FINAL waypoint and "
+        "discard the intermediate ones. The default streams cuRobo's dense waypoints through joint "
+        "impedance so the arm tracks the planned path (incl. DROID-manifold jerkiness from "
+        "vae_manifold_weight).",
+    )
     args = p.parse_args()
+    dense_exec = not args.endpoint_exec
 
     robot, gripper = _connect_robot(args.polymetis_ip, args.polymetis_port, args.robotiq_port or None)
 
@@ -539,7 +580,7 @@ def main():
 
     cache = _StateCache()
     poller = threading.Thread(target=_state_poller, args=(robot, cache), daemon=True)
-    t1 = threading.Thread(target=_control_handler, args=(ctrl_sock, robot, gripper, True), daemon=True)
+    t1 = threading.Thread(target=_control_handler, args=(ctrl_sock, robot, gripper, True, dense_exec), daemon=True)
     t2 = threading.Thread(target=_gripper_handler, args=(grip_sock, gripper), daemon=True)
     t3 = threading.Thread(target=_state_handler, args=(state_sock, cache), daemon=True)
     poller.start(); t1.start(); t2.start(); t3.start()
