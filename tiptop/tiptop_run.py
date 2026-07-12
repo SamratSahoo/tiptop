@@ -1,4 +1,5 @@
 import asyncio
+import ctypes
 import json
 import os
 import logging
@@ -33,6 +34,7 @@ from tiptop.execute_plan import execute_cutamp_plan
 from tiptop.motion_planning import (
     build_curobo_solvers,
     go_to_capture,
+    go_to_home,
     resolve_time_dilation_factor,
     summarize_curobo_config,
 )
@@ -69,7 +71,7 @@ from tiptop.utils import (
     remove_file_handler,
     setup_logging,
 )
-from tiptop.lerobot_capture import GripperSampler, JointSampler, dump_raw_episode
+from tiptop.lerobot_capture import GRIPPER_MAX_WIDTH, GripperSampler, JointSampler, _read_gripper_width, dump_raw_episode
 from tiptop.viz_utils import get_gripper_mesh, get_heatmap
 from tiptop.workspace import workspace_cuboids
 
@@ -79,7 +81,26 @@ tensor_args = TensorDeviceType()
 # Sampling rate for the LeRobot DROID-format capture during plan execution (matches DROID).
 LEROBOT_FPS = 15
 
+# A measured gripper width (metres) at or above this counts as "already open", so the
+# per-episode reset skips re-issuing an open. 90% of the Robotiq 2F-85 full span.
+GRIPPER_OPEN_WIDTH = 0.9 * GRIPPER_MAX_WIDTH
+
 _executor_pool = None
+
+
+def _init_pool_worker() -> None:
+    """Set up a save-worker process.
+
+    Ignores SIGINT so only the main process handles Ctrl+C, and asks the kernel to SIGTERM this
+    worker if its parent dies. Without the death signal, force-killing a run (SIGKILL, so no atexit
+    hook runs) strands the workers: they are reparented to init and survive indefinitely.
+    """
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        PR_SET_PDEATHSIG = 1
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+    except (OSError, AttributeError):  # non-Linux or no libc: best effort, the pool still works
+        pass
 
 
 class UserExitException(Exception):
@@ -705,15 +726,26 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 task_instruction = _get_task_instruction()  # Let UserExitException propagate
                 _log.info(f"User entered instruction: {task_instruction}")
 
+                # Reset to a clean starting state for the new episode: return the arm home
+                # and open the gripper -- but only when they aren't already so. go_to_home
+                # no-ops when the arm is already at q_home (go_to_q's distance check), and the
+                # gripper open is skipped when the measured width already reads open. This
+                # matters most right after a force-stop abort, where the arm may be left
+                # mid-motion still gripping an object.
+                _log.info("Resetting robot for new episode: return home + open gripper (if not already)")
+                go_to_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+                try:
+                    width = _read_gripper_width(container.robot)
+                    if width is not None and width >= GRIPPER_OPEN_WIDTH:
+                        _log.info(f"Gripper already open (width={width:.3f} m >= {GRIPPER_OPEN_WIDTH:.3f} m); skipping open")
+                    else:
+                        _log.info(f"Opening gripper (measured width={width})")
+                        container.robot.open_gripper()
+                except Exception as _e:
+                    _log.exception('Gripper open/check failed: ' + str(_e))
+
                 _log.debug("Moving robot to capture joint positions")
                 go_to_capture(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
-                # PATCH: wrap in try/except + log so we see hangs
-                try:
-                    _log.info('[DEBUG] About to call open_gripper()')
-                    container.robot.open_gripper()
-                    _log.info('[DEBUG] open_gripper() returned OK')
-                except Exception as _e:
-                    _log.exception('[DEBUG] open_gripper FAILED: ' + str(_e))
 
                 now = datetime.now()
                 timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
@@ -901,12 +933,18 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 finally:
                     # Always remove the file handler after the run
                     remove_file_handler(file_handler)
-            except (UserExitException, KeyboardInterrupt) as e:
-                if isinstance(e, KeyboardInterrupt):
-                    _log.info("Interrupted by user (Ctrl+C)")
-                else:
-                    _log.info("User requested exit")
+            except UserExitException:
+                _log.info("User requested exit")
                 break
+            except KeyboardInterrupt:
+                # Force-stop from the data-collection UI (SIGINT), or a terminal Ctrl-C. Treat it
+                # as "abort THIS rollout" rather than "end the session": unwind the in-flight
+                # rollout (its finally-blocks have already run during propagation) and loop back
+                # to the task prompt so another episode can be collected without a full re-warm.
+                # The graceful stop path ("q\n" -> UserExitException) is what ends the session.
+                _log.info("Rollout aborted (Ctrl-C / force stop); keeping session warm, returning to task prompt")
+                _emit_event({"event": "rollout_aborted"})
+                continue
             except Exception as e:
                 # A single rollout failing (a transient Gemini/perception 503, a planning
                 # error, a health-check blip, ...) must NOT tear down the warmed session --
@@ -982,10 +1020,15 @@ def _sync_entrypoint(
     container = get_demo_container(
         num_particles, config.coll_n_spheres, 0.0, enable_recording, cost_overrides, curobo_config_summary
     )
-    # Workers ignore SIGINT so only the main process handles Ctrl+C for clean shutdown
-    _executor_pool = ProcessPoolExecutor(
-        max_workers=4, initializer=signal.signal, initargs=(signal.SIGINT, signal.SIG_IGN)
-    )
+    # Workers fork from a process that has already initialised CUDA (curobo + the ZED cameras), so
+    # they inherit its CUDA context. That costs no extra VRAM while we are alive, but the driver
+    # cannot reclaim the context until every process holding it exits -- so a worker that outlives a
+    # force-killed run pins ~3.8GB of VRAM until reboot, and the next run OOMs (including inside
+    # zed.open(), which needs GPU memory to decode an SVO). _init_pool_worker's death signal is what
+    # guarantees they never outlive us. Do NOT switch this to forkserver/spawn to dodge the
+    # inheritance: those re-import this module in each worker, and importing it initialises CUDA,
+    # giving every worker its own ~600MB context -- strictly worse.
+    _executor_pool = ProcessPoolExecutor(max_workers=4, initializer=_init_pool_worker)
 
     exit_code = 1
     try:
@@ -1007,7 +1050,19 @@ def _sync_entrypoint(
                 container.external_cam_2.close()
             container.robot.close()
         if _executor_pool is not None:
+            # Reap the workers rather than just detaching from them: cancel what has not started,
+            # then give a save in flight a moment to finish before terminating the stragglers.
+            # shutdown() drops the executor's handles on its workers, so grab them first. The 5s is a
+            # budget shared across all of them, not per worker, so a pool of stragglers cannot add
+            # 5s each to shutdown.
+            workers = list((getattr(_executor_pool, "_processes", None) or {}).values())
             _executor_pool.shutdown(wait=False, cancel_futures=True)
+            deadline = time.monotonic() + 5.0
+            for proc in workers:
+                proc.join(timeout=max(0.0, deadline - time.monotonic()))
+                if proc.is_alive():
+                    _log.warning(f"Save worker {proc.pid} still alive after shutdown; terminating")
+                    proc.terminate()
         # Wait for any background per-rollout post-processing (gifs + LeRobot export) to finish
         # so the session doesn't exit mid-export. Ctrl-C here leaves them running detached.
         pending = [p for p in _postprocess_procs if p.poll() is None]

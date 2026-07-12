@@ -9,7 +9,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from tiptop.perception.cameras.zed_camera import CorruptSVOError, convert_svo_to_mp4
+from tiptop.perception.cameras.zed_camera import CorruptSVOError, SVOGPUMemoryError, convert_svo_to_mp4
 
 _log = logging.getLogger(__name__)
 
@@ -56,6 +56,12 @@ def svo_to_mp4_entrypoint():
         except CorruptSVOError as e:
             _log.warning(f"Skipping corrupted SVO {svo_path.name}: {e}")
             corrupted.append(svo_path)
+        except SVOGPUMemoryError as e:
+            # The files are fine, the GPU is full -- so every remaining one would fail the same way.
+            # Stop rather than march on and report a directory of good recordings as corrupted.
+            _log.error(f"{e}")
+            _log.error(f"Aborting with {len(svo_files) - svo_files.index(svo_path)} file(s) left to convert.")
+            return
 
     if corrupted:
         _log.warning(

@@ -267,6 +267,16 @@ class CorruptSVOError(RuntimeError):
     """
 
 
+class SVOGPUMemoryError(RuntimeError):
+    """Raised when the GPU is too full for the ZED SDK to open an SVO for decoding.
+
+    The recording on disk is INTACT -- this is a transient resource failure, not corruption.
+    Opening an SVO allocates a CUDA decode context, so it fails when something else is holding
+    VRAM. The .svo2 is left in place and converts fine once the GPU frees up; do not discard the
+    episode on this error.
+    """
+
+
 def convert_svo_to_mp4(svo_path: Path, mp4_path: Path, crf: int = 20):
     """Convert SVO file to MP4 video (left RGB only) using ffmpeg for efficient compression.
 
@@ -295,6 +305,18 @@ def convert_svo_to_mp4(svo_path: Path, mp4_path: Path, crf: int = 20):
     zed = sl.Camera()
     err = zed.open(init_params)
     if err != sl.ERROR_CODE.SUCCESS:
+        # Opening an SVO allocates a CUDA decode context, so a full GPU fails here with a code that
+        # says nothing about the file. Reporting that as corruption throws away a perfectly good
+        # recording, so keep the two apart: only a genuine file problem is CorruptSVOError.
+        if err in (
+            sl.ERROR_CODE.NOT_ENOUGH_GPU_MEMORY,
+            sl.ERROR_CODE.NO_GPU_DETECTED,
+            sl.ERROR_CODE.NO_GPU_COMPATIBLE,
+        ):
+            raise SVOGPUMemoryError(
+                f"Cannot open SVO file -- the GPU is unavailable, the recording itself is fine: "
+                f"{svo_path} ({err}). Free VRAM and re-run the conversion; the .svo2 is kept on disk."
+            )
         # A truncated/corrupted recording (ZED auto-repair already tried and failed)
         # reports INVALID_SVO_FILE here. Surface it as recoverable so batch
         # conversion can skip this file and still process the others.
