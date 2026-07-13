@@ -14,6 +14,14 @@ libc = { family = "glibc", version = "2.31" }
 # cannot infer the version. Pin it so the editable install of tiptop builds.
 SETUPTOOLS_SCM_PRETEND_VERSION_FOR_TIPTOP = "0.1.0"
 
+# opencv links liblapack.so.3 -> libmkl_rt.so.2, which lands in the same process as
+# the libmkl_intel_lp64 that torch links directly. Both drive one shared libmkl_core,
+# and the threaded LAPACK path then returns a corrupt pivot array: cuRobo's
+# get_stomp_cov() dies in torch.inverse with "Pivots given to lu_solve...".
+# Serializing MKL avoids the threaded path. Planning runs on the GPU, so this costs
+# nothing that matters.
+MKL_NUM_THREADS = "1"
+
 [dependencies]
 # higher-level dependencies
 python = "3.12.*"

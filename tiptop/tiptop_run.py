@@ -103,6 +103,40 @@ def _init_pool_worker() -> None:
         pass
 
 
+_preempting = False  # a rollout abort is unwinding; extra SIGINTs are absorbed until it finishes
+
+
+def _sigint_preempt(_signum, _frame) -> None:
+    """SIGINT preempts the CURRENT ROLLOUT; it must never kill the warmed session.
+
+    The first Ctrl-C (or the data-collection UI's Preempt button) raises KeyboardInterrupt, which
+    the rollout loop catches and turns into "abort this rollout, go back to the task prompt".
+
+    Unwinding is not instant -- the cameras stop and the SVO is converted to MP4, which takes
+    several seconds. A second Ctrl-C landing in that window used to be raised inside the loop's own
+    KeyboardInterrupt handler (or a finally block), escaping to the top-level handler and killing
+    the session. So while a preempt is already unwinding, further SIGINTs are absorbed.
+
+    This only softens SIGINT. SIGTERM/SIGKILL -- what the UI's Stop button escalates to, and what
+    `q` at the prompt does gracefully -- still end the session.
+    """
+    global _preempting
+    if _preempting:
+        _log.warning(
+            "Preempt already in progress (closing out the recording) -- ignoring extra Ctrl-C. "
+            "The session stays warm; use Stop/Finish to end it."
+        )
+        return
+    _preempting = True
+    raise KeyboardInterrupt
+
+
+def _clear_preempt() -> None:
+    """Called once a rollout abort has fully unwound, so the next Ctrl-C preempts again."""
+    global _preempting
+    _preempting = False
+
+
 class UserExitException(Exception):
     """Raised when user explicitly requests to exit."""
 
@@ -285,12 +319,54 @@ def _label_rollout(save_dir: Path, output_dir: str, timestamp: str) -> Path:
 _LAST_TASK: str | None = None
 _postprocess_procs: list[subprocess.Popen] = []
 
+# Manual robot commands accepted at the task prompt, in place of a task instruction. The
+# data-collection UI's top-bar buttons drive these over stdin; a terminal user can just type them.
+# They run BETWEEN rollouts (the prompt is the one point where the arm is idle and stdin is being
+# read), reusing the warmed container -- so no cuRobo re-warm and no second robot connection.
+ROBOT_COMMANDS = ("home", "open")
+
+
+def _open_gripper_if_needed(container) -> float | None:
+    """Open the gripper unless the measured width already reads open. Returns the measured width."""
+    width = _read_gripper_width(container.robot)
+    if width is not None and width >= GRIPPER_OPEN_WIDTH:
+        _log.info(f"Gripper already open (width={width:.3f} m >= {GRIPPER_OPEN_WIDTH:.3f} m); skipping open")
+        return width
+    _log.info(f"Opening gripper (measured width={width})")
+    container.robot.open_gripper()
+    return width
+
+
+def _run_robot_command(container, cfg, cmd: str) -> None:
+    """Run a manual robot command typed at the task prompt.
+
+    Never raises: a failed nudge (controller hiccup, gripper unreadable) must not tear down the
+    warmed session -- the user should just land back at the prompt and be able to retry.
+    """
+    try:
+        if cmd == "home":
+            _log.info("Manual command: returning the arm home")
+            go_to_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+        elif cmd == "open":
+            _log.info("Manual command: opening the gripper")
+            _open_gripper_if_needed(container)
+        else:
+            raise ValueError(f"Unknown robot command: {cmd}")
+        _emit_event({"event": "robot_command", "command": cmd, "ok": True})
+    except Exception as e:
+        _log.exception(f"Manual robot command '{cmd}' failed: {e}")
+        _emit_event({"event": "robot_command", "command": cmd, "ok": False, "error": str(e)})
+
 
 def _get_task_instruction() -> str:
     """Task for the next rollout. The first comes from ``TIPTOP_TASK`` (non-interactive
     launch); subsequent ones are prompted interactively so the warmed container is reused
     across rollouts. Enter repeats the last task, typing a new one changes it, and
-    'q'/'exit'/Ctrl-D ends the session (raising UserExitException)."""
+    'q'/'exit'/Ctrl-D ends the session (raising UserExitException).
+
+    A ROBOT_COMMANDS word ('home'/'open') is returned as-is instead of a task; the caller runs it
+    and re-prompts. It is deliberately NOT remembered as the last task, so a later bare Enter still
+    repeats the real instruction rather than nudging the robot again."""
     global _LAST_TASK
     env_task = os.environ.get('TIPTOP_TASK', '')
     if env_task:
@@ -304,11 +380,13 @@ def _get_task_instruction() -> str:
     suffix = f" [{_LAST_TASK}]" if _LAST_TASK else ""
     _emit_event({"event": "awaiting_task"})
     try:
-        raw = input(f"\nNext task (Enter = repeat{suffix}, 'q' to quit): ").strip()
+        raw = input(f"\nNext task (Enter = repeat{suffix}, 'home'/'open' to nudge the robot, 'q' to quit): ").strip()
     except EOFError:
         raise UserExitException('EOF; ending session')
     if raw.lower() in ('q', 'exit', 'quit'):
         raise UserExitException('user quit')
+    if raw.lower() in ROBOT_COMMANDS:
+        return raw.lower()  # a robot nudge, not a task -- leave _LAST_TASK alone
     if not raw:
         if _LAST_TASK:
             return _LAST_TASK
@@ -724,6 +802,11 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # prompt) ends the session without moving to capture + opening the gripper --
                 # which would drop whatever is currently held. Reuses the warmed container.
                 task_instruction = _get_task_instruction()  # Let UserExitException propagate
+                # A robot nudge ('home'/'open') from the UI's top bar or the prompt: run it against
+                # the warm container and go straight back to the prompt -- no rollout, no episode.
+                if task_instruction in ROBOT_COMMANDS:
+                    _run_robot_command(container, cfg, task_instruction)
+                    continue
                 _log.info(f"User entered instruction: {task_instruction}")
 
                 # Reset to a clean starting state for the new episode: return the arm home
@@ -735,12 +818,7 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 _log.info("Resetting robot for new episode: return home + open gripper (if not already)")
                 go_to_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
                 try:
-                    width = _read_gripper_width(container.robot)
-                    if width is not None and width >= GRIPPER_OPEN_WIDTH:
-                        _log.info(f"Gripper already open (width={width:.3f} m >= {GRIPPER_OPEN_WIDTH:.3f} m); skipping open")
-                    else:
-                        _log.info(f"Opening gripper (measured width={width})")
-                        container.robot.open_gripper()
+                    _open_gripper_if_needed(container)
                 except Exception as _e:
                     _log.exception('Gripper open/check failed: ' + str(_e))
 
@@ -937,13 +1015,25 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 _log.info("User requested exit")
                 break
             except KeyboardInterrupt:
-                # Force-stop from the data-collection UI (SIGINT), or a terminal Ctrl-C. Treat it
+                # Preempt from the data-collection UI (SIGINT), or a terminal Ctrl-C. Treat it
                 # as "abort THIS rollout" rather than "end the session": unwind the in-flight
                 # rollout (its finally-blocks have already run during propagation) and loop back
                 # to the task prompt so another episode can be collected without a full re-warm.
                 # The graceful stop path ("q\n" -> UserExitException) is what ends the session.
-                _log.info("Rollout aborted (Ctrl-C / force stop); keeping session warm, returning to task prompt")
+                #
+                # NOTE: this stops us sending any further plan steps, but it cannot stop a
+                # trajectory the controller is already executing -- bamboo hands the whole segment
+                # over in one execute_trajectory request and has no abort command, so the arm runs
+                # to the end of the current segment regardless. The hardware E-stop is the only
+                # instant stop. See the Preempt copy in the data-collection UI.
+                _log.info(
+                    "Rollout aborted (Ctrl-C / preempt); no further plan steps will be sent. "
+                    "Keeping session warm, returning to task prompt"
+                )
                 _emit_event({"event": "rollout_aborted"})
+                # Unwind is done (the finally-blocks above ran as the exception propagated), so a
+                # new Ctrl-C should preempt the next rollout rather than be swallowed.
+                _clear_preempt()
                 continue
             except Exception as e:
                 # A single rollout failing (a transient Gemini/perception 503, a planning
@@ -1029,6 +1119,12 @@ def _sync_entrypoint(
     # inheritance: those re-import this module in each worker, and importing it initialises CUDA,
     # giving every worker its own ~600MB context -- strictly worse.
     _executor_pool = ProcessPoolExecutor(max_workers=4, initializer=_init_pool_worker)
+
+    # SIGINT preempts the current rollout instead of ending the session -- and stays safe when it is
+    # pressed repeatedly, which is exactly what a user does when the arm keeps moving through the
+    # tail of its current trajectory segment. Installed after the pool so its workers (which set
+    # SIG_IGN in their own initializer) are unaffected.
+    signal.signal(signal.SIGINT, _sigint_preempt)
 
     exit_code = 1
     try:
