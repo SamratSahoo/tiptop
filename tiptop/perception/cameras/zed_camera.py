@@ -194,10 +194,14 @@ class ZedCamera:
         if not filename.endswith(".svo"):
             raise ValueError("Recording filename must end with .svo")
 
+        # H265 needs NVENC, which requires ZED SDK >= 5.2.3 on Blackwell GPUs -- older SDKs ship a
+        # Video Codec SDK that fails to init against driver 590+, and every hardware codec then dies
+        # with a bare SVO_RECORDING_ERROR. Fall back to SVO_COMPRESSION_MODE.LOSSLESS (CPU, ~30x
+        # larger) if this ever has to run on an older SDK.
         recording_param = sl.RecordingParameters(filename, sl.SVO_COMPRESSION_MODE.H265)
         err = self._cam.enable_recording(recording_param)
         if err != sl.ERROR_CODE.SUCCESS:
-            raise RuntimeError(f"Failed to enable recording to {filename}")
+            raise RuntimeError(f"Failed to enable recording to {filename} ({err})")
         self._is_recording = True
         _log.info(f"Started recording to {filename}")
 

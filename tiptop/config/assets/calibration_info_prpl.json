@@ -1,0 +1,26 @@
+{
+  "13222437": {
+    "pose": [
+      0.036207971410110555,
+      0.06407676270687518,
+      -0.13043551656474742,
+      -0.3151342738995566,
+      0.0029161864368973944,
+      3.1284929752078874
+    ],
+    "timestamp": 1783989345.529895,
+    "source": "derived from droid 13222437_left via the tiptop<-droid EE-frame offset solved on 14846828 (-90deg yaw, 0.145m z); NOT a direct tiptop calibrate-wrist-cam measurement -- verify with viz-calibration, re-measure to replace"
+  },
+  "39379013": {
+    "pose": [
+      0.19564110524574535,
+      0.45448597428043697,
+      0.41536133654252017,
+      -2.0390496919615537,
+      0.017103113577024764,
+      -2.486228089521667
+    ],
+    "timestamp": 1783991597.6599455,
+    "source": "copied verbatim from droid 39379013_left; tiptop and droid agree exactly on third-person extrinsics (verified on 32439448)"
+  }
+}

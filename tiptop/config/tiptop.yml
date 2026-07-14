@@ -23,16 +23,20 @@ cameras:
   # camera frames by hardware timestamp, so 15 fps capture loses nothing. If you still see
   # LOW USB BANDWIDTH, drop resolution next (HD720 -> VGA) or move a camera to its own USB3
   # controller. ZED HD720 supports 15/30/60 fps.
+  # Serials default to the lab's usual ZEDs. When a camera is swapped for another unit, export
+  # TIPTOP_HAND_CAMERA_ID / TIPTOP_EXTERNAL_CAMERA_ID / TIPTOP_EXTERNAL_2_CAMERA_ID instead of
+  # editing this file; droid reads the same variables (droid/droid/misc/parameters.py). Any serial
+  # you point at needs its own entry in calibration_info.json — extrinsics are keyed by serial.
   # Hand (wrist) camera — used for perception
   hand:
-    serial: "14846828"
+    serial: "${oc.env:TIPTOP_HAND_CAMERA_ID,14846828}"
     type: zed
     resolution: HD720
     fps: 15
 
   # External (side) camera — optional, for recording / viz only
   external:
-    serial: "32439448"
+    serial: "${oc.env:TIPTOP_EXTERNAL_CAMERA_ID,32439448}"
     type: zed
     resolution: HD720
     fps: 15
@@ -41,7 +45,7 @@ cameras:
   # tiptop aborts at startup if a configured camera can't open, so no rollout is collected
   # missing a camera. For a deliberate 2-camera setup, just leave this commented out.
   # external_2:
-  #   serial: "31425515"
+  #   serial: "${oc.env:TIPTOP_EXTERNAL_2_CAMERA_ID,31425515}"
   #   type: zed
   #   resolution: HD720
   #   fps: 15

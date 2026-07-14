@@ -97,45 +97,53 @@ def record_cameras(recordings: list[tuple[ZedCamera, Path, Path | None]]) -> Gen
     Args:
         recordings: List of (camera, svo_path, mp4_path) tuples
     """
-    stop_events: list[threading.Event] = []
-    threads: list[threading.Thread] = []
+    started: list[tuple[ZedCamera, Path, Path | None, threading.Event, threading.Thread]] = []
     window: dict[str, float] = {}
 
-    for camera, svo_path, _ in recordings:
-        stop_event = threading.Event()
+    def stop_all():
+        # Signal all cameras to stop simultaneously so recordings are the same length
+        for _, _, _, stop_event, _ in started:
+            stop_event.set()
+        for camera, _, _, _, thread in started:
+            thread.join(timeout=3.0)
+            camera.stop_recording()
+            _log.info(f"Stopped recording camera {camera.serial}")
 
-        def recording_loop(cam=camera, event=stop_event):
-            while not event.is_set():
-                try:
-                    cam.read_camera()
-                except Exception as e:
-                    _log.error(f"Error grabbing frame during recording: {e}")
-                    break
+    try:
+        for camera, svo_path, mp4_path in recordings:
+            stop_event = threading.Event()
 
-        camera.start_recording(str(svo_path))
-        thread = threading.Thread(target=recording_loop)
-        thread.start()
-        _log.info(f"Started recording camera {camera.serial} to {svo_path}")
-        stop_events.append(stop_event)
-        threads.append(thread)
+            def recording_loop(cam=camera, event=stop_event):
+                while not event.is_set():
+                    try:
+                        cam.read_camera()
+                    except Exception as e:
+                        _log.error(f"Error grabbing frame during recording: {e}")
+                        break
+
+            camera.start_recording(str(svo_path))
+            thread = threading.Thread(target=recording_loop)
+            thread.start()
+            _log.info(f"Started recording camera {camera.serial} to {svo_path}")
+            started.append((camera, svo_path, mp4_path, stop_event, thread))
+    except BaseException:
+        # A camera failing to start leaves the earlier ones recording with live grab threads, which
+        # then hold the devices and break every subsequent rollout in a warm session. Stop them and
+        # let the original error propagate -- no MP4 conversion, it would mask the real failure.
+        stop_all()
+        raise
 
     window["t_start"] = time.time()
     try:
         yield window
     finally:
-        # Signal all cameras to stop simultaneously so recordings are the same length
-        for event in stop_events:
-            event.set()
-        for (camera, svo_path, _), thread in zip(recordings, threads):
-            thread.join(timeout=3.0)
-            camera.stop_recording()
-            _log.info(f"Stopped recording camera {camera.serial}")
+        stop_all()
         # Recording window closes when the cameras stop; the SVO->MP4 conversion below must NOT
         # count as recording time, so stamp t_stop before it.
         window["t_stop"] = time.time()
 
         # Convert to MP4 after all cameras have stopped
-        for camera, svo_path, mp4_path in recordings:
+        for _, svo_path, mp4_path, _, _ in started:
             if mp4_path is None:
                 continue
             actual_svo_path = svo_path
