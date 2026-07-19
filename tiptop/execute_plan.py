@@ -16,12 +16,17 @@ _log = logging.getLogger(__name__)
 # so it is filtered out.
 #
 # We overlap the actuation with the FOLLOWING trajectory (the lift after a close, the retreat
-# after an open) so the arm keeps moving across the transition. The bamboo gripper command blocks
-# until the gripper physically settles (the server does NOT honour blocking=False -- confirmed on
-# hardware), but on a Robotiq it talks to the gripper server on its OWN socket, separate from the
-# arm control socket. So we run the blocking command on a background thread and start the next
-# trajectory concurrently on the control socket; the transition then lands inside a moving
-# (non-idle) segment and survives the filter.
+# after an open) so the arm keeps moving across the transition. On a Robotiq the gripper talks to
+# the gripper server on its OWN socket, separate from the arm control socket, so we run the command
+# on a background thread and start the next trajectory concurrently on the control socket; the
+# transition then lands inside a moving (non-idle) segment and survives the filter.
+#
+# The threaded command MUST be issued blocking=False + polled client-side (see _spawn_gripper_command
+# and _wait_for_gripper_settled), NOT as a server-side blocking command. The gripper server handles
+# requests on a single thread: a blocking command occupies it for the whole actuation, starving the
+# LeRobot gripper sampler's state polls so the recorded open<->close ramp collapses to an instant
+# jump. A background thread frees only the *client*, not the server; the client-side poll frees the
+# server socket between reads. (This was the "gripper obs jumps" regression -- see git history.)
 #
 # Only overlapped when the gripper has a separate socket (Robotiq). A Franka hand routes gripper
 # commands through the control socket, so a thread would race the arm trajectory -- there we fall
@@ -34,7 +39,7 @@ GRIPPER_OVERLAP = os.environ.get("TIPTOP_GRIPPER_OVERLAP", "1") != "0"
 # ~0.2 s is ~3 export frames, well under the 7-frame threshold, while the rest of the close
 # overlaps the (moving) lift. Main grasp-reliability knob -- raise toward ~0.3 s if objects slip,
 # lower toward 0 for a pure swoop grasp that relies on gripper force control during the lift.
-CLOSE_CONTACT_DELAY_S = float(os.environ.get("TIPTOP_CLOSE_CONTACT_DELAY_S", "0.2"))
+CLOSE_CONTACT_DELAY_S = float(os.environ.get("TIPTOP_CLOSE_CONTACT_DELAY_S", "0.0"))
 
 # An OPEN releases an already-placed object, so the arm can start retreating immediately.
 OPEN_CONTACT_DELAY_S = float(os.environ.get("TIPTOP_OPEN_CONTACT_DELAY_S", "0.0"))
@@ -111,18 +116,22 @@ def _can_overlap_gripper(client) -> bool:
 def _spawn_gripper_command(client, action: str) -> tuple[threading.Thread, dict]:
     """Fire an open/close gripper command on a BACKGROUND thread; return ``(thread, box)``.
 
-    The bamboo gripper command blocks until the gripper physically settles, so running it on a
-    thread lets the caller start the next arm trajectory (on the control socket) concurrently --
-    keeping the arm moving across the gripper transition. Only safe when the gripper uses its own
-    socket (see :func:`_can_overlap_gripper`). ``box`` receives ``{"result": ...}`` or
+    Running it on a thread lets the caller start the next arm trajectory (on the control socket)
+    concurrently -- keeping the arm moving across the gripper transition. Only safe when the gripper
+    uses its own socket (see :func:`_can_overlap_gripper`). ``box`` receives ``{"result": ...}`` or
     ``{"exc": ...}`` once the thread finishes; :func:`_join_gripper` surfaces either to the caller.
+
+    The worker uses the same ``blocking=False`` + client-side poll path as :func:`_command_gripper`,
+    NOT a server-side blocking command. A blocking command would occupy the gripper server's single
+    request thread for the whole actuation, starving the LeRobot gripper sampler's state polls and
+    collapsing the recorded open<->close ramp into an instantaneous jump. Client-side polling frees
+    the gripper socket between reads so the sampler captures the ramp while the arm still overlaps.
     """
-    fn = client.open_gripper if action == "open" else client.close_gripper
     box: dict = {}
 
     def _run() -> None:
         try:
-            box["result"] = fn(speed=1.0)
+            box["result"] = _command_gripper(client, action)
         except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread at join time
             box["exc"] = exc
 
@@ -192,9 +201,10 @@ def execute_cutamp_plan(
                 step + 1 < len(cutamp_plan) and cutamp_plan[step + 1].get("type") == "trajectory"
             )
             if GRIPPER_OVERLAP and next_is_trajectory and _can_overlap_gripper(client):
-                # Fire the (blocking) gripper command on a thread; the NEXT loop iteration runs the
-                # trajectory concurrently on the control socket. A brief stationary settle first
-                # lets the fingers seat before the arm departs.
+                # Fire the gripper command on a thread (non-blocking + client-side poll, so the
+                # sampler still sees the ramp); the NEXT loop iteration runs the trajectory
+                # concurrently on the control socket. A brief stationary settle first lets the
+                # fingers seat before the arm departs.
                 pending_gripper = _spawn_gripper_command(client, action)
                 settle_delay = CLOSE_CONTACT_DELAY_S if action == "close" else OPEN_CONTACT_DELAY_S
                 if settle_delay > 0:
