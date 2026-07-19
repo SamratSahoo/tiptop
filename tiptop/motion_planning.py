@@ -1,5 +1,7 @@
 import logging
+import os
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -73,6 +75,24 @@ def get_ik_solver(world_cfg: WorldConfig, num_particles: int, warmup_iters: int 
     return ik_solver
 
 
+# tamp-vla repo root: .../tamp-vla/tiptop/tiptop/motion_planning.py -> parents[2] == tamp-vla.
+# Used to resolve repo-relative vae_path overrides (e.g. "vae/checkpoints/vae_full_v2.pt") the same
+# way regardless of the process cwd (tiptop-run runs from tiptop/, not the repo root).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def resolve_vae_path(vae_path: str) -> str:
+    """Resolve a vae_path override to an absolute checkpoint path.
+
+    Absolute (or ~-prefixed) paths are used as-is; relative paths are resolved against the
+    tamp-vla repo root so `vae/checkpoints/vae_full_v2.pt` works from any cwd.
+    """
+    p = Path(os.path.expanduser(vae_path))
+    if not p.is_absolute():
+        p = _REPO_ROOT / p
+    return str(p)
+
+
 def apply_cost_overrides(cost: dict, overrides: dict | None) -> None:
     """Mutate a gradient-trajopt ``cost`` dict in place with UI overrides (if present).
 
@@ -87,9 +107,14 @@ def apply_cost_overrides(cost: dict, overrides: dict | None) -> None:
     # VAE motion-manifold cost (see curobo cost/vae_manifold_cost.py): a single weight knob
     # (Mahalanobis distance to the DROID latent cluster). The block may be absent on older
     # configs, so create it on demand when the override is provided.
-    if overrides.get("vae_manifold_weight") is not None:
+    if overrides.get("vae_manifold_weight") is not None or overrides.get("vae_path") is not None:
         vm = cost.setdefault("vae_manifold_cfg", {"weight": 0.0, "n_joints": 7, "source_dt": 0.15})
-        vm["weight"] = float(overrides["vae_manifold_weight"])
+        if overrides.get("vae_manifold_weight") is not None:
+            vm["weight"] = float(overrides["vae_manifold_weight"])
+        # vae_path selects WHICH checkpoint the manifold cost loads (encoder + DROID latent stats),
+        # overriding the VAE_MANIFOLD_CKPT env default. Resolved to an absolute path so it is cwd-safe.
+        if overrides.get("vae_path") is not None:
+            vm["checkpoint_path"] = resolve_vae_path(str(overrides["vae_path"]))
     # RND novelty cost (see curobo cost/rnd_novelty_cost.py): a single weight knob that MAXIMIZES how
     # poorly DROID covers the motion (the opposite of vae_manifold_weight). rnd_novelty_log toggles
     # maximizing log(novelty) (default) vs raw novelty. Block may be absent -> create on demand.
@@ -200,6 +225,7 @@ def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dic
         "resolved": {
             "uniform_velocity_weight": c["uniform_velocity_cfg"]["weight"],
             "vae_manifold_weight": c.get("vae_manifold_cfg", {}).get("weight", 0.0),
+            "vae_path": c.get("vae_manifold_cfg", {}).get("checkpoint_path"),
             "rnd_novelty_weight": c.get("rnd_novelty_cfg", {}).get("weight", 0.0),
             "rnd_novelty_log": c.get("rnd_novelty_cfg", {}).get("use_log", True),
             "bound_smooth_weight": c["bound_cfg"]["smooth_weight"],
@@ -285,8 +311,9 @@ def get_motion_gen(
         # just that the CLI arg parsed). Grep tiptop_*.log for "RESOLVED cuRobo cost".
         _gc = grad_cfg["cost"]
         _log.info(
-            "RESOLVED cuRobo cost after overrides: vae_manifold_weight=%s rnd_novelty_weight=%s | overrides=%s",
+            "RESOLVED cuRobo cost after overrides: vae_manifold_weight=%s vae_path=%s rnd_novelty_weight=%s | overrides=%s",
             _gc.get("vae_manifold_cfg", {}).get("weight"),
+            _gc.get("vae_manifold_cfg", {}).get("checkpoint_path"),
             _gc.get("rnd_novelty_cfg", {}).get("weight"),
             cost_overrides,
         )
