@@ -126,6 +126,12 @@ def apply_cost_overrides(cost: dict, overrides: dict | None) -> None:
             rn["weight"] = float(overrides["rnd_novelty_weight"])
         if overrides.get("rnd_novelty_log") is not None:
             rn["use_log"] = bool(overrides["rnd_novelty_log"])
+    # Joint-position density-matching cost (see curobo cost/joint_density_cost.py): a single weight
+    # knob that MINIMIZES the 1-D Wasserstein-1 distance between the trajectory's per-joint position
+    # marginal and DROID's. Block may be absent on older configs -> create on demand.
+    if overrides.get("joint_density_weight") is not None:
+        jd = cost.setdefault("joint_density_cfg", {"weight": 0.0, "n_joints": 7, "huber_delta": 0.05})
+        jd["weight"] = float(overrides["joint_density_weight"])
     for idx, val in (overrides.get("smooth_weight") or {}).items():
         cost["bound_cfg"]["smooth_weight"][int(idx)] = float(val)
     if overrides.get("primitive_collision_activation_distance") is not None:
@@ -228,6 +234,7 @@ def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dic
             "vae_path": c.get("vae_manifold_cfg", {}).get("checkpoint_path"),
             "rnd_novelty_weight": c.get("rnd_novelty_cfg", {}).get("weight", 0.0),
             "rnd_novelty_log": c.get("rnd_novelty_cfg", {}).get("use_log", True),
+            "joint_density_weight": c.get("joint_density_cfg", {}).get("weight", 0.0),
             "bound_smooth_weight": c["bound_cfg"]["smooth_weight"],
             "bound_weight": c["bound_cfg"]["weight"],
             "bound_activation_distance": c["bound_cfg"]["activation_distance"],
@@ -311,10 +318,11 @@ def get_motion_gen(
         # just that the CLI arg parsed). Grep tiptop_*.log for "RESOLVED cuRobo cost".
         _gc = grad_cfg["cost"]
         _log.info(
-            "RESOLVED cuRobo cost after overrides: vae_manifold_weight=%s vae_path=%s rnd_novelty_weight=%s | overrides=%s",
+            "RESOLVED cuRobo cost after overrides: vae_manifold_weight=%s vae_path=%s rnd_novelty_weight=%s joint_density_weight=%s | overrides=%s",
             _gc.get("vae_manifold_cfg", {}).get("weight"),
             _gc.get("vae_manifold_cfg", {}).get("checkpoint_path"),
             _gc.get("rnd_novelty_cfg", {}).get("weight"),
+            _gc.get("joint_density_cfg", {}).get("weight"),
             cost_overrides,
         )
         grad_file = grad_cfg  # dict, not str

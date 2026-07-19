@@ -44,8 +44,9 @@ def _load_curobo_overrides(spec: str | None) -> dict:
     """Parse cuRobo cost overrides from a JSON file path OR an inline JSON string.
 
     Returns {} when ``spec`` is falsy. These are the same override keys the parameter sweep and
-    the tiptop-viz UI use (vae_manifold_weight, rnd_novelty_weight, smooth_weight, self_collision_weight,
-    time_dilation_factor[_literal], ...) -- see motion_planning.apply_cost_overrides. Applying them at
+    the tiptop-viz UI use (vae_manifold_weight, rnd_novelty_weight, joint_density_weight, smooth_weight,
+    self_collision_weight, time_dilation_factor[_literal], ...) -- see motion_planning.apply_cost_overrides.
+    Applying them at
     server build time makes every plan this server produces use those tamp parameters, so e.g. a
     data-gen job can generate a dataset with a chosen manifold/novelty/smoothness regime.
     """
