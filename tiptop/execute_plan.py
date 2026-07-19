@@ -1,9 +1,35 @@
 import logging
+import os
 import time
 
 from tiptop.utils import RobotClient, get_robot_client
 
 _log = logging.getLogger(__name__)
+
+# --- Gripper/arm overlap ---------------------------------------------------------------------
+# A TAMP plan issues each gripper open/close as its own step, sandwiched between two arm
+# trajectories (arrive -> actuate -> depart). Executing that step as a blocking hold parks the
+# arm for the full ~0.5-1 s actuation, which the LeRobot export records as a run of zero-velocity
+# frames. The DROID-style non-idle training filter then drops any idle joint-velocity run of
+# >= 7 frames -- and the gripper open/close timestep sits right inside it, so it is filtered out.
+#
+# Overlapping the actuation with the FOLLOWING trajectory (the lift after a close, the retreat
+# after an open) keeps the arm moving across the transition: the gripper command is issued
+# non-blocking, we pause only briefly for the fingers to make contact, then the next trajectory
+# runs while the gripper finishes. The transition then lands inside a moving (non-idle) segment
+# and survives the filter. Set TIPTOP_GRIPPER_OVERLAP=0 to restore the old blocking hold.
+GRIPPER_OVERLAP = os.environ.get("TIPTOP_GRIPPER_OVERLAP", "1") != "0"
+
+# Seconds to stay parked after firing a CLOSE before the arm departs, so the fingers seat on the
+# object before the lift begins. Keep this comfortably below min_idle_len / fps (~7/15 = 0.47 s):
+# the settle is the only stationary window left, so at ~0.2 s it is ~3 export frames -- well under
+# the 7-frame idle run the filter drops -- while the rest of the close overlaps the (moving) lift.
+# This is the main grasp-reliability knob: raise it toward ~0.3 s if objects slip, lower toward 0
+# for a pure swoop grasp that relies on gripper force control during the lift.
+CLOSE_CONTACT_DELAY_S = float(os.environ.get("TIPTOP_CLOSE_CONTACT_DELAY_S", "0.0"))
+
+# An OPEN releases an already-placed object, so the arm can start retreating immediately.
+OPEN_CONTACT_DELAY_S = float(os.environ.get("TIPTOP_OPEN_CONTACT_DELAY_S", "0.0"))
 
 
 class ExecutionFailure(Exception):
@@ -49,16 +75,33 @@ def _wait_for_gripper_settled(client, *, timeout: float = 5.0, poll: float = 0.0
     _log.warning("Gripper did not report settled within %.1fs; continuing", timeout)
 
 
-def _command_gripper(client, action: str):
-    """Issue an open/close gripper command non-blocking, then wait client-side for it to
-    settle. Falls back to the client's blocking command if it doesn't accept blocking=False."""
+def _command_gripper(client, action: str, *, overlap: bool = False, settle_delay: float = 0.0):
+    """Issue an open/close gripper command non-blocking, then either wait for it to settle or
+    briefly pause so the caller can overlap the next arm trajectory.
+
+    With ``overlap=False`` (the default): block client-side until the gripper stops moving -- the
+    arm stays parked for the whole actuation (see :func:`_wait_for_gripper_settled`).
+
+    With ``overlap=True``: pause only ``settle_delay`` seconds (long enough for the fingers to
+    contact the object on a close) and return, letting the caller start the following trajectory
+    while the gripper finishes actuating. This keeps the arm moving across the gripper transition
+    so those frames stay non-idle for the training filter (see ``GRIPPER_OVERLAP``). Keep
+    ``settle_delay`` well under min_idle_len / fps or the pause itself becomes a filtered idle run.
+
+    Falls back to the client's blocking command if it doesn't accept ``blocking=False`` (e.g. the
+    UR5 client), in which case overlap is not possible.
+    """
     fn = client.open_gripper if action == "open" else client.close_gripper
     try:
         result = fn(speed=1.0, blocking=False)
     except TypeError:
-        # Client without a blocking flag (e.g. UR5) -- it blocks until done itself.
+        # Client without a blocking flag (e.g. UR5) -- it blocks until done itself; no overlap.
         return fn(speed=1.0)
-    _wait_for_gripper_settled(client)
+    if overlap:
+        if settle_delay > 0:
+            time.sleep(settle_delay)
+    else:
+        _wait_for_gripper_settled(client)
     return result
 
 
@@ -98,9 +141,16 @@ def execute_cutamp_plan(
             action = action_dict["action"]
             if action not in ("open", "close"):
                 raise ValueError(f"Unknown gripper action: {action}")
-            # Issue non-blocking and wait client-side so the gripper position can be
-            # sampled during the motion (see _command_gripper / _wait_for_gripper_settled).
-            result = _command_gripper(client, action)
+            # Overlap the actuation with the next trajectory (if any) so the arm doesn't sit idle
+            # across the transition -- otherwise the training filter drops the gripper open/close
+            # frames (see GRIPPER_OVERLAP). A gripper step with no trajectory after it (e.g. the
+            # last step) falls back to a blocking settle.
+            next_is_trajectory = (
+                step + 1 < len(cutamp_plan) and cutamp_plan[step + 1].get("type") == "trajectory"
+            )
+            overlap = GRIPPER_OVERLAP and next_is_trajectory
+            settle_delay = CLOSE_CONTACT_DELAY_S if action == "close" else OPEN_CONTACT_DELAY_S
+            result = _command_gripper(client, action, overlap=overlap, settle_delay=settle_delay)
 
         elif action_type == "trajectory":
             # Extract joint position and velocity waypoints for the trajectory

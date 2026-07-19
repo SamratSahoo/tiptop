@@ -253,11 +253,17 @@ def _flatten_plan(plan: dict, timeline: list | None = None) -> dict:
     in order, each ``{"t_start", "t_end"}``): a trajectory step's rows are spread
     linearly between its measured start and end.
 
-    Gripper steps are instantaneous in the plan but take ~0.5-1 s on the real robot.
-    When the timeline gives that pause duration, we insert stationary "hold" rows (arm
-    frozen at its last pose, zero velocity) spanning the pause, so the export emits
-    frames *during* gripper actuation -- otherwise every frame lands where the gripper
-    is already fully open/closed and the measured open->close ramp is never sampled.
+    A gripper step is instantaneous in the plan but takes real time on the robot; the timeline
+    reports that measured duration. We insert stationary "hold" rows (arm frozen at its last pose,
+    zero velocity) spanning it, so the export emits frames covering the actuation instead of
+    jumping straight to the fully open/closed state.
+
+    With overlapped execution (see ``execute_plan.GRIPPER_OVERLAP``) this measured duration is
+    only the brief post-fire contact settle -- the rest of the actuation happens while the NEXT
+    trajectory runs -- so these hold rows are just a few frames and the open<->close ramp is
+    captured across the following (moving) trajectory. Keeping that stationary run short is what
+    lets the gripper transition survive the non-idle training filter. Without overlap the hold
+    spans the whole ~0.5-1 s actuation, as before.
     """
     HOLD_DT = 0.02  # 50 Hz, matching the plan's trajectory rate, for inserted hold rows
     pos_chunks, vel_chunks, grip_chunks, dt_chunks, twall_chunks = [], [], [], [], []
