@@ -2,11 +2,14 @@ import asyncio
 import logging
 
 import aiohttp
+import cv2
+import numpy as np
 import rerun as rr
 
 from tiptop.perception.cameras import get_depth_estimator, get_hand_camera
 from tiptop.perception.utils import depth_to_xyz
 from tiptop.utils import setup_logging
+from tiptop.viz_utils import get_heatmap
 
 _log = logging.getLogger(__name__)
 
@@ -28,6 +31,12 @@ async def _run_demo():
     async with aiohttp.ClientSession() as session:
         pred_depth = await depth_estimator(session, frame)
     rr.log("cam/depth", rr.DepthImage(pred_depth, meter=1.0))
+
+    # Save the predicted depth as a turbo-colormapped image
+    depth_turbo = get_heatmap(pred_depth.reshape(-1), cmap_name="turbo").reshape(*pred_depth.shape, 3)
+    depth_turbo = (depth_turbo * 255.0).clip(0, 255).astype(np.uint8)
+    cv2.imwrite("depth_turbo.png", cv2.cvtColor(depth_turbo, cv2.COLOR_RGB2BGR))
+    _log.info("Saved turbo-colormapped depth to depth_turbo.png")
 
     # Project to point cloud and set gripper mask to zeros
     xyz_map = depth_to_xyz(pred_depth, K)  # in cam frame

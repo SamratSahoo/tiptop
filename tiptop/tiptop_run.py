@@ -162,6 +162,9 @@ class Observation:
     frame: Frame
     world_from_cam: Float[np.ndarray, "4 4"]
     q_init: Float[np.ndarray | list, "n"]
+    # Additional stereo frames captured back-to-back at the same (static) pose, used for
+    # temporal depth smoothing. Empty for replay/websocket paths, which fuse nothing.
+    depth_frames: tuple[Frame, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -207,8 +210,17 @@ def capture_live_observation(container: _DemoContainer) -> Observation:
     q_curr_pt = tensor_args.to_device(q_curr)
     world_from_ee = container.motion_gen.kinematics.get_state(q_curr_pt).ee_pose.get_numpy_matrix()[0]
     world_from_cam = world_from_ee @ container.ee_from_cam
-    frame = container.cam.read_camera()
-    return Observation(frame=frame, world_from_cam=world_from_cam, q_init=q_curr)
+
+    # Grab a short burst of frames at this static pose for temporal depth smoothing. The first
+    # frame is the representative one (used for rgb/intrinsics); the rest feed the median fusion.
+    num_frames = max(1, int(tiptop_cfg().perception.depth_smoothing.num_frames))
+    frames = [container.cam.read_camera() for _ in range(num_frames)]
+    return Observation(
+        frame=frames[0],
+        world_from_cam=world_from_cam,
+        q_init=q_curr,
+        depth_frames=tuple(frames),
+    )
 
 
 def get_demo_container(
@@ -678,6 +690,7 @@ async def run_perception(
             tiptop_cfg().perception.voxel_downsample_size,
             depth_estimator=depth_estimator,
             gripper_mask=gripper_mask,
+            depth_frames=observation.depth_frames,
         ),
         detect_and_segment(rgb, task_instruction),
     )

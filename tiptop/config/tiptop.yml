@@ -69,3 +69,9 @@ perception:
   voxel_downsample_size: 0.0075
   contact_threshold_m: 0.01
   mask_erosion_pixels: 3
+
+  # Temporal depth smoothing: at the (static) capture pose we grab num_frames stereo frames
+  # back-to-back and per-pixel median-fuse their depth maps to suppress sensor noise / flicker.
+  # num_frames = 1 disables smoothing (single-frame behavior).
+  depth_smoothing:
+    num_frames: 5

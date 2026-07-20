@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+import warnings
 
 import aiohttp
 import numpy as np
@@ -16,6 +17,36 @@ from tiptop.perception.m2t2 import generate_grasps_async
 from tiptop.perception.utils import depth_to_xyz, get_o3d_pcd
 
 _log = logging.getLogger(__name__)
+
+
+async def _estimate_smoothed_depth(
+    session: aiohttp.ClientSession,
+    frames: list[Frame],
+    depth_estimator: DepthEstimator,
+) -> Float[np.ndarray, "h w"]:
+    """Temporally smooth depth by per-pixel median over a burst of frames from a static pose.
+
+    Depth is estimated for each frame, then fused per pixel with a median over frames where the
+    pixel is valid (finite and > 0; 0 is FoundationStereo's invalid convention). Pixels invalid in
+    every frame stay 0. Estimation is sequential to avoid overloading the single depth server.
+    """
+    depths = []
+    for i, f in enumerate(frames):
+        depths.append(await depth_estimator(session, f))
+        _log.debug(f"Estimated depth for smoothing frame {i + 1}/{len(frames)}")
+
+    stacked = np.stack(depths, axis=0).astype(np.float32)  # (num_frames, h, w)
+    valid = np.isfinite(stacked) & (stacked > 0)
+    stacked[~valid] = np.nan
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN pixels -> nan, handled below
+        fused = np.nanmedian(stacked, axis=0)
+    fused = np.nan_to_num(fused, nan=0.0)
+
+    coverage = float(valid.any(axis=0).mean())
+    _log.info(f"Median-fused depth over {len(frames)} frames (valid-pixel coverage {coverage:.1%})")
+    return fused
 
 
 async def detect_and_segment(rgb: UInt8[np.ndarray, "h w 3"], task_instruction: str) -> dict:
@@ -67,13 +98,22 @@ async def predict_depth_and_grasps(
     downsample_voxel_size: float,
     depth_estimator: DepthEstimator | None = None,
     gripper_mask: Bool[np.ndarray, "h w 3"] | None = None,
+    depth_frames: tuple[Frame, ...] = (),
 ) -> dict:
-    """Predict depth map using FoundationStereo and grasps using M2T2. Uses depth_estimator if provided, otherwise uses frame.depth."""
+    """Predict depth map using FoundationStereo and grasps using M2T2. Uses depth_estimator if provided, otherwise uses frame.depth.
+
+    When depth_frames holds more than one frame, their depth maps are per-pixel median-fused for
+    temporal smoothing (see _estimate_smoothed_depth); otherwise a single frame is used.
+    """
     cfg = tiptop_cfg()
 
     # Get depth map — use estimator (e.g. FoundationStereo) or fall back to onboard sensor depth
     if depth_estimator is not None:
-        depth_map = await depth_estimator(session, frame)
+        frames = list(depth_frames) if depth_frames else [frame]
+        if len(frames) > 1:
+            depth_map = await _estimate_smoothed_depth(session, frames, depth_estimator)
+        else:
+            depth_map = await depth_estimator(session, frame)
     else:
         if frame.depth is None:
             raise RuntimeError(

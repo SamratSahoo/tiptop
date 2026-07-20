@@ -23,6 +23,7 @@ from tiptop.perception.cameras.zed_camera import ZedCamera, convert_svo_to_mp4
 from tiptop.perception.utils import get_o3d_pcd
 from tiptop.perception.visualization import visualize_detections, visualize_masks
 from tiptop.utils import NumpyEncoder
+from tiptop.viz_utils import get_heatmap
 
 _log = logging.getLogger(__name__)
 
@@ -194,6 +195,11 @@ def save_perception_outputs(
     depth_mm = np.clip(depth_mm, 0, 65535)
     depth_uint16 = depth_mm.astype(np.uint16)
     cv2.imwrite(str(perception_dir / "depth.png"), depth_uint16)
+
+    # Turbo-colormapped depth for quick visual inspection (normalized over valid depth range)
+    depth_turbo = get_heatmap(depth_map.reshape(-1), cmap_name="turbo").reshape(*depth_map.shape, 3)
+    depth_turbo = (depth_turbo * 255.0).clip(0, 255).astype(np.uint8)
+    cv2.imwrite(str(save_dir / "depth_turbo.png"), cv2.cvtColor(depth_turbo, cv2.COLOR_RGB2BGR))
 
     # Create point cloud and write
     pcd = get_o3d_pcd(xyz_map, rgb_map)
