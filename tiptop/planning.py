@@ -15,6 +15,7 @@ from cutamp.cost_reduction import CostReducer
 from cutamp.envs import TAMPEnvironment
 from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
 from cutamp.task_planning.constraints import StablePlacement
+from cutamp.task_planning.costs import GraspCost
 from jaxtyping import Float
 
 from tiptop.trajectory_blending import arm_joint_limits, blend_cutamp_plan, resolve_blend_config
@@ -51,6 +52,8 @@ def build_tamp_config(
     time_dilation_factor: float,
     collision_activation_distance: float = 0.0,
     enable_visualizer: bool = False,
+    traj_length_norm: float = 2.0,
+    grasp_orientation_cost: bool = False,
 ) -> TAMPConfiguration:
     """Build a TAMPConfiguration with TiPToP defaults.
 
@@ -77,6 +80,16 @@ def build_tamp_config(
         placement_shrink_dist=0.01,
         enable_visualizer=enable_visualizer,
         coll_sphere_radius=0.008,
+        # Cost-sensitive task planning that minimizes joint-space distance traveled: each
+        # move(q1, tau, q2) action is charged ||q1 - q2||_p between its start/end configurations,
+        # a lower bound on the shortest collision-free path length. p=2 (default) is the Euclidean
+        # straight-line distance; p=inf is the max-joint-displacement (infinity-norm) the TiPToP
+        # paper minimizes, opted into per config via `traj_length_norm: "inf"` in cfg/tamp
+        # tamp_overrides (resolve_traj_length_norm). See cuTAMP trajectory_length / TrajectoryLength.
+        traj_length_norm=traj_length_norm,
+        # Gate for the grasp orientation-change soft cost (weight set in run_planning). Enabled from
+        # cfg/tamp when `grasp_pose_change_weight` is present; see resolve_grasp_orientation_cost.
+        grasp_orientation_cost=grasp_orientation_cost,
     )
 
 
@@ -106,6 +119,15 @@ def run_planning(
         constraint_to_tol[StablePlacement.type][f"{surface.name}_in_xy"] = 1e-2
         constraint_to_tol[StablePlacement.type][f"{surface.name}_support"] = 1e-2
         constraint_to_mult[StablePlacement.type][f"{surface.name}_support"] = 1.0
+    # Opt-in grasp orientation-change cost (cfg/tamp `grasp_pose_change_weight` in tamp_overrides):
+    # weights cuTAMP's GraspCost = geodesic angle between each grasp's EE orientation and the robot's
+    # initial EE orientation, steering the planner toward grasps that reorient the wrist least. Absent
+    # / zero -> the multiplier is never set, so the reducer drops the (still-cheap) computed value and
+    # cuTAMP behavior is unchanged. Assigned as a fresh dict so we don't mutate the shared default.
+    grasp_weight = (cost_overrides or {}).get("grasp_pose_change_weight")
+    if grasp_weight:
+        constraint_to_mult[GraspCost.type] = {"grasp_rot_change": float(grasp_weight)}
+        _log.info(f"Grasp orientation-change cost active: grasp_rot_change weight={float(grasp_weight)}")
     cost_reducer = CostReducer(constraint_to_mult)
     constraint_checker = ConstraintChecker(constraint_to_tol)
 
@@ -146,7 +168,7 @@ def run_planning(
     return cutamp_plan, elapsed, failure_reason
 
 
-def _per_timestep_cost(velocity, position=None, dt=None, vae_cfg=None) -> dict:
+def _per_timestep_cost(velocity, position=None, trace_cfg=None) -> dict:
     """Per-timestep trajectory-cost arrays for plotting / validation.
 
     Derived from the joint velocities of a single trajectory segment. Mirrors the
@@ -155,10 +177,18 @@ def _per_timestep_cost(velocity, position=None, dt=None, vae_cfg=None) -> dict:
     and the joint speed ``||v_t||``. The mean is taken over the segment to match how
     cuRobo computes the cost per trajopt horizon. ``velocity`` is a torch tensor [T, dof].
 
-    When ``position`` (torch tensor [T, dof]) + ``dt`` are given and ``vae_cfg`` is set,
-    also emits the per-segment VAE motion-manifold cost (DROID Mahalanobis distance, weight = 1;
-    see curobo cost/vae_manifold_cost.py). It is best effort: if the VAE artifact is missing it
-    is silently omitted so plotting still works.
+    When ``position`` (torch tensor [T, dof]) is given and ``trace_cfg`` selects them, also emits the
+    per-segment cuRobo motion-manifold cost traces the optimizer saw -- the raw (weight-independent)
+    cost each term contributes, broadcast over the segment's T timesteps (see resolve_trace_cfg):
+
+      - ``vae_manifold``  (DROID Mahalanobis distance; curobo cost/vae_manifold_cost.py)
+      - ``joint_density`` (per-joint W1 to DROID; curobo cost/joint_density_cost.py)
+      - ``rnd_novelty``   (raw RND novelty; curobo cost/rnd_novelty_cost.py)
+
+    ``trace_cfg`` carries ``source_dt`` (the trajopt base_dt the manifold costs finite-difference at,
+    NOT the plan's playback dt) and ``n_joints``, plus a per-term sub-dict for each trace to emit.
+    Each trace is best effort: a missing artifact/load error is logged and that key is omitted so
+    plotting still works.
     """
     speed_sq = (velocity * velocity).sum(dim=-1)  # [T]
     speed = speed_sq.sqrt()  # [T] joint speed ||v_t||
@@ -168,32 +198,51 @@ def _per_timestep_cost(velocity, position=None, dt=None, vae_cfg=None) -> dict:
         "uniform_velocity": uniform_velocity.cpu().numpy(),
         "dof_speed_sq": speed_sq.cpu().numpy(),
     }
-    if vae_cfg is not None and position is not None and dt is not None:
+    if trace_cfg is None or position is None:
+        return out
+
+    source_dt = float(trace_cfg.get("source_dt", 0.15))
+    n_joints = int(trace_cfg.get("n_joints", 7))
+    if "vae" in trace_cfg:
         try:
-            from curobo.rollout.cost.vae_manifold_cost import (
-                DEFAULT_VAE_MANIFOLD_CKPT,
-                trajectory_score_trace,
-            )
+            from curobo.rollout.cost.vae_manifold_cost import DEFAULT_VAE_MANIFOLD_CKPT, trajectory_score_trace
 
             out["vae_manifold"] = trajectory_score_trace(
-                position,
-                float(dt),
-                checkpoint_path=vae_cfg.get("checkpoint_path") or DEFAULT_VAE_MANIFOLD_CKPT,
-                n_joints=int(vae_cfg.get("n_joints", 7)),
+                position, source_dt,
+                checkpoint_path=trace_cfg["vae"].get("checkpoint_path") or DEFAULT_VAE_MANIFOLD_CKPT,
+                n_joints=n_joints,
             )
         except Exception as exc:  # missing artifact / load error -> skip the trace
             _log.warning(f"VAE-manifold cost trace skipped: {exc}")
+    if "joint_density" in trace_cfg:
+        try:
+            from curobo.rollout.cost.joint_density_cost import trajectory_density_trace
+
+            out["joint_density"] = trajectory_density_trace(
+                position, n_joints=n_joints, huber_delta=float(trace_cfg["joint_density"].get("huber_delta", 0.05))
+            )
+        except Exception as exc:
+            _log.warning(f"Joint-density cost trace skipped: {exc}")
+    if "rnd_novelty" in trace_cfg:
+        try:
+            from curobo.rollout.cost.rnd_novelty_cost import trajectory_novelty_trace
+
+            out["rnd_novelty"] = trajectory_novelty_trace(position, source_dt, n_joints=n_joints)
+        except Exception as exc:
+            _log.warning(f"RND-novelty cost trace skipped: {exc}")
     return out
 
 
-def serialize_plan(cutamp_plan: list[dict], q_init: Float[np.ndarray, "d"], vae_cfg: dict | None = None) -> dict:
+def serialize_plan(cutamp_plan: list[dict], q_init: Float[np.ndarray, "d"], trace_cfg: dict | None = None) -> dict:
     """Serialize a cuTAMP plan to a dict.
 
     Schema versioning follows semver: bump minor for new optional fields, major for breaking changes.
     If the schema changes, update load_tiptop_plan accordingly.
 
-    ``vae_cfg`` (optional) enables recording the VAE motion-manifold cost (DROID Mahalanobis
-    distance) as a per-segment trace, e.g. ``{"checkpoint_path": None, "n_joints": 7}``.
+    ``trace_cfg`` (optional) selects which cuRobo motion-manifold cost traces to record per trajectory
+    segment (``vae_manifold`` / ``joint_density`` / ``rnd_novelty``) -- built by
+    motion_planning.resolve_trace_cfg from the cfg/tamp cost overrides, so only the costs actually
+    active in the run are logged. See _per_timestep_cost.
     """
     steps = []
     for step in cutamp_plan:
@@ -206,11 +255,10 @@ def serialize_plan(cutamp_plan: list[dict], q_init: Float[np.ndarray, "d"], vae_
                     "velocities": step["plan"].velocity.cpu().numpy(),
                     "dt": step["dt"],
                     "cost": _per_timestep_cost(
-                        step["plan"].velocity, position=step["plan"].position,
-                        dt=step["dt"], vae_cfg=vae_cfg,
+                        step["plan"].velocity, position=step["plan"].position, trace_cfg=trace_cfg,
                     ),
                 }
             )
         elif step["type"] == "gripper":
             steps.append({"type": "gripper", "label": step["label"], "action": step["action"]})
-    return {"version": "1.2.0", "q_init": q_init, "steps": steps}
+    return {"version": "1.3.0", "q_init": q_init, "steps": steps}

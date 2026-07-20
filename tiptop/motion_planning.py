@@ -93,6 +93,33 @@ def resolve_vae_path(vae_path: str) -> str:
     return str(p)
 
 
+def resolve_trace_cfg(overrides: dict | None) -> dict | None:
+    """Build the per-segment cost-trace config for serialize_plan from cfg/tamp cost overrides.
+
+    Records a raw (weight-independent) cost trace for each motion-manifold cost that is ACTIVE in the
+    run (nonzero weight), so tiptop_plan.json logs what the optimizer saw for exactly the terms being
+    used -- vae_manifold, joint_density, rnd_novelty. Returns None when none are active (nothing to
+    trace beyond the always-on speed/uniform_velocity).
+
+    ``source_dt`` is the trajopt base_dt the manifold costs finite-difference at (default 0.15; see
+    gradient_trajopt.yml), which an override may change via ``base_dt`` -- NOT the plan's playback dt.
+    """
+    ov = overrides or {}
+    cfg: dict = {"source_dt": float(ov.get("base_dt") or 0.15), "n_joints": 7}
+    active = False
+    if ov.get("vae_manifold_weight"):
+        # checkpoint_path selects the encoder + DROID latent stats; resolve like apply_cost_overrides.
+        cfg["vae"] = {"checkpoint_path": resolve_vae_path(str(ov["vae_path"])) if ov.get("vae_path") else None}
+        active = True
+    if ov.get("joint_density_weight"):
+        cfg["joint_density"] = {"huber_delta": 0.05}
+        active = True
+    if ov.get("rnd_novelty_weight"):
+        cfg["rnd_novelty"] = {}
+        active = True
+    return cfg if active else None
+
+
 def apply_cost_overrides(cost: dict, overrides: dict | None) -> None:
     """Mutate a gradient-trajopt ``cost`` dict in place with UI overrides (if present).
 
@@ -208,6 +235,38 @@ def resolve_time_dilation_factor(overrides: dict | None, config_default: float) 
     if tdf is None or abs(float(tdf) - 1.0) < 1e-6:
         return float(config_default)
     return float(tdf)
+
+
+def resolve_traj_length_norm(overrides: dict | None, default: float = 2.0) -> float:
+    """Effective norm p for cuTAMP's per-move TrajectoryLength cost, from cfg/tamp tamp_overrides.
+
+    The ``move(q1, tau, q2)`` cost charges the joint-space distance ||q1 - q2||_p; p=2 (default) is
+    the Euclidean straight-line distance, p=inf is the max joint displacement (the infinity-norm the
+    TiPToP paper minimizes). Both lower-bound the shortest collision-free path length.
+
+    The value is read from the ``traj_length_norm`` override. It is accepted as a string ("inf" /
+    "infinity" / "max") or a number (1, 2, ...). A string is required for the infinity-norm because
+    the overrides dict round-trips through JSON (Python -> Node -> Python), which cannot represent
+    Infinity as a bare number.
+    """
+    val = (overrides or {}).get("traj_length_norm")
+    if val is None:
+        return float(default)
+    if isinstance(val, str):
+        if val.strip().lower() in {"inf", "infinity", "max"}:
+            return float("inf")
+        return float(val)  # numeric string, e.g. "2"
+    return float(val)
+
+
+def resolve_grasp_orientation_cost(overrides: dict | None) -> bool:
+    """Whether to enable cuTAMP's grasp orientation-change soft cost, from cfg/tamp tamp_overrides.
+
+    Enabled iff a truthy ``grasp_pose_change_weight`` is present (the same key run_planning reads for
+    the weight), so a single YAML knob both gates the cost (this bool -> TAMPConfiguration) and sets
+    its multiplier. A zero/absent weight leaves it off.
+    """
+    return bool((overrides or {}).get("grasp_pose_change_weight"))
 
 
 def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dict:

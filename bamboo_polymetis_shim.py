@@ -37,6 +37,13 @@ The state_port (5557) serves get_robot_state from a cache filled by a ~100 Hz ba
 poller, so encoders stay readable while _control_handler is parked inside a blocking
 move_to_joint_positions (the control socket cannot answer during motion).
 ----------------------------------------------------------------------------------
+GRIPPER STATE CACHE: get_gripper_state is likewise served from a ~50 Hz background poller
+inside RobotiqDriver (start_polling / get_cached_state), NOT a live Modbus read on the
+request path. A live read stalls on the post-arm-motion RTU retries exactly during the
+open/close ramp, starving the LeRobot gripper sampler so the recorded gripper obs collapses
+to a single-frame jump. The poller and move writes share the one RTU link via _io_lock
+(pymodbus RTU is not thread-safe).
+----------------------------------------------------------------------------------
 """
 from __future__ import annotations
 import argparse, logging, sys, threading, time
@@ -80,6 +87,14 @@ class RobotiqDriver:
         from pymodbus.client.sync import ModbusSerialClient
         self.slave = slave
         self._last_state: dict | None = None  # last successful get_state, reused on transient read failure
+        # A single RTU serial link, now touched by two threads: the gripper handler (move writes +
+        # bootstrap reads) and the background _poll_loop (continuous status reads). pymodbus RTU is
+        # NOT thread-safe -- interleaved transactions corrupt the frame -- so every register access
+        # goes through _io_lock. _state_lock guards the cached-state handoff to get_cached_state.
+        self._io_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._poll_stop = threading.Event()
+        self._poll_thread: threading.Thread | None = None
         self.client = ModbusSerialClient(
             method="rtu", port=port,
             baudrate=115200, stopbits=1, bytesize=8, parity="N", timeout=1.0,
@@ -87,6 +102,11 @@ class RobotiqDriver:
         if not self.client.connect():
             raise RuntimeError(f"Cannot open Robotiq on {port}")
         self.activate()
+        # Continuously refresh the cache in the background so get_cached_state() -- the path the
+        # LeRobot gripper sampler and the client-side settle poll both hit -- never does a live
+        # Modbus read. Without this, those reads stall on the post-arm-motion RTU retries exactly
+        # during the open/close ramp, so the recorded gripper obs collapses to a single-frame jump.
+        self.start_polling()
 
     def _reconnect(self) -> None:
         """Reopen the serial link if it dropped; best-effort."""
@@ -101,45 +121,47 @@ class RobotiqDriver:
         # reg[0]=ACT_REQ<<8, reg[1]=pos, reg[2]=(speed<<8)|force
         regs = [(act_req & 0xFF) << 8, pos & 0xFF, ((speed & 0xFF) << 8) | (force & 0xFF)]
         last = None
-        for attempt in range(retries):
-            try:
-                r = self.client.write_registers(0x03E8, regs, unit=self.slave)
-                if r is not None and not r.isError():
-                    if attempt:
-                        log.info(f"Robotiq write succeeded on attempt {attempt + 1}")
-                    return True
-                last = r
-            except Exception as e:
-                last = e
-            # Transient RTU error (common right after arm motion). Settle, reconnect, retry.
-            time.sleep(retry_delay)
-            self._reconnect()
+        with self._io_lock:  # serialize against the background poller's reads on the shared RTU link
+            for attempt in range(retries):
+                try:
+                    r = self.client.write_registers(0x03E8, regs, unit=self.slave)
+                    if r is not None and not r.isError():
+                        if attempt:
+                            log.info(f"Robotiq write succeeded on attempt {attempt + 1}")
+                        return True
+                    last = r
+                except Exception as e:
+                    last = e
+                # Transient RTU error (common right after arm motion). Settle, reconnect, retry.
+                time.sleep(retry_delay)
+                self._reconnect()
         log.warning(f"Robotiq Modbus write failed after {retries} attempts: {last}")
         return False
 
     def _read_status(self, retries: int = 3, retry_delay: float = 0.1):
-        for _ in range(retries):
-            try:
-                r = self.client.read_input_registers(0x07D0, 3, unit=self.slave)
-                if r is not None and not r.isError():
-                    # Robotiq input/status registers (big-endian bytes within each register):
-                    #   registers[0] = [ GRIPPER STATUS (high) | reserved (low) ]
-                    #   registers[1] = [ gFLT (high)           | gPR  (low)  ]  gPR = commanded echo
-                    #   registers[2] = [ gPO  (high)           | gCU  (low)  ]  gPO = ACTUAL position
-                    return {
-                        "gOBJ": (r.registers[0] >> 14) & 0x03,
-                        "gSTA": (r.registers[0] >> 12) & 0x03,
-                        "gGTO": (r.registers[0] >> 11) & 0x01,
-                        "gACT": (r.registers[0] >> 8) & 0x01,
-                        # FIX: actual position gPO is the HIGH byte of register 2 (byte 4),
-                        # NOT `registers[1] & 0xFF` (which is gPR, the commanded-position echo).
-                        "gPO":  (r.registers[2] >> 8) & 0xFF,   # actual position (0-255)
-                        "gCU":  r.registers[2] & 0xFF,          # motor current (0-255), ~0.1 units
-                    }
-            except Exception:
-                pass
-            time.sleep(retry_delay)
-            self._reconnect()
+        with self._io_lock:  # serialize against move writes on the shared RTU link
+            for _ in range(retries):
+                try:
+                    r = self.client.read_input_registers(0x07D0, 3, unit=self.slave)
+                    if r is not None and not r.isError():
+                        # Robotiq input/status registers (big-endian bytes within each register):
+                        #   registers[0] = [ GRIPPER STATUS (high) | reserved (low) ]
+                        #   registers[1] = [ gFLT (high)           | gPR  (low)  ]  gPR = commanded echo
+                        #   registers[2] = [ gPO  (high)           | gCU  (low)  ]  gPO = ACTUAL position
+                        return {
+                            "gOBJ": (r.registers[0] >> 14) & 0x03,
+                            "gSTA": (r.registers[0] >> 12) & 0x03,
+                            "gGTO": (r.registers[0] >> 11) & 0x01,
+                            "gACT": (r.registers[0] >> 8) & 0x01,
+                            # FIX: actual position gPO is the HIGH byte of register 2 (byte 4),
+                            # NOT `registers[1] & 0xFF` (which is gPR, the commanded-position echo).
+                            "gPO":  (r.registers[2] >> 8) & 0xFF,   # actual position (0-255)
+                            "gCU":  r.registers[2] & 0xFF,          # motor current (0-255), ~0.1 units
+                        }
+                except Exception:
+                    pass
+                time.sleep(retry_delay)
+                self._reconnect()
         return None
 
     def activate(self, timeout: float = 10.0):
@@ -212,10 +234,47 @@ class RobotiqDriver:
             "is_moving": is_moving,
             "current": float(st.get("gCU", 0)) * 0.1,
         }
-        self._last_state = state
+        with self._state_lock:
+            self._last_state = state
         return state
 
+    def start_polling(self, period_s: float = 0.02) -> None:
+        """Spin a background thread refreshing the cached state at ~1/period_s Hz (idempotent)."""
+        if self._poll_thread is not None and self._poll_thread.is_alive():
+            return
+        self._poll_stop.clear()
+        self._poll_thread = threading.Thread(
+            target=self._poll_loop, args=(period_s,), name="robotiq-state-poller", daemon=True
+        )
+        self._poll_thread.start()
+
+    def _poll_loop(self, period_s: float) -> None:
+        while not self._poll_stop.is_set():
+            t0 = time.time()
+            try:
+                self.get_state()  # live read under _io_lock; updates _last_state
+            except Exception:
+                pass  # keep the last good sample; never let a read error kill the poller
+            time.sleep(max(0.0, period_s - (time.time() - t0)))
+
+    def get_cached_state(self) -> dict:
+        """Return the most recent polled state without touching the serial link.
+
+        This is the read path for clients (LeRobot sampler, settle poll). It answers from the
+        background poller's cache so those reads stay fast and dense through an open/close ramp,
+        instead of stalling on the post-arm-motion RTU retries a live read would incur. Falls back
+        to a one-off live read only to bootstrap before the poller's first sample lands.
+        """
+        with self._state_lock:
+            cached = self._last_state
+        if cached is not None:
+            return dict(cached)
+        return self.get_state()
+
     def close(self):
+        self._poll_stop.set()
+        if self._poll_thread is not None:
+            self._poll_thread.join(timeout=1.0)
         try:
             self.client.close()
         except Exception:
@@ -445,7 +504,9 @@ def _gripper_handler(socket: zmq.Socket, gripper):
                     resp = {"success": False, "error": str(e)}
             elif cmd in ("get_gripper_state", "get_state"):
                 try:
-                    st = gripper.get_state()
+                    # Serve from the background poller's cache (no live Modbus read on the request
+                    # path) so sampler/settle reads stay dense through the open/close ramp.
+                    st = gripper.get_cached_state()
                     resp = {
                         "success": True,
                         "state": {

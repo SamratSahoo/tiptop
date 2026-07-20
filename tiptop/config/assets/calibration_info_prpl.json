@@ -1,15 +1,14 @@
 {
   "13222437": {
     "pose": [
-      0.036207971410110555,
-      0.06407676270687518,
-      -0.13043551656474742,
-      -0.3151342738995566,
-      0.0029161864368973944,
-      3.1284929752078874
+      0.032829662019066966,
+      0.07216989944669612,
+      -0.13396110787409699,
+      -0.3863723932683909,
+      -0.02980138969349122,
+      3.1279531486965744
     ],
-    "timestamp": 1783989345.529895,
-    "source": "derived from droid 13222437_left via the tiptop<-droid EE-frame offset solved on 14846828 (-90deg yaw, 0.145m z); NOT a direct tiptop calibrate-wrist-cam measurement -- verify with viz-calibration, re-measure to replace"
+    "timestamp": 1784572702.5799677
   },
   "39379013": {
     "pose": [

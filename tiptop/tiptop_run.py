@@ -35,7 +35,10 @@ from tiptop.motion_planning import (
     build_curobo_solvers,
     go_to_capture,
     go_to_home,
+    resolve_grasp_orientation_cost,
     resolve_time_dilation_factor,
+    resolve_traj_length_norm,
+    resolve_trace_cfg,
     summarize_curobo_config,
 )
 from tiptop.perception.cameras import (
@@ -908,7 +911,10 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         _log.info(f"Perception and cuTAMP planning took: {perception_duration + planning_duration:.2f}s")
                         if cutamp_plan is not None:
                             plan_path = save_dir / "tiptop_plan.json"
-                            save_tiptop_plan(serialize_plan(cutamp_plan, observation.q_init), plan_path)
+                            trace_cfg = resolve_trace_cfg(container.cost_overrides)
+                            save_tiptop_plan(
+                                serialize_plan(cutamp_plan, observation.q_init, trace_cfg=trace_cfg), plan_path
+                            )
                             _log.info(f"Saved TiPToP plan to {plan_path}")
 
                         if cutamp_plan is not None and execute_plan:
@@ -1100,6 +1106,19 @@ def _sync_entrypoint(
     from tiptop.tiptop_websocket_server import _load_curobo_overrides
 
     cost_overrides = _load_curobo_overrides(curobo_overrides)
+    # num_particles / opt_steps_per_skeleton may be set from the cfg/tamp yml (tamp_overrides) so a
+    # data-gen config controls solver effort without CLI flags; an override wins over the CLI default.
+    # (These key names are also echoed by summarize_curobo_config.)
+    if cost_overrides.get("num_particles") is not None:
+        num_particles = int(cost_overrides["num_particles"])
+    if cost_overrides.get("opt_steps_per_skeleton") is not None:
+        opt_steps_per_skeleton = int(cost_overrides["opt_steps_per_skeleton"])
+    if num_particles <= 0 or opt_steps_per_skeleton <= 0:
+        raise ValueError(
+            f"num_particles and opt_steps_per_skeleton must be positive, got "
+            f"{num_particles=}, {opt_steps_per_skeleton=}"
+        )
+    _log.info(f"Solver effort: num_particles={num_particles}, opt_steps_per_skeleton={opt_steps_per_skeleton}")
     cfg = tiptop_cfg()
     # time_dilation_factor[_literal] is a plan-time knob (not a cuRobo cost weight), so it is NOT
     # handled by build_curobo_solvers/apply_cost_overrides — resolve it here and thread it into the
@@ -1121,6 +1140,10 @@ def _sync_entrypoint(
         time_dilation_factor=time_dilation_factor,
         collision_activation_distance=0.0,
         enable_visualizer=cutamp_visualize,
+        # move-cost norm for cuTAMP (Euclidean unless a cfg/tamp yml opts into "inf"), same as
+        # time_dilation_factor this is a TAMP-config knob, not a cuRobo cost weight.
+        traj_length_norm=resolve_traj_length_norm(cost_overrides),
+        grasp_orientation_cost=resolve_grasp_orientation_cost(cost_overrides),
     )
 
     global _executor_pool

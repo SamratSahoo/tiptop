@@ -30,7 +30,13 @@ from curobo.wrap.reacher.ik_solver import IKSolver
 from curobo.wrap.reacher.motion_gen import MotionGen
 
 from tiptop.config import tiptop_cfg
-from tiptop.motion_planning import build_curobo_solvers, resolve_time_dilation_factor
+from tiptop.motion_planning import (
+    build_curobo_solvers,
+    resolve_grasp_orientation_cost,
+    resolve_time_dilation_factor,
+    resolve_traj_length_norm,
+    resolve_trace_cfg,
+)
 from tiptop.perception.cameras import Frame
 from tiptop.planning import build_tamp_config, run_planning, save_tiptop_plan, serialize_plan
 from tiptop.recording import save_run_metadata, save_run_outputs
@@ -116,6 +122,8 @@ class TiptopPlanningServer:
             opt_steps=500,
             robot_type=self._cfg.robot.type,
             time_dilation_factor=time_dilation_factor,
+            traj_length_norm=resolve_traj_length_norm(self._curobo_overrides),
+            grasp_orientation_cost=resolve_grasp_orientation_cost(self._curobo_overrides),
         )
         self._output_dir = Path("tiptop_server_outputs")
         # Concurrency model. The slow part of a plan is I/O-bound perception (Gemini / SAM2 / M2T2
@@ -342,7 +350,7 @@ class TiptopPlanningServer:
                     "save_dir": str(save_dir.resolve()),
                 }
 
-            serialized_plan = serialize_plan(cutamp_plan, q_init)
+            serialized_plan = serialize_plan(cutamp_plan, q_init, trace_cfg=resolve_trace_cfg(self._curobo_overrides))
             plan_path = save_dir / "tiptop_plan.json"
             save_tiptop_plan(serialized_plan, plan_path)
             _log.info(f"Saved outputs to {save_dir}")
