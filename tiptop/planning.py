@@ -17,6 +17,7 @@ from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_
 from cutamp.task_planning.constraints import StablePlacement
 from jaxtyping import Float
 
+from tiptop.trajectory_blending import arm_joint_limits, blend_cutamp_plan, resolve_blend_config
 from tiptop.utils import NumpyEncoder
 
 _log = logging.getLogger(__name__)
@@ -88,10 +89,15 @@ def run_planning(
     motion_gen: MotionGen,
     all_surfaces: list,
     experiment_dir: Path | None = None,
+    cost_overrides: dict | None = None,
 ) -> tuple[list | None, float, str | None]:
     """Run cuTAMP planning and return (plan, planning_time_seconds, failure_reason).
 
     Returns (None, elapsed, failure_reason) if cuTAMP fails to find a plan.
+
+    ``cost_overrides`` is the config's ``tamp_overrides`` dict; it is used here only to resolve the
+    trajectory-blending settings (``blend_trajectory`` etc. -- see resolve_blend_config). Blending is
+    off unless the config opts in.
     """
     constraint_to_tol = default_constraint_to_tol.copy()
     constraint_to_mult = default_constraint_to_mult.copy()
@@ -122,6 +128,20 @@ def run_planning(
         _log.error(f"cuTAMP failed to find a plan: {failure_reason}")
     else:
         _log.info(f"Found plan with {len(cutamp_plan)} steps")
+        # Optionally blend + re-time consecutive trajectory segments into continuous strokes so the
+        # arm only stops at gripper events (opt-in via `blend_trajectory` in tamp_overrides; see
+        # trajectory_blending). Done here, before both serialize_plan and execute_cutamp_plan, so the
+        # saved and executed plans are the identical (possibly blended) object.
+        blend_config = resolve_blend_config(cost_overrides)
+        if blend_config.enabled:
+            dof = next(
+                (s["plan"].position.shape[1] for s in cutamp_plan if s.get("type") == "trajectory"), None
+            )
+            if dof is not None:
+                vel_limit, acc_limit = arm_joint_limits(motion_gen, dof)
+                cutamp_plan = blend_cutamp_plan(
+                    cutamp_plan, blend_config, vel_limit=vel_limit, acc_limit=acc_limit
+                )
 
     return cutamp_plan, elapsed, failure_reason
 

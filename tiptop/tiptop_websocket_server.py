@@ -331,6 +331,7 @@ class TiptopPlanningServer:
                     processed_scene.grasps,
                     self._motion_gen,
                     all_surfaces,
+                    cost_overrides=self._curobo_overrides,
                 )
 
             if cutamp_plan is None:

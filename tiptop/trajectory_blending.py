@@ -1,0 +1,440 @@
+"""Blend + re-time a cuTAMP plan so consecutive arm motions read like one continuous stroke.
+
+A cuTAMP plan is a sequence of independently-planned trajectory segments (retract -> approach ->
+grasp, etc.) separated by gripper open/close steps. Every segment is a cuRobo *reaching* motion, so
+it accelerates from rest and decelerates back to rest at each of its endpoints. Concatenated, the
+arm therefore comes to a full stop at every interior waypoint -- a stop-and-go, per-segment velocity
+profile with ~20 zero-velocity dips, quite unlike a human teleop demo, which flows through the
+reach and only slows near the grasp/place itself.
+
+This module collapses that: it groups the consecutive trajectory segments *between gripper events*
+and replaces each group with a single smooth stroke that comes to rest only at its ends -- which are
+exactly the gripper-actuation points, where the arm genuinely should be still for a reliable
+grasp/place. Each stroke is built by path-velocity decomposition:
+
+* Geometry. The group's joined waypoints are fit with a penalized cubic SMOOTHING spline in joint
+  space, parameterized by arc length. The penalty rounds the sharp direction changes at the old
+  segment joins (which an interpolating spline would overshoot, producing large phantom
+  accelerations) while staying close to the collision-checked path (~1 deg joint deviation at the
+  default smoothing).
+
+* Timing. A quintic time law sweeps along the path with a smooth (min-jerk-like) bell-shaped speed
+  profile. At the plan's true rest points (episode start/end) it comes fully to rest (this is the
+  6t^5-15t^4+10t^3 minimum-jerk quintic, the standard model of human reaching). At gripper-adjacent
+  boundaries it instead ends/starts at a small NONZERO boundary speed: the min-jerk quintic ramps so
+  gently through zero that it leaves a long run of near-zero-velocity frames on both sides of the
+  gripper event, and the DROID/openpi non-idle training filter drops idle joint-velocity runs (>=7
+  frames at 15 Hz), which would take the gripper open/close timestep with them. Carrying a nonzero
+  boundary speed keeps the only zero-velocity frames at a gripper event to the short (~3-frame)
+  stationary hold the export inserts for the actuation itself -- comfortably under the filter's run
+  length. The arm still slows into the grasp/place (the boundary speed is a small fraction of cruise)
+  and its final commanded POSITION is exactly the grasp, so there is no overshoot.
+
+* Pace / limits. The stroke's duration defaults to the group's original wall-clock (so a
+  ``time_dilation_factor``-slowed plan stays slow, just continuous), and is stretched only if the
+  motion would otherwise exceed the robot's REAL joint velocity/acceleration limits (from
+  ``motion_gen``). Capping at the true limits -- not at the slowed plan's own peaks, which sit at
+  ~1/4 of the acceleration limit -- is what lets the corners round without the stroke crawling.
+
+Calibration: on this repo's teleop demos the human joint-jerk RMS is ~3-6; the default smoothing is
+tuned so the blended strokes land in that same band (i.e. as smooth as the human data), not smoother
+and blurrier, nor sharper and more robotic.
+
+Collision caveat: smoothing rounds the sharp corners at the old segment joins, so the blended path is
+NOT identical to the one cuRobo collision-checked (largest deviation at those corners, ~1 deg joint at
+the default). This is the same rounding a human demo has, but validate in sim / on the viz before
+trusting it near tight obstacles.
+
+Blending is OFF by default and opt-in per config: set ``blend_trajectory: true`` under
+``tamp_overrides`` in a ``cfg/tamp/*.yml`` (see :func:`resolve_blend_config`). This is a pure
+post-process over the joint-waypoint arrays (no planner changes); it runs in ``run_planning`` so the
+saved plan and the executed plan are the identical blended object.
+"""
+
+import logging
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+from curobo.types.state import JointState
+from scipy.interpolate import CubicSpline, make_smoothing_spline
+
+_log = logging.getLogger(__name__)
+
+# Defaults for the tunable knobs (overridable per config -- see resolve_blend_config).
+_DEFAULT_SMOOTHING = 1e-4  # smoothing-spline penalty (lam) in the arc-length (radian) parameterization
+_DEFAULT_VEL_SLACK = 1.0  # fraction of the robot's real velocity limit the blend may use
+_DEFAULT_ACC_SLACK = 1.0  # fraction of the robot's real acceleration limit the blend may use
+# Joint speed (rad/s, L2) each stroke carries at gripper-adjacent boundaries so those frames are not
+# idle (see module docstring). ~0.15 clears the ~0.02 non-idle threshold with wide margin while
+# staying a small fraction of cruise. Set to 0 to fall back to fully rest-to-rest (min-jerk) strokes.
+_DEFAULT_BOUNDARY_SPEED = 0.15
+
+# The boundary slope is capped at this fraction of the stroke's average slope so the time law stays
+# monotonic (a boundary faster than the mean would invert the bell / make the arm backtrack).
+_MAX_BOUNDARY_SLOPE = 0.8
+
+# Waypoints closer than this (Euclidean, joint space, radians) to the previous kept one are dropped
+# before fitting so the arc-length parameter is strictly increasing. Consecutive segments share an
+# exact endpoint, and each segment's decel tail is a cluster of near-identical points -- this removes
+# both.
+_MIN_CHORD = 1e-4
+
+# Below this many distinct waypoints the smoothing spline is not well-conditioned; fall back to a
+# plain (natural) cubic through the points -- the min-jerk time law still makes it rest-to-rest.
+_MIN_SMOOTH_PTS = 6
+
+# Fallback caps when the robot's real limits are unavailable, as multiples of the plan's OWN peak
+# per-joint velocity / acceleration. The acceleration multiple is generous because a slowed plan sits
+# well below the true acceleration limit (see module docstring), so its own peak is a poor ceiling.
+_FALLBACK_VEL_MULT = 1.5
+_FALLBACK_ACC_MULT = 4.0
+
+
+@dataclass
+class BlendConfig:
+    """Resolved trajectory-blending settings (from a config's ``tamp_overrides``)."""
+
+    enabled: bool = False
+    smoothing: float = _DEFAULT_SMOOTHING
+    vel_slack: float = _DEFAULT_VEL_SLACK
+    acc_slack: float = _DEFAULT_ACC_SLACK
+    boundary_speed: float = _DEFAULT_BOUNDARY_SPEED
+    # Operation names to restrict blending to (e.g. ("Pick", "Place")); None blends every operation.
+    ops: tuple[str, ...] | None = None
+
+
+def resolve_blend_config(overrides: dict | None) -> BlendConfig:
+    """Read the blending knobs from a config's ``tamp_overrides`` dict (OFF unless opted in).
+
+    Recognized keys (all optional):
+        blend_trajectory: bool       -- master enable (default False)
+        blend_smoothing:  float      -- smoothing-spline penalty; higher = smoother, less faithful
+        blend_vel_slack:  float      -- fraction of the real velocity limit to use (default 1.0)
+        blend_acc_slack:  float      -- fraction of the real acceleration limit to use (default 1.0)
+        blend_boundary_speed: float  -- joint speed (rad/s) carried at gripper-adjacent boundaries so
+                                        those frames are not idle-filtered (default 0.15; 0 = rest)
+        blend_ops:        list[str]  -- restrict blending to these operations by name, e.g.
+                                        [Pick, Place]; omitted/empty blends every operation
+    """
+    o = overrides or {}
+    raw_ops = o.get("blend_ops")
+    ops = tuple(str(x) for x in raw_ops) if raw_ops else None
+    return BlendConfig(
+        enabled=bool(o.get("blend_trajectory", False)),
+        smoothing=float(o.get("blend_smoothing", _DEFAULT_SMOOTHING)),
+        vel_slack=float(o.get("blend_vel_slack", _DEFAULT_VEL_SLACK)),
+        acc_slack=float(o.get("blend_acc_slack", _DEFAULT_ACC_SLACK)),
+        boundary_speed=float(o.get("blend_boundary_speed", _DEFAULT_BOUNDARY_SPEED)),
+        ops=ops,
+    )
+
+
+def _op_name(label: str) -> str:
+    """Operation name from a step label, e.g. 'Pick(brown_toy, grasp1, q1)' -> 'Pick'."""
+    return (label or "").split("(", 1)[0].strip()
+
+
+def _dedup_path(positions: np.ndarray) -> np.ndarray:
+    """Drop waypoints within ``_MIN_CHORD`` of the previous kept one so chord length is strictly increasing.
+
+    Each segment decelerates to rest, so its final few waypoints are near-identical; the true group
+    endpoint must survive, so the final point is forced in and any trailing kept points too close to
+    it are dropped first (keeping the endpoint exact and the last interval strictly positive).
+    """
+    keep = [0]
+    for i in range(1, len(positions) - 1):
+        if np.linalg.norm(positions[i] - positions[keep[-1]]) > _MIN_CHORD:
+            keep.append(i)
+    final = len(positions) - 1
+    while len(keep) > 1 and np.linalg.norm(positions[final] - positions[keep[-1]]) <= _MIN_CHORD:
+        keep.pop()
+    keep.append(final)
+    return positions[keep]
+
+
+def _fit_geometry(u: np.ndarray, positions: np.ndarray, smoothing: float) -> list:
+    """Per-joint geometry spline q_j(u) over arc length: penalized smoothing spline, cubic fallback."""
+    if len(positions) >= _MIN_SMOOTH_PTS:
+        try:
+            return [make_smoothing_spline(u, positions[:, j], lam=smoothing) for j in range(positions.shape[1])]
+        except Exception:
+            _log.exception("Smoothing-spline geometry fit failed; falling back to a plain cubic")
+    return [CubicSpline(u, positions[:, j], bc_type="natural") for j in range(positions.shape[1])]
+
+
+def _eval_geometry(geom: list, u: np.ndarray, nu: int) -> np.ndarray:
+    """Evaluate the ``nu``-th derivative of every joint's geometry spline -> [len(u), dof]."""
+    return np.stack([g(u, nu) for g in geom], axis=1)
+
+
+def _time_law(tau: np.ndarray, lead_slope: float, trail_slope: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Normalized quintic h(tau) mapping [0,1]->[0,1] with, at both ends, the given first-derivative
+    (slope) and zero second-derivative. Returns (h, h', h'').
+
+    With lead_slope == trail_slope == 0 this is exactly the minimum-jerk quintic 10t^3-15t^4+6t^5
+    (rest to rest). A nonzero slope makes the arc-length sweep -- hence the joint speed -- start/end
+    at a controlled nonzero value instead of dwelling near zero. h(0)=0, h(1)=1, h'(0)=lead_slope,
+    h'(1)=trail_slope, h''(0)=h''(1)=0.
+    """
+    # h = lead_slope*tau + c3 tau^3 + c4 tau^4 + c5 tau^5  (c0=0, c1=lead_slope, c2=0 satisfy the tau=0 BCs)
+    a = np.array([[1.0, 1.0, 1.0], [3.0, 4.0, 5.0], [6.0, 12.0, 20.0]])
+    rhs = np.array([1.0 - lead_slope, trail_slope - lead_slope, 0.0])
+    c3, c4, c5 = np.linalg.solve(a, rhs)
+    h = lead_slope * tau + c3 * tau**3 + c4 * tau**4 + c5 * tau**5
+    hp = lead_slope + 3 * c3 * tau**2 + 4 * c4 * tau**3 + 5 * c5 * tau**4
+    hpp = 6 * c3 * tau + 12 * c4 * tau**2 + 20 * c5 * tau**3
+    return h, hp, hpp
+
+
+def blend_group(
+    positions: np.ndarray,
+    dt: float,
+    target_duration: float,
+    vel_cap: np.ndarray,
+    acc_cap: np.ndarray,
+    smoothing: float = _DEFAULT_SMOOTHING,
+    lead_speed: float = 0.0,
+    trail_speed: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Re-time one group of joined waypoints into a single smooth stroke.
+
+    Args:
+        positions: [N, dof] concatenated waypoints of the group (segment joins de-duplicated upstream).
+        dt: control timestep to re-sample at.
+        target_duration: desired duration (the group's original wall-clock), stretched only if the
+            per-joint velocity/acceleration caps would otherwise be exceeded.
+        vel_cap, acc_cap: [dof] per-joint velocity / acceleration ceilings.
+        smoothing: geometry smoothing-spline penalty (lam).
+        lead_speed, trail_speed: joint speed (rad/s, L2) to carry at the first / last sample. 0 means
+            rest (min-jerk); >0 keeps the boundary out of the idle band (see module docstring).
+
+    Returns:
+        (positions, velocities, accelerations, dt_out) re-sampled at ~uniform ``dt_out`` (== dt up to
+        rounding). Velocity is exactly zero at an end whose *_speed is 0, else that boundary speed.
+    """
+    positions = _dedup_path(np.asarray(positions, dtype=np.float64))
+
+    # Degenerate group (no motion): a single held pose -> two stationary, zero-velocity samples.
+    if len(positions) < 2:
+        pos = np.repeat(positions[:1], 2, axis=0)
+        zeros = np.zeros_like(pos)
+        return pos, zeros, zeros, dt
+
+    # Arc-length parameter (joint space) for the geometry spline.
+    u = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(positions, axis=0), axis=1))])
+    length = float(u[-1])
+    if length < _MIN_CHORD:  # no meaningful net motion (e.g. returns to start): hold the pose.
+        pos = np.repeat(positions[:1], 2, axis=0)
+        zeros = np.zeros_like(pos)
+        return pos, zeros, zeros, dt
+
+    geom = _fit_geometry(u, positions, smoothing)
+
+    # Tangent magnitude |dq/du| at each end. Arc length makes this ~1, but the smoothing spline
+    # rounds corners, so it can be < 1 near a boundary; dividing the requested boundary joint speed
+    # by it makes the actual end speed match the request rather than falling short.
+    t0 = float(np.linalg.norm(_eval_geometry(geom, np.array([0.0]), 1)[0])) or 1.0
+    t1 = float(np.linalg.norm(_eval_geometry(geom, np.array([length]), 1)[0])) or 1.0
+
+    def sample(duration: float, n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        tau = np.linspace(0.0, 1.0, n)
+        # Boundary slopes in normalized (tau) units so that the joint speed at each end equals the
+        # requested value. Capped below the mean slope (1.0) to keep the sweep monotonic.
+        lead_slope = min(_MAX_BOUNDARY_SLOPE, (lead_speed / t0) * duration / length)
+        trail_slope = min(_MAX_BOUNDARY_SLOPE, (trail_speed / t1) * duration / length)
+        h, hp, hpp = _time_law(tau, lead_slope, trail_slope)
+        ut = length * h
+        du_dt = length * hp / duration
+        d2u_dt2 = length * hpp / duration**2
+        d1 = _eval_geometry(geom, ut, 1)  # dq/du
+        d2 = _eval_geometry(geom, ut, 2)  # d2q/du2
+        pos = _eval_geometry(geom, ut, 0)
+        vel = d1 * du_dt[:, None]
+        acc = d2 * (du_dt**2)[:, None] + d1 * d2u_dt2[:, None]
+        return pos, vel, acc
+
+    # Stretch the (single, global) duration until velocity and acceleration fit the caps. Under
+    # duration -> alpha*duration, velocity scales as 1/alpha and acceleration as 1/alpha^2.
+    _, v0, a0 = sample(target_duration, 400)
+    alpha_v = float((np.abs(v0).max(axis=0) / vel_cap).max())
+    alpha_a = float(np.sqrt((np.abs(a0).max(axis=0) / acc_cap).max()))
+    duration = target_duration * max(1.0, alpha_v, alpha_a)
+
+    n = max(2, int(round(duration / dt)) + 1)
+    out_pos, out_vel, out_acc = sample(duration, n)
+    # Pin a boundary to exact rest only where a zero boundary speed was requested (episode ends);
+    # a nonzero boundary is left as computed so the gripper-adjacent frames stay out of the idle band.
+    if lead_speed == 0.0:
+        out_vel[0] = 0.0
+    if trail_speed == 0.0:
+        out_vel[-1] = 0.0
+    dt_out = duration / (n - 1)
+    return out_pos, out_vel, out_acc, dt_out
+
+
+def _resolve_caps(
+    orig_velocities: np.ndarray,
+    dt: float,
+    vel_limit: np.ndarray | None,
+    acc_limit: np.ndarray | None,
+    vel_slack: float,
+    acc_slack: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-joint velocity/acceleration caps: the robot's real limits (scaled by slack) when available,
+    else a generous multiple of the plan's own peaks (a slowed plan sits well below the true limits)."""
+    if vel_limit is not None and acc_limit is not None:
+        return vel_slack * np.abs(vel_limit), acc_slack * np.abs(acc_limit)
+    _log.warning(
+        "Trajectory blending: robot limits unavailable; capping at %.1fx/%.1fx the plan's own peak "
+        "velocity/acceleration instead.",
+        _FALLBACK_VEL_MULT,
+        _FALLBACK_ACC_MULT,
+    )
+    ov = np.asarray(orig_velocities, dtype=np.float64)
+    vel_cap = _FALLBACK_VEL_MULT * np.abs(ov).max(axis=0)
+    orig_acc = np.gradient(ov, dt, axis=0) if len(ov) > 2 else np.zeros_like(ov)
+    acc_cap = _FALLBACK_ACC_MULT * np.abs(orig_acc).max(axis=0)
+    # Floor tiny-motion joints at a fraction of the largest cap so their near-zero peak does not make
+    # the limit check hypersensitive and stretch the whole group.
+    for cap in (vel_cap, acc_cap):
+        m = float(cap.max())
+        if m > 0:
+            np.maximum(cap, 0.25 * m, out=cap)
+    return vel_cap, acc_cap
+
+
+def _blend_trajectory_steps(
+    steps: list[dict],
+    config: BlendConfig,
+    vel_limit: np.ndarray | None,
+    acc_limit: np.ndarray | None,
+    lead_speed: float,
+    trail_speed: float,
+) -> dict:
+    """Blend a run of consecutive ``trajectory`` steps into one re-timed trajectory step."""
+    template = steps[0]["plan"]
+    device = template.position.device
+    joint_names = template.joint_names
+    dt = float(steps[0]["dt"])
+
+    # Join waypoints, dropping each later segment's first row (an exact copy of the previous
+    # segment's last row -- see motion_solver: the next plan starts from the prior end position).
+    seg_positions = [s["plan"].position.detach().cpu().numpy().astype(np.float64) for s in steps]
+    joined = np.concatenate([seg_positions[0]] + [p[1:] for p in seg_positions[1:]], axis=0)
+    orig_velocities = np.concatenate(
+        [s["plan"].velocity.detach().cpu().numpy().astype(np.float64) for s in steps], axis=0
+    )
+    # Preserve the group's original wall-clock so blending changes shape, not overall pace (the limit
+    # check may still stretch it if rounding the previously-stopped corners needs more time).
+    target_duration = sum((len(p) - 1) for p in seg_positions) * dt
+
+    vel_cap, acc_cap = _resolve_caps(
+        orig_velocities, dt, vel_limit, acc_limit, config.vel_slack, config.acc_slack
+    )
+    pos, vel, acc, dt_out = blend_group(
+        joined, dt, target_duration, vel_cap, acc_cap, config.smoothing, lead_speed, trail_speed
+    )
+
+    plan = JointState(
+        position=torch.as_tensor(pos, dtype=torch.float32, device=device),
+        velocity=torch.as_tensor(vel, dtype=torch.float32, device=device),
+        acceleration=torch.as_tensor(acc, dtype=torch.float32, device=device),
+        jerk=torch.zeros(pos.shape, dtype=torch.float32, device=device),
+        joint_names=list(joint_names) if joint_names is not None else None,
+    )
+    # Keep the run's first label; the merged stroke spans the same logical action(s).
+    return {"type": "trajectory", "plan": plan, "dt": dt_out, "label": steps[0]["label"]}
+
+
+def blend_cutamp_plan(
+    cutamp_plan: list[dict],
+    config: BlendConfig,
+    vel_limit: np.ndarray | None = None,
+    acc_limit: np.ndarray | None = None,
+) -> list[dict]:
+    """Return ``cutamp_plan`` with consecutive trajectory segments blended + re-timed, if enabled.
+
+    A no-op returning the plan unchanged when ``config.enabled`` is False (the default -- blending is
+    opt-in per config via ``blend_trajectory: true``). When enabled, gripper steps pass through
+    untouched and delimit the groups; the trajectory steps between two gripper events (or a plan end)
+    -- always a single operation, e.g. one Pick or Place -- are merged into a single smooth,
+    minimum-jerk stroke that only comes to rest at those gripper events. If ``config.ops`` is set,
+    only operations named in it are blended; every other operation's original segments pass through
+    untouched. ``vel_limit`` / ``acc_limit`` are the robot's per-arm-joint velocity / acceleration
+    limits (see :func:`arm_joint_limits`); when omitted, a fallback derived from the plan's own peaks
+    is used.
+    """
+    if not config.enabled:
+        return cutamp_plan
+
+    n_steps = len(cutamp_plan)
+    out: list[dict] = []
+    run: list[dict] = []
+    run_start_idx = 0
+    stats = {"blended": 0, "skipped": 0}
+
+    def flush(run_end_idx: int):
+        if not run:
+            return
+        # A run is one operation's trajectory segments (grippers delimit operations). Skip it if an
+        # ops filter is set and this operation is not in it -- its original segments pass through.
+        if config.ops is not None and _op_name(run[0]["label"]) not in config.ops:
+            out.extend(run)
+            stats["skipped"] += 1
+            run.clear()
+            return
+        # Rest (zero boundary speed) only where the arm is genuinely stationary: the episode's very
+        # start (this run opens the plan) and end (it closes the plan). Every other boundary abuts a
+        # gripper event, so carry a nonzero speed there to keep those frames out of the idle filter.
+        lead_speed = 0.0 if run_start_idx == 0 else config.boundary_speed
+        trail_speed = 0.0 if run_end_idx == n_steps - 1 else config.boundary_speed
+        try:
+            out.append(_blend_trajectory_steps(run, config, vel_limit, acc_limit, lead_speed, trail_speed))
+            stats["blended"] += 1
+        except Exception:
+            # Best-effort: on any numerical/shape surprise, keep the original segments for this run
+            # rather than failing the whole plan.
+            _log.exception("Trajectory blending failed for a segment run; keeping original segments")
+            out.extend(run)
+        run.clear()
+
+    for idx, step in enumerate(cutamp_plan):
+        if step.get("type") == "trajectory":
+            if not run:
+                run_start_idx = idx
+            run.append(step)
+        else:
+            flush(idx - 1)
+            out.append(step)
+    flush(n_steps - 1)
+
+    scope = "all operations" if config.ops is None else f"operations {list(config.ops)}"
+    _log.info(
+        "Trajectory blending (%s): %d operation groups blended into single strokes, %d left unblended "
+        "(%d trajectory segments -> %d steps)",
+        scope,
+        stats["blended"],
+        stats["skipped"],
+        sum(1 for s in cutamp_plan if s.get("type") == "trajectory"),
+        sum(1 for s in out if s.get("type") == "trajectory"),
+    )
+    return out
+
+
+def arm_joint_limits(motion_gen, dof: int) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Best-effort (velocity_limit, acceleration_limit) arrays for the first ``dof`` arm joints.
+
+    Reads the robot's joint limits from ``motion_gen`` and returns the upper (positive) velocity and
+    acceleration bounds for the arm joints (the plan's dof), or (None, None) if they can't be read --
+    in which case the blend falls back to plan-derived caps.
+    """
+    try:
+        jl = motion_gen.kinematics.get_joint_limits()
+        vel = jl.velocity[1].detach().cpu().numpy().astype(np.float64)  # upper bound per joint
+        acc = jl.acceleration[1].detach().cpu().numpy().astype(np.float64)
+        # cuRobo cspace lists the arm joints first, then any gripper joints; the plan is the arm dof.
+        return vel[:dof], acc[:dof]
+    except Exception:
+        _log.exception("Could not read robot joint limits for trajectory blending; using fallback caps")
+        return None, None

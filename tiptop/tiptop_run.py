@@ -186,6 +186,10 @@ class _DemoContainer:
     # fact, not just live in the warmup console (see async_entrypoint).
     curobo_config_summary: dict
 
+    # Raw cfg/tamp/*.yml tamp_overrides, threaded to run_planning for the plan-time knobs it resolves
+    # itself (currently trajectory blending -- `blend_trajectory` etc.).
+    cost_overrides: dict
+
 
 @dataclass
 class ProcessedScene:
@@ -268,6 +272,7 @@ def get_demo_container(
         ik_solver=ik_solver,
         motion_gen=motion_gen,
         curobo_config_summary=curobo_config_summary or {},
+        cost_overrides=cost_overrides or {},
     )
 
 
@@ -885,6 +890,7 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                             motion_gen=container.motion_gen,
                             all_surfaces=all_surfaces,
                             experiment_dir=save_dir / "cutamp",
+                            cost_overrides=container.cost_overrides,
                         )
                         _log.info(f"Perception and cuTAMP planning took: {perception_duration + planning_duration:.2f}s")
                         if cutamp_plan is not None:
