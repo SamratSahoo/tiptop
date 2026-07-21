@@ -516,6 +516,11 @@ def _gripper_handler(socket: zmq.Socket, gripper):
                             "current": float(st.get("current", 0.0)),
                         },
                     }
+                    log.info(
+                        f"  gripper state: width={float(st['width']):.4f} "
+                        f"is_grasped={bool(st['is_grasped'])} is_moving={bool(st['is_moving'])} "
+                        f"current={float(st.get('current', 0.0)):.2f} stale={bool(st.get('stale', False))}"
+                    )
                 except Exception as e:
                     resp = {"success": False, "error": str(e)}
             else:
