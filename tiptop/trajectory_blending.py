@@ -30,11 +30,26 @@ grasp/place. Each stroke is built by path-velocity decomposition:
   length. The arm still slows into the grasp/place (the boundary speed is a small fraction of cruise)
   and its final commanded POSITION is exactly the grasp, so there is no overshoot.
 
-* Pace / limits. The stroke's duration defaults to the group's original wall-clock (so a
-  ``time_dilation_factor``-slowed plan stays slow, just continuous), and is stretched only if the
-  motion would otherwise exceed the robot's REAL joint velocity/acceleration limits (from
-  ``motion_gen``). Capping at the true limits -- not at the slowed plan's own peaks, which sit at
-  ~1/4 of the acceleration limit -- is what lets the corners round without the stroke crawling.
+  A symmetric bell makes the endpoint the stroke's SLOWEST point, so the boundary speed it can carry is
+  capped at ``_MAX_BOUNDARY_SLOPE`` * the stroke average (monotonicity): on a slow (heavily time-dilated)
+  operation that clamps the transition back into the idle band, and an endpoint-tangent collapse at a
+  grasp reversal clamps it further. Setting ``blend_boundary_window`` > 0 switches to an asymmetric time
+  law (:func:`_asymmetric_stroke`) that holds the plan pace through the middle and carries the boundary
+  speed only within that window at each end -- a strictly-positive (monotonic) speed profile with no
+  such cap, so the transition clears the idle band while the careful mid-approach stays slow.
+
+* Pace / limits. The stroke's duration starts at the group's original wall-clock (so a
+  ``time_dilation_factor``-slowed plan stays slow, just continuous) and is then shortened PER STROKE
+  only as much as its own gripper-adjacent boundary speed requires -- never globally. This matters
+  because the boundary joint speed is capped at ``_MAX_BOUNDARY_SLOPE`` times the stroke AVERAGE
+  (the min-jerk endpoints are its slowest point), so at a slow pace ``blend_boundary_speed`` is
+  silently clamped and the arm crawls through gripper open/close -- which a velocity-command policy
+  learns to stall on. Shortening only the strokes that would clamp lifts their transition speed to the
+  request while leaving strokes already fast enough (and the cruise of the rest of the plan) at their
+  original careful pace. The shortening is bounded by the robot's REAL joint velocity/acceleration
+  limits (from ``motion_gen``); a transition unreachable within those limits (e.g. a rounded grasp
+  cusp) is left at the original pace and logged, not chased by over-speeding the whole stroke.
+  ``blend_speed_scale`` (default 1.0) is an optional EXTRA global multiplier on top, rarely needed now.
 
 Calibration: on this repo's teleop demos the human joint-jerk RMS is ~3-6; the default smoothing is
 tuned so the blended strokes land in that same band (i.e. as smooth as the human data), not smoother
@@ -70,9 +85,28 @@ _DEFAULT_ACC_SLACK = 1.0  # fraction of the robot's real acceleration limit the 
 # staying a small fraction of cruise. Set to 0 to fall back to fully rest-to-rest (min-jerk) strokes.
 _DEFAULT_BOUNDARY_SPEED = 0.15
 
+# Optional EXTRA global speed-up applied to every blended stroke (target_duration is divided by this).
+# Normally left at 1.0: blend_group already shortens each stroke just enough to realize its own
+# gripper-adjacent boundary speed (see blend_group), so the transitions clear the idle band without
+# over-speeding the cruise of the rest of the plan. Set >1.0 only to deliberately run the whole plan
+# faster on top of that; the vel/accel caps still bound it to the robot's real limits.
+_DEFAULT_SPEED_SCALE = 1.0
+
 # The boundary slope is capped at this fraction of the stroke's average slope so the time law stays
-# monotonic (a boundary faster than the mean would invert the bell / make the arm backtrack).
+# monotonic (a boundary faster than the mean would invert the bell / make the arm backtrack). This cap
+# only applies to the default (symmetric min-jerk) time law; the asymmetric profile (blend_boundary_window
+# > 0) is monotonic by construction and is not subject to it.
 _MAX_BOUNDARY_SLOPE = 0.8
+
+# Asymmetric time law (Option B): length of the fast/slow end window in seconds. 0 disables it (use the
+# symmetric min-jerk bell). >0 carries blend_boundary_speed only within this window at each gripper end
+# and holds the plan pace through the middle -- decoupling the transition speed from the careful cruise.
+_DEFAULT_BOUNDARY_WINDOW = 0.0
+
+# Ceiling on the asymmetric profile's end speed as a multiple of the cruise, so a near-vanishing endpoint
+# tangent can't blow the profile up. The vel/accel caps bound the actual motion; this only keeps the
+# normalized speed profile numerically sane.
+_MAX_BOUNDARY_RATIO = 40.0
 
 # Waypoints closer than this (Euclidean, joint space, radians) to the previous kept one are dropped
 # before fitting so the arc-length parameter is strictly increasing. Consecutive segments share an
@@ -100,6 +134,8 @@ class BlendConfig:
     vel_slack: float = _DEFAULT_VEL_SLACK
     acc_slack: float = _DEFAULT_ACC_SLACK
     boundary_speed: float = _DEFAULT_BOUNDARY_SPEED
+    speed_scale: float = _DEFAULT_SPEED_SCALE
+    boundary_window: float = _DEFAULT_BOUNDARY_WINDOW
     # Operation names to restrict blending to (e.g. ("Pick", "Place")); None blends every operation.
     ops: tuple[str, ...] | None = None
 
@@ -114,18 +150,35 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
         blend_acc_slack:  float      -- fraction of the real acceleration limit to use (default 1.0)
         blend_boundary_speed: float  -- joint speed (rad/s) carried at gripper-adjacent boundaries so
                                         those frames are not idle-filtered (default 0.15; 0 = rest)
+        blend_speed_scale: float     -- optional EXTRA global speed-up on top of the automatic per-stroke
+                                        boundary speed-up (default 1.0 = none). Rarely needed now: each
+                                        stroke is already shortened just enough to realize
+                                        blend_boundary_speed; >1 additionally over-speeds every stroke.
+        blend_boundary_window: float -- 0 (default) uses the symmetric min-jerk bell. >0 enables the
+                                        asymmetric time law (Option B): carry blend_boundary_speed only
+                                        within this many seconds at each gripper end while holding the
+                                        plan pace through the middle, so the transition is non-idle
+                                        without speeding up the careful cruise (see _asymmetric_stroke).
         blend_ops:        list[str]  -- restrict blending to these operations by name, e.g.
                                         [Pick, Place]; omitted/empty blends every operation
     """
     o = overrides or {}
     raw_ops = o.get("blend_ops")
     ops = tuple(str(x) for x in raw_ops) if raw_ops else None
+    speed_scale = float(o.get("blend_speed_scale", _DEFAULT_SPEED_SCALE))
+    if speed_scale <= 0.0:
+        raise ValueError(f"blend_speed_scale must be > 0 (got {speed_scale})")
+    boundary_window = float(o.get("blend_boundary_window", _DEFAULT_BOUNDARY_WINDOW))
+    if boundary_window < 0.0:
+        raise ValueError(f"blend_boundary_window must be >= 0 (got {boundary_window})")
     return BlendConfig(
         enabled=bool(o.get("blend_trajectory", False)),
         smoothing=float(o.get("blend_smoothing", _DEFAULT_SMOOTHING)),
         vel_slack=float(o.get("blend_vel_slack", _DEFAULT_VEL_SLACK)),
         acc_slack=float(o.get("blend_acc_slack", _DEFAULT_ACC_SLACK)),
         boundary_speed=float(o.get("blend_boundary_speed", _DEFAULT_BOUNDARY_SPEED)),
+        speed_scale=speed_scale,
+        boundary_window=boundary_window,
         ops=ops,
     )
 
@@ -187,6 +240,73 @@ def _time_law(tau: np.ndarray, lead_slope: float, trail_slope: float) -> tuple[n
     return h, hp, hpp
 
 
+def _smootherstep(x: np.ndarray) -> np.ndarray:
+    """Quintic smoothstep 10x^3-15x^4+6x^5 on [0,1] (0 at 0, 1 at 1, zero slope+accel at both ends)."""
+    x = np.clip(x, 0.0, 1.0)
+    return x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
+
+
+def _asymmetric_stroke(
+    geom: list,
+    length: float,
+    t0: float,
+    t1: float,
+    dt: float,
+    target_duration: float,
+    vel_cap: np.ndarray,
+    acc_cap: np.ndarray,
+    lead_speed: float,
+    trail_speed: float,
+    window_sec: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Option B time law: cruise at the plan pace through the middle, carry the requested boundary speed
+    only within a ~``window_sec`` window at each end.
+
+    Instead of a single symmetric min-jerk bell (whose slowest point is the endpoint, so the boundary is
+    capped at ``_MAX_BOUNDARY_SLOPE`` * the stroke average), this builds a strictly-positive speed-vs-time
+    profile ``p(tau)`` that equals the cruise in the middle and ramps to the boundary speed at the ends
+    (a "dumbbell" when the ends are faster than the cruise, or a gentle dip when they are slower). Because
+    ``p > 0`` everywhere the sweep is monotonic with no ``_MAX_BOUNDARY_SLOPE`` cap, and the end level is
+    divided by the endpoint tangent so a collapsed grasp-reversal tangent is compensated. The transition
+    thus clears the idle band while the careful mid-stroke pace is preserved. Returns (pos, vel, acc,
+    duration); the boundary falls short only if the vel/accel caps (or ``_MAX_BOUNDARY_RATIO``) bind.
+    """
+    v_cruise = length / target_duration  # the plan's average pace = the middle cruise target
+    t_mid = float(np.median(np.linalg.norm(_eval_geometry(geom, np.linspace(0.0, length, 256), 1), axis=1))) or 1.0
+    # Relative end speed (vs cruise); divide by the endpoint tangent so the realized joint speed matches
+    # the request even where that tangent has collapsed. 0 keeps a rest end (episode start/end).
+    r_lead = 0.0 if lead_speed == 0.0 else min(_MAX_BOUNDARY_RATIO, (lead_speed / v_cruise) * (t_mid / t0))
+    r_trail = 0.0 if trail_speed == 0.0 else min(_MAX_BOUNDARY_RATIO, (trail_speed / v_cruise) * (t_mid / t1))
+    w = float(np.clip(window_sec / target_duration, 0.03, 0.35))  # window as a fraction of normalized time
+    tau_d = np.linspace(0.0, 1.0, 2048)
+    shape_lead = np.where(tau_d < w, 1.0 - _smootherstep(tau_d / w), 0.0)
+    shape_trail = np.where(tau_d > 1.0 - w, 1.0 - _smootherstep((1.0 - tau_d) / w), 0.0)
+    p = np.maximum(1.0 + (r_lead - 1.0) * shape_lead + (r_trail - 1.0) * shape_trail, 0.0)  # speed vs time
+    pbar = float(np.trapezoid(p, tau_d))
+    # h(tau) in [0,1]: normalized arc length vs normalized time (cumulative p, scaled so h(1)=1).
+    h = np.concatenate([[0.0], np.cumsum((p[1:] + p[:-1]) / 2.0 * np.diff(tau_d))]) / pbar
+
+    def sample(duration: float, n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        ts = np.linspace(0.0, 1.0, n)
+        ut = length * np.interp(ts, tau_d, h)
+        ps = np.interp(ts, tau_d, p)
+        pos = _eval_geometry(geom, ut, 0)
+        du_dt = length * (ps / pbar) / duration
+        vel = _eval_geometry(geom, ut, 1) * du_dt[:, None]
+        acc = np.gradient(vel, duration / (n - 1), axis=0)
+        return pos, vel, acc
+
+    # Duration so the middle (p == 1) joint speed equals v_cruise, then stretch to fit the vel/accel caps.
+    duration = t_mid * length / (pbar * v_cruise)
+    _, v0, a0 = sample(duration, 512)
+    alpha_v = float((np.abs(v0).max(axis=0) / vel_cap).max())
+    alpha_a = float(np.sqrt((np.abs(a0).max(axis=0) / acc_cap).max()))
+    duration *= max(1.0, alpha_v, alpha_a)
+    n = max(2, int(round(duration / dt)) + 1)
+    pos, vel, acc = sample(duration, n)
+    return pos, vel, acc, duration
+
+
 def blend_group(
     positions: np.ndarray,
     dt: float,
@@ -196,18 +316,24 @@ def blend_group(
     smoothing: float = _DEFAULT_SMOOTHING,
     lead_speed: float = 0.0,
     trail_speed: float = 0.0,
+    boundary_window: float = _DEFAULT_BOUNDARY_WINDOW,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """Re-time one group of joined waypoints into a single smooth stroke.
 
     Args:
         positions: [N, dof] concatenated waypoints of the group (segment joins de-duplicated upstream).
         dt: control timestep to re-sample at.
-        target_duration: desired duration (the group's original wall-clock), stretched only if the
-            per-joint velocity/acceleration caps would otherwise be exceeded.
+        target_duration: UPPER bound on duration (the group's original wall-clock). The stroke is sped
+            up below this only as much as its own boundary speed needs (never slowed past it), and only
+            when that boundary is reachable within the vel/accel caps -- so a stroke already fast enough
+            keeps its original pace, and only a genuinely slow one is shortened (see the body).
         vel_cap, acc_cap: [dof] per-joint velocity / acceleration ceilings.
         smoothing: geometry smoothing-spline penalty (lam).
         lead_speed, trail_speed: joint speed (rad/s, L2) to carry at the first / last sample. 0 means
             rest (min-jerk); >0 keeps the boundary out of the idle band (see module docstring).
+        boundary_window: 0 -> symmetric min-jerk bell (the default; boundary <= _MAX_BOUNDARY_SLOPE *
+            average). >0 -> Option B asymmetric time law: cruise at the plan pace through the middle and
+            carry the boundary speed only within this many seconds at each end (see _asymmetric_stroke).
 
     Returns:
         (positions, velocities, accelerations, dt_out) re-sampled at ~uniform ``dt_out`` (== dt up to
@@ -237,6 +363,13 @@ def blend_group(
     t0 = float(np.linalg.norm(_eval_geometry(geom, np.array([0.0]), 1)[0])) or 1.0
     t1 = float(np.linalg.norm(_eval_geometry(geom, np.array([length]), 1)[0])) or 1.0
 
+    if boundary_window > 0.0:
+        # Option B: asymmetric time law -- plan pace in the middle, boundary speed only near the ends.
+        out_pos, out_vel, out_acc, duration = _asymmetric_stroke(
+            geom, length, t0, t1, dt, target_duration, vel_cap, acc_cap, lead_speed, trail_speed, boundary_window
+        )
+        return _finish_stroke(out_pos, out_vel, out_acc, duration, lead_speed, trail_speed)
+
     def sample(duration: float, n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         tau = np.linspace(0.0, 1.0, n)
         # Boundary slopes in normalized (tau) units so that the joint speed at each end equals the
@@ -254,22 +387,64 @@ def blend_group(
         acc = d2 * (du_dt**2)[:, None] + d1 * d2u_dt2[:, None]
         return pos, vel, acc
 
-    # Stretch the (single, global) duration until velocity and acceleration fit the caps. Under
-    # duration -> alpha*duration, velocity scales as 1/alpha and acceleration as 1/alpha^2.
+    # Duration that just realizes each requested boundary speed WITHOUT hitting the slope cap: the
+    # boundary joint speed is t_end * length * slope / duration and slope maxes at _MAX_BOUNDARY_SLOPE,
+    # so the request is met iff duration <= _MAX_BOUNDARY_SLOPE * length * t_end / speed. Take the tightest
+    # (smallest) over the nonzero-speed ends; rest ends (speed 0) impose no constraint.
+    dur_reqs = []
+    if lead_speed > 0.0:
+        dur_reqs.append(_MAX_BOUNDARY_SLOPE * length * t0 / lead_speed)
+    if trail_speed > 0.0:
+        dur_reqs.append(_MAX_BOUNDARY_SLOPE * length * t1 / trail_speed)
+    dur_boundary = min(dur_reqs) if dur_reqs else target_duration
+
+    # vel/accel-cap floor: the shortest duration the robot can physically run this stroke. Under
+    # duration -> alpha*duration, velocity scales as 1/alpha and acceleration as 1/alpha^2, so
+    # alpha*duration is invariant and cap_min is independent of the probe duration.
     _, v0, a0 = sample(target_duration, 400)
     alpha_v = float((np.abs(v0).max(axis=0) / vel_cap).max())
     alpha_a = float(np.sqrt((np.abs(a0).max(axis=0) / acc_cap).max()))
-    duration = target_duration * max(1.0, alpha_v, alpha_a)
+    cap_min = target_duration * max(alpha_v, alpha_a)
+
+    # Speed the stroke up ONLY as much as its own boundary needs -- not globally. A stroke already fast
+    # enough to carry the boundary keeps its original (careful) pace; a slow one is shortened just to
+    # dur_boundary so the transition clears the idle band without over-speeding the cruise. When the
+    # boundary is unreachable within the robot's limits (dur_boundary < cap_min -- e.g. a rounded grasp
+    # cusp whose tangent collapses), don't chase it: keep the original pace rather than running the whole
+    # stroke at the limit for a transition it still can't hit (the warning below flags it instead).
+    if dur_boundary >= cap_min:
+        duration = min(target_duration, dur_boundary)
+    else:
+        duration = target_duration
+    duration = max(duration, cap_min)
 
     n = max(2, int(round(duration / dt)) + 1)
     out_pos, out_vel, out_acc = sample(duration, n)
+    return _finish_stroke(out_pos, out_vel, out_acc, duration, lead_speed, trail_speed)
+
+
+def _finish_stroke(out_pos, out_vel, out_acc, duration, lead_speed, trail_speed):
+    """Pin rest ends to exactly zero, warn on a shortfall, and return (pos, vel, acc, dt_out)."""
     # Pin a boundary to exact rest only where a zero boundary speed was requested (episode ends);
     # a nonzero boundary is left as computed so the gripper-adjacent frames stay out of the idle band.
     if lead_speed == 0.0:
         out_vel[0] = 0.0
     if trail_speed == 0.0:
         out_vel[-1] = 0.0
-    dt_out = duration / (n - 1)
+    # Surface a boundary that fell short of the request: it is limited by the robot's vel/accel limits.
+    # Default (symmetric) law: a slow stroke whose tangent collapses at a grasp/place cusp -- fix on the
+    # geometry side (blend_smoothing / dwell). Asymmetric law (blend_boundary_window): the end ramp needs
+    # more room -- widen blend_boundary_window. Either way, running faster alone won't clear it.
+    for end, req in ((0, lead_speed), (-1, trail_speed)):
+        realized = float(np.linalg.norm(out_vel[end]))
+        if req > 0.0 and realized < 0.7 * req:
+            _log.warning(
+                "Blended stroke boundary speed %.3f rad/s is below the requested %.3f, limited by the "
+                "robot's vel/accel limits (a collapsed grasp-reversal tangent, or too tight a boundary "
+                "window). These gripper-adjacent frames stay slow.",
+                realized, req,
+            )
+    dt_out = duration / (len(out_pos) - 1)
     return out_pos, out_vel, out_acc, dt_out
 
 
@@ -325,15 +500,18 @@ def _blend_trajectory_steps(
     orig_velocities = np.concatenate(
         [s["plan"].velocity.detach().cpu().numpy().astype(np.float64) for s in steps], axis=0
     )
-    # Preserve the group's original wall-clock so blending changes shape, not overall pace (the limit
-    # check may still stretch it if rounding the previously-stopped corners needs more time).
-    target_duration = sum((len(p) - 1) for p in seg_positions) * dt
+    # The group's original wall-clock -- an UPPER bound on the stroke's duration. blend_group shortens it
+    # per stroke only as much as that stroke's boundary speed needs (never slower, and only within the
+    # robot's real limits), so the cruise of strokes already fast enough stays at the original pace.
+    # speed_scale is an optional extra global multiplier on top (default 1.0 -> no global change).
+    target_duration = sum((len(p) - 1) for p in seg_positions) * dt / config.speed_scale
 
     vel_cap, acc_cap = _resolve_caps(
         orig_velocities, dt, vel_limit, acc_limit, config.vel_slack, config.acc_slack
     )
     pos, vel, acc, dt_out = blend_group(
-        joined, dt, target_duration, vel_cap, acc_cap, config.smoothing, lead_speed, trail_speed
+        joined, dt, target_duration, vel_cap, acc_cap, config.smoothing, lead_speed, trail_speed,
+        config.boundary_window,
     )
 
     plan = JointState(
