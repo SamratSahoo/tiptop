@@ -14,12 +14,11 @@ except the timing is *identical* and reused directly from :mod:`trajectory_blend
 
 What changes: instead of a symmetric min-jerk quintic (``_time_law``) or the asymmetric dumbbell
 (``_asymmetric_stroke``), the speed-vs-time profile ``p(tau)`` comes from a :class:`~tiptop.networks.
-timing_net.TimingModel`, conditioned on the stroke's ``(lead_kind, trail_kind)`` -- ``rest`` / ``grasp``
-(a gripper close) / ``release`` (a gripper open), recovered from the plan's adjacent ``gripper`` steps --
-and optionally a task-language embedding. The learned ``p`` is used as the base shape; the boundary
-levels the non-idle filter requires are then enforced on top of it (see :func:`_neural_stroke`), so the
-model supplies the STYLE (where along the reach the arm speeds up / slows into the grasp) while the hard
-constraints remain analytic.
+timing_net.TimingModel`, conditioned on the stroke's GEOMETRY + PACE features (arc length, straightness,
+average speed, curvature -- see ``stroke_features``). The learned ``p`` is used as the base shape; the
+boundary levels the non-idle filter requires are then enforced on top of it (see :func:`_neural_stroke`),
+so the model supplies the STYLE (where along the reach the arm speeds up / slows into the grasp) while the
+hard constraints remain analytic.
 
 Robustness: any per-stroke failure (a missing model, a numerical surprise) falls back to the analytic
 spline ``blend_group`` for that stroke, and a failure to load the model at all falls back to spline mode
@@ -151,20 +150,16 @@ def neural_blend_group(
     vel_cap: np.ndarray,
     acc_cap: np.ndarray,
     model: TimingModel,
-    lead_kind: str,
-    trail_kind: str,
-    lang_emb: np.ndarray | None = None,
     smoothing: float = None,
     lead_speed: float = 0.0,
     trail_speed: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    """Re-time one group of joined waypoints into a single stroke using the LEARNED time law.
+    """Re-time one group of joined waypoints into a single stroke using the LEARNED (geometry) time law.
 
     Geometry is built exactly as in :func:`trajectory_blending.blend_group` (de-dup + arc-length +
-    smoothing spline); only the time law differs. ``lead_kind`` / ``trail_kind`` (``rest`` / ``grasp`` /
-    ``release``) and the optional ``lang_emb`` select the network's speed profile. ``lead_speed`` /
-    ``trail_speed`` are the requested boundary joint speeds (0 = rest), used identically to spline mode.
-    On any failure this raises; the caller falls back to the analytic ``blend_group`` for the stroke.
+    smoothing spline); only the time law differs. The stroke's geometry/pace features select the network's
+    speed profile. ``lead_speed`` / ``trail_speed`` are the requested boundary joint speeds (0 = rest),
+    used identically to spline mode. On any failure this raises; the caller falls back to ``blend_group``.
     """
     from tiptop.trajectory_blending import _DEFAULT_SMOOTHING
 
@@ -191,15 +186,15 @@ def neural_blend_group(
     t1 = float(np.linalg.norm(_eval_geometry(geom, np.array([length]), 1)[0])) or 1.0
 
     # Geometry/pace features of THIS stroke (arc length, straightness, avg speed = arc/target_duration,
-    # curvature). None when the model was trained without geometry conditioning -- profile_on handles it.
+    # curvature). None for a degenerate path -> profile_on falls back to the feature mean.
     feats = None
     try:
         feats = model.features(positions, target_duration)
     except Exception:
-        _log.exception("Geometry feature computation failed; timing runs without geometry conditioning")
+        _log.exception("Geometry feature computation failed; timing runs from the feature mean")
 
     def profile_fn(tau: np.ndarray) -> np.ndarray:
-        return model.profile_on(tau, lead_kind, trail_kind, feats, lang_emb)
+        return model.profile_on(tau, feats)
 
     out_pos, out_vel, out_acc, duration = _neural_stroke(
         geom, length, t0, t1, dt, target_duration, vel_cap, acc_cap, lead_speed, trail_speed, profile_fn
@@ -207,43 +202,14 @@ def neural_blend_group(
     return _finish_stroke(out_pos, out_vel, out_acc, duration, lead_speed, trail_speed)
 
 
-def _gripper_kind(step: dict) -> str:
-    """Map a plan ``gripper`` step to the boundary kind a neighbouring stroke sees: 'grasp' or 'release'.
-
-    cuTAMP emits ``{"type": "gripper", "action": "close"|"open", ...}`` (motion_solver); a close is a
-    grasp (pick), an open is a release (place). Falls back to inspecting the label / numeric action if the
-    exact string is not present, defaulting to 'grasp' with a warning.
-    """
-    action = step.get("action")
-    if isinstance(action, str):
-        a = action.strip().lower()
-        if a in ("close", "grasp", "closed"):
-            return "grasp"
-        if a in ("open", "release", "opened"):
-            return "release"
-    if isinstance(action, (int, float)):
-        # DROID convention: 1 = closed, 0 = open.
-        return "grasp" if float(action) >= 0.5 else "release"
-    label = _op_name(step.get("label", "")).lower()
-    if "place" in label or "release" in label or "open" in label:
-        return "release"
-    if "pick" in label or "grasp" in label or "close" in label:
-        return "grasp"
-    _log.warning("Could not classify gripper step %r; assuming 'grasp'", step.get("action"))
-    return "grasp"
-
-
 def _blend_trajectory_steps_neural(
     steps: list[dict],
     config: BlendConfig,
     model: TimingModel,
-    lang_emb: np.ndarray | None,
     vel_limit: np.ndarray | None,
     acc_limit: np.ndarray | None,
     lead_speed: float,
     trail_speed: float,
-    lead_kind: str,
-    trail_kind: str,
 ) -> dict:
     """Blend a run of consecutive ``trajectory`` steps into one re-timed step using the learned time law.
 
@@ -271,8 +237,7 @@ def _blend_trajectory_steps_neural(
     )
     try:
         pos, vel, acc, dt_out = neural_blend_group(
-            joined, dt, target_duration, vel_cap, acc_cap, model, lead_kind, trail_kind, lang_emb,
-            config.smoothing, lead_speed, trail_speed,
+            joined, dt, target_duration, vel_cap, acc_cap, model, config.smoothing, lead_speed, trail_speed,
         )
     except Exception:
         _log.exception("Neural timing failed for a stroke; falling back to the analytic spline time law")
@@ -295,7 +260,6 @@ def neural_blend_cutamp_plan(
     cutamp_plan: list[dict],
     config: BlendConfig,
     model: TimingModel,
-    lang_emb: np.ndarray | None = None,
     vel_limit: np.ndarray | None = None,
     acc_limit: np.ndarray | None = None,
 ) -> list[dict]:
@@ -303,10 +267,9 @@ def neural_blend_cutamp_plan(
 
     Structurally identical to :func:`trajectory_blending.blend_cutamp_plan` (gripper steps pass through and
     delimit the groups; ``config.ops`` restricts which operations are blended), but each group is re-timed
-    by the network. In addition to the rest-vs-boundary speed decision, this recovers the boundary KIND at
-    each end from the adjacent gripper step (``grasp`` for a close, ``release`` for an open; ``rest`` at
-    the plan's start/end) and passes it -- plus the optional task-language embedding -- to the model.
-    A no-op when ``config.enabled`` is False.
+    by the geometry-conditioned network. As in spline mode, a boundary is rest (speed 0) only at the plan's
+    very start/end; every gripper-adjacent boundary carries ``config.boundary_speed`` to stay out of the
+    non-idle filter. A no-op when ``config.enabled`` is False.
     """
     if not config.enabled:
         return cutamp_plan
@@ -327,19 +290,11 @@ def neural_blend_cutamp_plan(
             return
         # Boundary speed: rest (0) only where the arm is genuinely stationary (plan start/end); a nonzero
         # speed at every gripper-adjacent boundary keeps those frames out of the non-idle filter.
-        lead_is_rest = run_start_idx == 0
-        trail_is_rest = run_end_idx == n_steps - 1
-        lead_speed = 0.0 if lead_is_rest else config.boundary_speed
-        trail_speed = 0.0 if trail_is_rest else config.boundary_speed
-        # Boundary KIND for the network: rest at the plan ends, else the adjacent gripper step's action.
-        lead_kind = "rest" if lead_is_rest else _gripper_kind(cutamp_plan[run_start_idx - 1])
-        trail_kind = "rest" if trail_is_rest else _gripper_kind(cutamp_plan[run_end_idx + 1])
+        lead_speed = 0.0 if run_start_idx == 0 else config.boundary_speed
+        trail_speed = 0.0 if run_end_idx == n_steps - 1 else config.boundary_speed
         try:
             out.append(
-                _blend_trajectory_steps_neural(
-                    run, config, model, lang_emb, vel_limit, acc_limit,
-                    lead_speed, trail_speed, lead_kind, trail_kind,
-                )
+                _blend_trajectory_steps_neural(run, config, model, vel_limit, acc_limit, lead_speed, trail_speed)
             )
             stats["blended"] += 1
         except Exception:

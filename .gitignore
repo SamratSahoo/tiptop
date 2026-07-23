@@ -35,3 +35,5 @@ pyzed*.whl
 # claude
 .claude
 tiptop/checkpoints/timing_data/**
+tiptop/checkpoints/flow_data/shards/**
+tiptop/checkpoints/flow_data/stroke_flow.npz

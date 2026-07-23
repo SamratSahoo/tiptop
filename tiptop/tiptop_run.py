@@ -907,7 +907,6 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                             all_surfaces=all_surfaces,
                             experiment_dir=save_dir / "cutamp",
                             cost_overrides=container.cost_overrides,
-                            prompt=task_instruction,  # for neural blend_mode's optional language conditioning
                         )
                         _log.info(f"Perception and cuTAMP planning took: {perception_duration + planning_duration:.2f}s")
                         if cutamp_plan is not None:

@@ -142,14 +142,18 @@ class BlendConfig:
     boundary_window: float = _DEFAULT_BOUNDARY_WINDOW
     # Operation names to restrict blending to (e.g. ("Pick", "Place")); None blends every operation.
     ops: tuple[str, ...] | None = None
-    # Timing backend: "spline" (the analytic min-jerk / asymmetric time law in this module, the default)
-    # or "neural" (a DROID-learned timing model supplies the speed profile; the GEOMETRY, vel/accel caps,
-    # endpoint pinning and non-idle boundary speed are unchanged). Neural mode is handled by the sibling
-    # module ``neural_blending`` and requires ``model_path``. See resolve_blend_config.
+    # Timing backend: "spline" (the analytic min-jerk / asymmetric time law here, the default), "neural"
+    # (a DROID-learned deterministic timing model supplies the speed profile -- see neural_blending), or
+    # "flow" (a DROID-learned conditional flow-matching model SAMPLES a full human stroke per operation --
+    # see flow_blending; each sample is a different human-like realization, so generated data reproduces
+    # the distribution of teleoperator styles). In every mode the GEOMETRY smoothing, vel/accel caps,
+    # endpoint pinning and non-idle boundary speed are enforced by the same engine.
     mode: str = "spline"
-    # Path to the learned timing checkpoint (neural mode only). Relative paths resolve under the tiptop
-    # package dir, e.g. "checkpoints/timing_net.pt" -> tiptop/tiptop/checkpoints/timing_net.pt.
+    # Path to the learned timing/flow checkpoint (neural / flow modes). Relative paths resolve under the
+    # tiptop package dir; when omitted each model uses its own default (timing_net.pt / flow_net.pt).
     model_path: str | None = None
+    # Flow mode only: number of Euler ODE steps when sampling the flow model (more = finer, slower).
+    flow_steps: int = 60
 
 
 def resolve_blend_config(overrides: dict | None) -> BlendConfig:
@@ -191,8 +195,8 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
     if boundary_window < 0.0:
         raise ValueError(f"blend_boundary_window must be >= 0 (got {boundary_window})")
     mode = str(o.get("blend_mode", "spline")).strip().lower()
-    if mode not in ("spline", "neural"):
-        raise ValueError(f"blend_mode must be 'spline' or 'neural' (got {mode!r})")
+    if mode not in ("spline", "neural", "flow"):
+        raise ValueError(f"blend_mode must be 'spline', 'neural' or 'flow' (got {mode!r})")
     raw_model_path = o.get("blend_model_path")
     model_path = str(raw_model_path) if raw_model_path else None
     return BlendConfig(
@@ -206,6 +210,7 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
         ops=ops,
         mode=mode,
         model_path=model_path,
+        flow_steps=int(o.get("blend_flow_steps", 60)),
     )
 
 

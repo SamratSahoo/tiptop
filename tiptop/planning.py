@@ -103,7 +103,6 @@ def run_planning(
     all_surfaces: list,
     experiment_dir: Path | None = None,
     cost_overrides: dict | None = None,
-    prompt: str | None = None,
 ) -> tuple[list | None, float, str | None]:
     """Run cuTAMP planning and return (plan, planning_time_seconds, failure_reason).
 
@@ -162,20 +161,19 @@ def run_planning(
             )
             if dof is not None:
                 vel_limit, acc_limit = arm_joint_limits(motion_gen, dof)
-                cutamp_plan = _apply_blend(
-                    cutamp_plan, blend_config, vel_limit, acc_limit, prompt
-                )
+                cutamp_plan = _apply_blend(cutamp_plan, blend_config, vel_limit, acc_limit)
 
     return cutamp_plan, elapsed, failure_reason
 
 
-def _apply_blend(cutamp_plan, blend_config, vel_limit, acc_limit, prompt):
+def _apply_blend(cutamp_plan, blend_config, vel_limit, acc_limit):
     """Dispatch trajectory blending on ``blend_config.mode`` (see resolve_blend_config).
 
-    ``spline`` (default) uses the analytic time law in ``trajectory_blending``. ``neural`` uses a
-    DROID-learned timing model (``neural_blending``): the model is loaded from ``blend_config.model_path``
-    and, if it was trained with language conditioning, the task ``prompt`` is embedded to condition the
-    timing. Any failure to set up the neural path (missing/corrupt checkpoint, import error) is logged and
+    ``spline`` (default) uses the analytic time law in ``trajectory_blending``. ``neural`` uses the
+    DROID-learned, geometry-conditioned deterministic timing model (``neural_blending``). ``flow`` samples a
+    full human-like stroke per operation from the conditional flow-matching model (``flow_blending``), so
+    generated data reproduces the distribution of teleoperator styles. Both learned modes load from
+    ``blend_config.model_path``; any setup failure (missing/corrupt checkpoint, import error) is logged and
     falls back to the analytic spline blend, so a plan is never lost to a model problem.
     """
     if blend_config.mode == "neural":
@@ -184,12 +182,22 @@ def _apply_blend(cutamp_plan, blend_config, vel_limit, acc_limit, prompt):
             from tiptop.networks.timing_net import TimingModel
 
             model = TimingModel(blend_config.model_path)
-            lang_emb = model.embed_language(prompt) if model.use_language else None
             return neural_blend_cutamp_plan(
-                cutamp_plan, blend_config, model, lang_emb, vel_limit=vel_limit, acc_limit=acc_limit
+                cutamp_plan, blend_config, model, vel_limit=vel_limit, acc_limit=acc_limit
             )
         except Exception:
             _log.exception("Neural blending unavailable; falling back to the analytic spline blend")
+    elif blend_config.mode == "flow":
+        try:
+            from tiptop.flow_blending import flow_blend_cutamp_plan
+            from tiptop.networks.flow_timing import FlowModel
+
+            model = FlowModel(blend_config.model_path)
+            return flow_blend_cutamp_plan(
+                cutamp_plan, blend_config, model, vel_limit=vel_limit, acc_limit=acc_limit
+            )
+        except Exception:
+            _log.exception("Flow blending unavailable; falling back to the analytic spline blend")
     return blend_cutamp_plan(cutamp_plan, blend_config, vel_limit=vel_limit, acc_limit=acc_limit)
 
 
