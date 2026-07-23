@@ -71,8 +71,12 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from curobo.types.state import JointState
 from scipy.interpolate import CubicSpline, make_smoothing_spline
+
+# NOTE: ``from curobo.types.state import JointState`` is imported lazily inside
+# ``_blend_trajectory_steps`` (its only user) rather than at module top, so this module's pure
+# geometry/timing helpers (``_fit_geometry``, ``_finish_stroke``, ``blend_group`` ...) can be
+# imported -- and unit-tested -- without a cuRobo install. ``neural_blending`` reuses them.
 
 _log = logging.getLogger(__name__)
 
@@ -138,6 +142,14 @@ class BlendConfig:
     boundary_window: float = _DEFAULT_BOUNDARY_WINDOW
     # Operation names to restrict blending to (e.g. ("Pick", "Place")); None blends every operation.
     ops: tuple[str, ...] | None = None
+    # Timing backend: "spline" (the analytic min-jerk / asymmetric time law in this module, the default)
+    # or "neural" (a DROID-learned timing model supplies the speed profile; the GEOMETRY, vel/accel caps,
+    # endpoint pinning and non-idle boundary speed are unchanged). Neural mode is handled by the sibling
+    # module ``neural_blending`` and requires ``model_path``. See resolve_blend_config.
+    mode: str = "spline"
+    # Path to the learned timing checkpoint (neural mode only). Relative paths resolve under the tiptop
+    # package dir, e.g. "checkpoints/timing_net.pt" -> tiptop/tiptop/checkpoints/timing_net.pt.
+    model_path: str | None = None
 
 
 def resolve_blend_config(overrides: dict | None) -> BlendConfig:
@@ -161,6 +173,13 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
                                         without speeding up the careful cruise (see _asymmetric_stroke).
         blend_ops:        list[str]  -- restrict blending to these operations by name, e.g.
                                         [Pick, Place]; omitted/empty blends every operation
+        blend_mode:       str        -- "spline" (default; the analytic time law here) or "neural"
+                                        (a DROID-learned timing model supplies the speed profile -- see
+                                        neural_blending). Only the TIMING differs; geometry + limits +
+                                        endpoint/non-idle handling are identical between the two modes.
+        blend_model_path: str        -- checkpoint for the learned timing model (neural mode); relative
+                                        paths resolve under the tiptop package dir. Defaults to the
+                                        model's own default checkpoint when omitted.
     """
     o = overrides or {}
     raw_ops = o.get("blend_ops")
@@ -171,6 +190,11 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
     boundary_window = float(o.get("blend_boundary_window", _DEFAULT_BOUNDARY_WINDOW))
     if boundary_window < 0.0:
         raise ValueError(f"blend_boundary_window must be >= 0 (got {boundary_window})")
+    mode = str(o.get("blend_mode", "spline")).strip().lower()
+    if mode not in ("spline", "neural"):
+        raise ValueError(f"blend_mode must be 'spline' or 'neural' (got {mode!r})")
+    raw_model_path = o.get("blend_model_path")
+    model_path = str(raw_model_path) if raw_model_path else None
     return BlendConfig(
         enabled=bool(o.get("blend_trajectory", False)),
         smoothing=float(o.get("blend_smoothing", _DEFAULT_SMOOTHING)),
@@ -180,6 +204,8 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
         speed_scale=speed_scale,
         boundary_window=boundary_window,
         ops=ops,
+        mode=mode,
+        model_path=model_path,
     )
 
 
@@ -488,6 +514,8 @@ def _blend_trajectory_steps(
     trail_speed: float,
 ) -> dict:
     """Blend a run of consecutive ``trajectory`` steps into one re-timed trajectory step."""
+    from curobo.types.state import JointState  # lazy: keep the module importable without cuRobo
+
     template = steps[0]["plan"]
     device = template.position.device
     joint_names = template.joint_names

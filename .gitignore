@@ -34,3 +34,4 @@ pyzed*.whl
 
 # claude
 .claude
+tiptop/checkpoints/timing_data/**
