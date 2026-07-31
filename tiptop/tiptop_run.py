@@ -51,7 +51,7 @@ from tiptop.perception.cameras import (
     get_external_camera_2,
     get_hand_camera,
 )
-from tiptop.perception.m2t2 import m2t2_to_tiptop_transform
+from tiptop.perception.m2t2 import augment_flipped_grasps, m2t2_to_tiptop_transform
 from tiptop.perception.sam2 import sam2_client
 from tiptop.perception.segmentation import segment_pointcloud_by_masks, segment_table_with_ransac
 from tiptop.perception.utils import convert_trimesh_box_to_curobo_cuboid, convert_trimesh_to_curobo_mesh
@@ -631,6 +631,9 @@ def process_scene_geometry(
         obj_from_world = np.linalg.inv(world_from_obj)
 
         world_from_grasp = grasp_dict["poses"] @ m2t2_to_tiptop_transform()
+        if tiptop_cfg().perception.get("augment_flipped_grasps", False):
+            world_from_grasp, grasp_dict = augment_flipped_grasps(world_from_grasp, grasp_dict)
+            filtered_grasps[label] = grasp_dict
         obj_from_grasp = obj_from_world @ world_from_grasp
         filtered_grasps[label]["grasps_obj"] = tensor_args.to_device(obj_from_grasp)
         filtered_grasps[label]["confidences_pt"] = tensor_args.to_device(filtered_grasps[label]["confidences"])

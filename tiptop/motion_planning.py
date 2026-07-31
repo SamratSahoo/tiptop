@@ -12,6 +12,7 @@ from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig, MotionGen
 from cutamp.motion_solver import MotionPlanningError
 from cutamp.robots import (
     get_panda_robotiq_ik_solver,
+    load_bimanual_yam_container,
     load_fr3_robotiq_container,
     load_panda_container,
     load_panda_robotiq_container,
@@ -24,13 +25,14 @@ from cutamp.robots.franka import (
     get_fr3_franka_ik_solver,
     get_franka_ik_solver,
 )
+from cutamp.robots.bimanual_yam import bimanual_yam_curobo_cfg, get_bimanual_yam_ik_solver
 from cutamp.robots.franka_robotiq import fr3_robotiq_curobo_cfg, get_fr3_robotiq_ik_solver
 from cutamp.robots.ur5 import get_ur5_ik_solver, ur5_curobo_cfg
 from cutamp.utils.common import sample_between_bounds
 from jaxtyping import Float
 
 from tiptop.config import tiptop_cfg
-from tiptop.utils import get_robot_client, patch_log_level
+from tiptop.utils import YAM_ROBOT_TYPES, get_robot_client, patch_log_level
 from tiptop.workspace import workspace_cuboids
 
 _log = logging.getLogger(__name__)
@@ -58,6 +60,12 @@ def get_ik_solver(world_cfg: WorldConfig, num_particles: int, warmup_iters: int 
         elif cfg.robot.type == "ur5":
             ik_solver = get_ur5_ik_solver(world_cfg)
             container = load_ur5_container(TensorDeviceType())
+        elif cfg.robot.type in YAM_ROBOT_TYPES:
+            # The bimanual YAM is registered once per arm; the suffix picks which arm plans and
+            # which one is locked as an obstacle. See cutamp/robots/bimanual_yam.py.
+            arm = cfg.robot.type.rsplit("_", 1)[1]
+            ik_solver = get_bimanual_yam_ik_solver(world_cfg, arm)
+            container = load_bimanual_yam_container(arm, TensorDeviceType())
         else:
             raise ValueError(f"Unknown robot type: {cfg.robot.type}")
 
@@ -350,6 +358,8 @@ def get_motion_gen(
         robot_cfg = franka_curobo_cfg()
     elif cfg.robot.type == "ur5":
         robot_cfg = ur5_curobo_cfg()
+    elif cfg.robot.type in YAM_ROBOT_TYPES:
+        robot_cfg = bimanual_yam_curobo_cfg(cfg.robot.type.rsplit("_", 1)[1])
     else:
         raise ValueError(f"Unknown robot type: {cfg.robot.type}")
 

@@ -10,8 +10,34 @@ from scipy.spatial.transform import Rotation
 
 config_dir = Path(__file__).parent
 config_assets_dir = config_dir / "assets"
-tiptop_config_path = config_dir / "tiptop.yml"
 calib_info_path = config_assets_dir / "calibration_info.json"
+
+
+def _resolve_config_path() -> Path:
+    """Which YAML ``tiptop_cfg()`` reads, honouring ``$TIPTOP_CONFIG``.
+
+    Robot type, DOF and camera setup all live in one file, so a second embodiment needs a second
+    file rather than a few overrides -- and the entry points are tyro CLIs, which reject the
+    ``key=value`` tokens ``OmegaConf.from_cli`` would otherwise pick up. Set ``TIPTOP_CONFIG`` to a
+    filename (resolved inside this directory) or an absolute path, e.g.::
+
+        TIPTOP_CONFIG=tiptop_yam.yml pixi run python -m tiptop.tiptop_websocket_server
+
+    Everything that reads ``tiptop_config_path`` follows, including the copy of the config that
+    ``recording.save_run_outputs`` drops into each run directory.
+    """
+    override = (os.environ.get("TIPTOP_CONFIG") or "").strip()
+    if not override:
+        return config_dir / "tiptop.yml"
+    path = Path(os.path.expanduser(override))
+    if not path.is_absolute():
+        path = config_dir / path
+    if not path.exists():
+        raise FileNotFoundError(f"TIPTOP_CONFIG={override!r} resolved to {path}, which does not exist")
+    return path
+
+
+tiptop_config_path = _resolve_config_path()
 
 # data-collection scopes each robot's data to a workspace and spawns tiptop with $DC_WORKSPACE set
 # (see data-collection/server/lib/sessions.js). Each robot has its own cameras, so a workspace can

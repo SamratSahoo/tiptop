@@ -9,11 +9,13 @@ import numpy as np
 from bamboo.client import BambooFrankaClient
 from cutamp.robots import (
     RerunRobot,
+    load_bimanual_yam_rerun,
     load_fr3_franka_rerun,
     load_fr3_robotiq_rerun,
     load_franka_rerun,
     load_panda_robotiq_rerun,
     load_ur5_rerun,
+    YAM_ARMS,
 )
 from jaxtyping import Bool
 from PIL import Image
@@ -24,6 +26,11 @@ from tiptop.ur5.ur5_client import UR5Client
 gripper_mask_path = config_dir / "assets" / "gripper_mask.png"
 
 REQUIRED_CUTAMP_VERSION = "0.0.5"
+
+# One robot type per YAM arm: cuTAMP plans a single kinematic chain, so which arm is active is part
+# of the embodiment (it picks the cuRobo config's ee_link and lock_joints). Lives here rather than in
+# motion_planning.py because workspace.py needs it too, and motion_planning already imports workspace.
+YAM_ROBOT_TYPES = frozenset(f"bimanual_yam_{arm}" for arm in YAM_ARMS)
 
 
 def check_cutamp_version() -> None:
@@ -96,6 +103,12 @@ def get_robot_client() -> RobotClient:
         from tiptop.ur5.ur5_client import get_ur5_client
 
         return get_ur5_client()
+    elif cfg.robot.type in YAM_ROBOT_TYPES:
+        raise NotImplementedError(
+            f"{cfg.robot.type} has no hardware client; it is currently a simulation-only embodiment "
+            "(see droid-sim-evals/eval/yam_tiptop_eval.py). Add one under tiptop/ following "
+            "tiptop/ur5/ur5_client.py to run it on real hardware."
+        )
     else:
         raise ValueError(f"Unknown robot type: {cfg.robot.type}")
 
@@ -113,6 +126,8 @@ def new_robot_client() -> RobotClient:
         return _build_bamboo_client()
     elif cfg.robot.type == "ur5":
         return UR5Client(cfg.robot.host)
+    elif cfg.robot.type in YAM_ROBOT_TYPES:
+        raise NotImplementedError(f"{cfg.robot.type} has no hardware client (simulation-only embodiment).")
     else:
         raise ValueError(f"Unknown robot type: {cfg.robot.type}")
 
@@ -131,6 +146,8 @@ def get_robot_rerun(robot_type: str | None = None) -> RerunRobot:
         return load_fr3_franka_rerun()
     elif robot_type == "ur5":
         return load_ur5_rerun()
+    elif robot_type in YAM_ROBOT_TYPES:
+        return load_bimanual_yam_rerun(robot_type.rsplit("_", 1)[1])
     else:
         raise ValueError(f"Unknown robot type: {robot_type}")
 
