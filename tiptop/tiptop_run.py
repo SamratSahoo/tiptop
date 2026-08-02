@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -53,7 +53,7 @@ from tiptop.perception.cameras import (
 )
 from tiptop.perception.m2t2 import augment_flipped_grasps, m2t2_to_tiptop_transform
 from tiptop.perception.sam2 import sam2_client
-from tiptop.perception.segmentation import segment_pointcloud_by_masks, segment_table_with_ransac
+from tiptop.perception.segmentation import TABLE_BOX_CLEARANCE, segment_pointcloud_by_masks, segment_table_with_ransac
 from tiptop.perception.utils import convert_trimesh_box_to_curobo_cuboid, convert_trimesh_to_curobo_mesh
 from tiptop.perception_wrapper import detect_and_segment, predict_depth_and_grasps
 from tiptop.planning import build_tamp_config, run_planning, save_tiptop_plan, serialize_plan
@@ -63,6 +63,7 @@ from tiptop.recording import (
     save_run_metadata,
     save_run_outputs,
 )
+from tiptop.scene_reset import build_reset_goal, reset_goal_builder
 from tiptop.utils import (
     RobotClient,
     add_file_handler,
@@ -87,6 +88,12 @@ LEROBOT_FPS = 15
 # A measured gripper width (metres) at or above this counts as "already open", so the
 # per-episode reset skips re-issuing an open. 90% of the Robotiq 2F-85 full span.
 GRIPPER_OPEN_WIDTH = 0.9 * GRIPPER_MAX_WIDTH
+
+# How far to raise the table collision box when a goal places ONTO the table (create_tamp_environment).
+# The full clearance puts its top exactly on the detected plane. Lower it (e.g. 0.015) if a scene
+# reset starts coming back "no reset plan": the last few mm of the sink are what let the fingertips
+# get under a flat object, and landing placements a little above the plane still avoids the press.
+TABLE_PLACEMENT_RAISE = TABLE_BOX_CLEARANCE
 
 _executor_pool = None
 
@@ -340,10 +347,12 @@ _LAST_TASK: str | None = None
 _postprocess_procs: list[subprocess.Popen] = []
 
 # Manual robot commands accepted at the task prompt, in place of a task instruction. The
-# data-collection UI's top-bar buttons drive these over stdin; a terminal user can just type them.
+# data-collection UI's buttons drive these over stdin; a terminal user can just type them.
 # They run BETWEEN rollouts (the prompt is the one point where the arm is idle and stdin is being
 # read), reusing the warmed container -- so no cuRobo re-warm and no second robot connection.
-ROBOT_COMMANDS = ("home", "open")
+# 'reset' is the odd one out: it runs a whole (unrecorded) perceive-plan-execute cycle rather than a
+# single nudge, so async_entrypoint dispatches it instead of _run_robot_command.
+ROBOT_COMMANDS = ("home", "open", "reset")
 
 
 def _open_gripper_if_needed(container) -> float | None:
@@ -384,9 +393,9 @@ def _get_task_instruction() -> str:
     across rollouts. Enter repeats the last task, typing a new one changes it, and
     'q'/'exit'/Ctrl-D ends the session (raising UserExitException).
 
-    A ROBOT_COMMANDS word ('home'/'open') is returned as-is instead of a task; the caller runs it
-    and re-prompts. It is deliberately NOT remembered as the last task, so a later bare Enter still
-    repeats the real instruction rather than nudging the robot again."""
+    A ROBOT_COMMANDS word ('home'/'open'/'reset') is returned as-is instead of a task; the caller
+    runs it and re-prompts. It is deliberately NOT remembered as the last task, so a later bare Enter
+    still repeats the real instruction rather than nudging the robot (or resetting the scene) again."""
     global _LAST_TASK
     env_task = os.environ.get('TIPTOP_TASK', '')
     if env_task:
@@ -400,7 +409,10 @@ def _get_task_instruction() -> str:
     suffix = f" [{_LAST_TASK}]" if _LAST_TASK else ""
     _emit_event({"event": "awaiting_task"})
     try:
-        raw = input(f"\nNext task (Enter = repeat{suffix}, 'home'/'open' to nudge the robot, 'q' to quit): ").strip()
+        raw = input(
+            f"\nNext task (Enter = repeat{suffix}, 'home'/'open' to nudge the robot, "
+            f"'reset' to put the scene back, 'q' to quit): "
+        ).strip()
     except EOFError:
         raise UserExitException('EOF; ending session')
     if raw.lower() in ('q', 'exit', 'quit'):
@@ -436,8 +448,20 @@ def _spawn_postprocess(rollout_dir: Path) -> None:
 
 
 def create_tamp_environment(
-    object_meshes: dict[str, Mesh], table_cuboid: Cuboid, grounded_atoms: list[dict], include_workspace: bool
+    object_meshes: dict[str, Mesh],
+    table_cuboid: Cuboid,
+    grounded_atoms: list[dict],
+    include_workspace: bool,
+    extra_surface_labels: set[str] | None = None,
 ) -> tuple[TAMPEnvironment, list[Cuboid | Mesh]]:
+    """Build the cuTAMP environment for one goal.
+
+    ``extra_surface_labels`` are labels that must be treated as SURFACES even though no goal atom
+    places anything on them. Surfaces are otherwise inferred purely from the second argument of the
+    goal's ``on`` atoms, which is fine for a task but wrong for a scene reset: its goal names only
+    the table, so the plate the objects are coming off would be classified movable and the planner
+    would be free to pick the plate up. See ``scene_reset.build_reset_goal``.
+    """
     # Reject goals that reference objects not present in the perceived scene.
     # Without this, cuTAMP's BFS runs without stopping, expanding the move-chain on an unreachable goal.
     known_labels = set(object_meshes.keys()) | {table_cuboid.name}
@@ -449,11 +473,14 @@ def create_tamp_environment(
                     f"references unknown object '{arg}'. Known objects: {sorted(known_labels)}"
                 )
 
-    # Identify which objects are used as surfaces (second arg in on(x, y))
+    # Identify which objects are used as surfaces (second arg in on(x, y)), plus any the caller
+    # designated explicitly.
     surface_labels = set()
     for atom in grounded_atoms:
         if atom["predicate"] == "on" and len(atom["args"]) == 2:
             surface_labels.add(atom["args"][1])
+    if extra_surface_labels:
+        surface_labels |= {label for label in extra_surface_labels if label in object_meshes}
 
     # Separate movables and surfaces
     movables = []
@@ -482,7 +509,25 @@ def create_tamp_environment(
     if not has_holding:
         goal_state.add(HandEmpty.ground())
 
-    # All surfaces include table and detected surface objects
+    # All surfaces include table and detected surface objects.
+    #
+    # A goal that places ONTO the table needs the table's true top face, which the collision cuboid
+    # is not: segment_table_with_ransac sinks it TABLE_BOX_CLEARANCE below the RANSAC plane so flat
+    # objects lying on the table stay graspable. Placement height comes straight off that face
+    # (cuTAMP's place_4dof_sampler adds only 1-10 mm), so placing on the unmodified cuboid commands
+    # the object ~1-2 cm INTO the tabletop, with no collision to reject it -- the obstacle really is
+    # that low. Grow the box upwards to the true plane, leaving its underside where it was.
+    # Conditional, so every goal that does not name the table keeps the existing geometry exactly.
+    if table_cuboid.name in surface_labels:
+        _log.info(
+            f"Goal places on '{table_cuboid.name}': raising its box top by {TABLE_PLACEMENT_RAISE} m toward the "
+            "detected surface, so placements land ON the table rather than inside it"
+        )
+        table_cuboid = replace(
+            table_cuboid,
+            dims=[table_cuboid.dims[0], table_cuboid.dims[1], table_cuboid.dims[2] + TABLE_PLACEMENT_RAISE],
+            pose=[*table_cuboid.pose[:2], table_cuboid.pose[2] + TABLE_PLACEMENT_RAISE / 2, *table_cuboid.pose[3:]],
+        )
     all_surfaces = [table_cuboid, *surfaces]
     statics = list(workspace_cuboids()) if include_workspace else []
     for surface in all_surfaces:
@@ -679,7 +724,16 @@ async def run_perception(
     gripper_mask: Bool[np.ndarray, "h w"] | None = None,
     include_workspace: bool = True,
     log_to_rerun: bool = True,
+    goal_builder=None,
 ) -> tuple[TAMPEnvironment, list, ProcessedScene, list[dict]]:
+    """Perceive the scene and turn it into a cuTAMP environment for ``task_instruction``.
+
+    ``goal_builder`` replaces the goal Gemini grounded from the instruction. It is called with
+    ``(processed_scene, detected_atoms)`` and returns ``(grounded_atoms, extra_surface_labels)``;
+    the scene reset uses it to plan against a goal built from geometry instead of language
+    (``scene_reset.reset_goal_builder``). The atoms actually planned for are what is returned, so a
+    caller's run metadata records the effective goal rather than the discarded one.
+    """
     start_time = time.perf_counter()
 
     frame = observation.frame
@@ -799,15 +853,192 @@ async def run_perception(
     if _os_detect.environ.get("TIPTOP_DETECT_ONLY"):
         raise UserExitException("TIPTOP_DETECT_ONLY: perception complete; skipping planning/motion")
 
+    grounded_atoms = detection_results["grounded_atoms"]
+    extra_surface_labels = None
+    if goal_builder is not None:
+        grounded_atoms, extra_surface_labels = goal_builder(processed_scene, grounded_atoms)
+
     env, all_surfaces = create_tamp_environment(
         processed_scene.object_meshes,
         processed_scene.table_cuboid,
-        detection_results["grounded_atoms"],
+        grounded_atoms,
         include_workspace,
+        extra_surface_labels=extra_surface_labels,
     )
     _log.info(f"Processing scene and perception results took {time.perf_counter() - proc_st:.2f}s")
     _log.info(f"Perception pipeline completed, took {time.perf_counter() - start_time:.2f}s")
-    return env, all_surfaces, processed_scene, detection_results["grounded_atoms"]
+    return env, all_surfaces, processed_scene, grounded_atoms
+
+
+def _plan_largest_solvable_reset(
+    container: _DemoContainer,
+    config: TAMPConfiguration,
+    processed_scene: ProcessedScene,
+    q_init,
+    goal_atoms: list[dict],
+    env: TAMPEnvironment,
+    all_surfaces: list,
+    save_dir: Path,
+) -> tuple[list | None, list[str], list[str]]:
+    """Plan the biggest subset of the reset goal cuTAMP can actually solve.
+
+    Returns ``(plan, moved_labels, skipped_labels)``; ``plan`` is None only if no single object could
+    be planned.
+
+    A reset goal is one plan over N objects, and cuTAMP must satisfy every object's Pick and Place
+    at once -- so ONE unreachable object sinks the whole reset and nothing moves. That is not a
+    corner case: an object nestled on the surface it has to come off gets few clean M2T2 grasps, and
+    with none of them IK-reachable its Pick constraint reports 0/256 satisfying while every other
+    object's is fine. (Measured: pink_toy 4 grasps -> 0/256, against blue_toy's 73 -> 129/256. All
+    three toys stayed on the plate.)
+
+    So on failure we drop the object with the FEWEST grasp candidates -- the signal that actually
+    predicts the blocker -- and re-plan the rest, down to a single object. Moving two of three toys
+    and naming the third beats moving none. Each attempt is a complete co-planned multi-object plan,
+    so placements are still solved together and cannot collide; only the goal shrinks.
+    """
+    n_grasps = {
+        label: len(processed_scene.grasps.get(label, {}).get("poses", ())) for label in processed_scene.object_meshes
+    }
+    # Hardest (fewest grasps) last, so pop() drops the most likely blocker first.
+    labels = sorted((a["args"][0] for a in goal_atoms), key=lambda label: -n_grasps.get(label, 0))
+    table_name = processed_scene.table_cuboid.name
+    _, surfaces = build_reset_goal(processed_scene.object_meshes, processed_scene.table_cuboid)
+    _log.info(f"Reset planning order (most graspable first): {[(label, n_grasps.get(label)) for label in labels]}")
+
+    skipped: list[str] = []
+    attempt = 0
+    while labels:
+        attempt += 1
+        if attempt > 1:
+            # Rebuild the environment for the shrunken goal. Perception is NOT re-run -- the scene
+            # has not changed, only what we are asking for.
+            atoms = [{"predicate": "on", "args": [label, table_name]} for label in labels]
+            env, all_surfaces = create_tamp_environment(
+                processed_scene.object_meshes,
+                processed_scene.table_cuboid,
+                atoms,
+                include_workspace=True,
+                extra_surface_labels=surfaces,
+            )
+        cutamp_plan, _, failure_reason = run_planning(
+            env,
+            config,
+            q_init=q_init,
+            ik_solver=container.ik_solver,
+            grasps=processed_scene.grasps,
+            motion_gen=container.motion_gen,
+            all_surfaces=all_surfaces,
+            experiment_dir=save_dir / ("cutamp" if attempt == 1 else f"cutamp_retry{attempt - 1}"),
+            cost_overrides=container.cost_overrides,
+        )
+        if cutamp_plan is not None:
+            return cutamp_plan, labels, skipped
+        dropped = labels.pop()
+        skipped.append(dropped)
+        _log.warning(
+            f"No reset plan for {len(labels) + 1} object(s) ({failure_reason}); dropping "
+            f"'{dropped}' ({n_grasps.get(dropped)} grasp candidates) and retrying with {labels or 'nothing left'}"
+        )
+    return None, [], skipped
+
+
+async def _run_scene_reset(
+    session: aiohttp.ClientSession, container: _DemoContainer, config: TAMPConfiguration, output_dir: str
+) -> None:
+    """Put the scene back the way the last rollout found it, reusing the warmed container.
+
+    A finished rollout leaves the scene in its goal state, so the next episode cannot start until the
+    toys are off the plate. This runs one extra perceive-plan-execute cycle whose goal is
+    ``on(obj, table)`` for every object something else is holding up (``scene_reset``).
+
+    It is deliberately NOT an episode: no cameras are recorded, no state is sampled, nothing is
+    labelled and nothing is written under ``eval/``. The artifacts land in
+    ``<output_dir>/resets/<ts>/`` instead, which neither the collected-episode count nor the LeRobot
+    dataset build looks at, so a reset can never leak into the training data.
+
+    Never raises except on KeyboardInterrupt (a preempt), which the rollout loop turns into "back to
+    the task prompt" -- a failed reset must leave the warmed session alive so the operator can retry
+    or just move the objects by hand.
+    """
+    cfg = tiptop_cfg()
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    save_dir = Path(output_dir) / "resets" / timestamp
+    _emit_event({"event": "reset_start", "dir": str(save_dir)})
+    file_handler = None
+    try:
+        file_handler = add_file_handler(save_dir / "scene_reset.log")
+        # Its own rerun recording, so the reset's perception does not land on top of the last
+        # rollout's; the next rollout's rr.init takes the global recording back.
+        rr.init("tiptop_run", recording_id=f"reset_{timestamp}", spawn=False)
+
+        # Whatever the rollout ended holding has to go before we look at the scene, and the arm has
+        # to be out of the cameras' way. Both no-op when already so, as at the start of an episode.
+        _log.info("Scene reset: returning home and opening the gripper")
+        go_to_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+        _open_gripper_if_needed(container)
+        go_to_capture(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+
+        # The instruction only steers DETECTION -- the goal comes from geometry (scene_reset), so
+        # nothing here depends on the VLM naming objects the same way twice. Reusing the last task
+        # verbatim is simply what makes it detect the same set of objects.
+        instruction = _LAST_TASK
+        if not instruction:
+            raise RuntimeError("no task has run yet, so there is nothing to reset")
+        _log.info(f"Scene reset: perceiving with the last task's instruction {instruction!r}")
+
+        observation = capture_live_observation(container)
+        env, all_surfaces, processed_scene, goal_atoms = await run_perception(
+            session,
+            observation,
+            instruction,
+            save_dir,
+            depth_estimator=container.depth_estimator,
+            gripper_mask=container.gripper_mask,
+            goal_builder=reset_goal_builder(),
+        )
+        (save_dir / "reset.json").write_text(
+            json.dumps({"instruction": instruction, "goal_atoms": goal_atoms}, indent=2)
+        )
+        # Saved BEFORE planning: cutamp_env.pkl (world AABBs + grasps) is exactly what you need to
+        # tell a genuinely infeasible reset -- an object embedded in a container it has to come out
+        # of -- from a tuning problem, and planning is the step that fails in that case.
+        save_run_outputs(save_dir, env, processed_scene.grasps)
+        if not goal_atoms:
+            _log.info("Scene reset: nothing to move, every object is already on the table")
+            _emit_event({"event": "reset_done", "dir": str(save_dir), "moved": 0})
+            return
+
+        cutamp_plan, moved, skipped = _plan_largest_solvable_reset(
+            container, config, processed_scene, observation.q_init, goal_atoms, env, all_surfaces, save_dir
+        )
+        if cutamp_plan is None:
+            raise RuntimeError(f"cuTAMP found no reset plan for any of {sorted(skipped)}")
+        save_tiptop_plan(serialize_plan(cutamp_plan, observation.q_init), save_dir / "tiptop_plan.json")
+
+        _log.info(f"Executing scene reset ({len(moved)} object(s) back to the table: {moved})")
+        execute_cutamp_plan(cutamp_plan, client=container.robot)
+        go_to_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+        if skipped:
+            _log.warning(f"Scene reset complete, but {skipped} could not be planned -- move those by hand")
+        else:
+            _log.info("Scene reset complete")
+        _emit_event({"event": "reset_done", "dir": str(save_dir), "moved": len(moved), "skipped": skipped})
+    except KeyboardInterrupt:
+        _log.info("Scene reset preempted (Ctrl-C)")
+        _emit_event({"event": "reset_failed", "dir": str(save_dir), "error": "aborted"})
+        raise  # the loop's handler clears the preempt latch and returns us to the task prompt
+    except UserExitException:
+        # run_perception raises this to end the whole session (TIPTOP_DETECT_ONLY). Catching it below
+        # as a plain reset failure would keep a session alive that asked to exit.
+        _emit_event({"event": "reset_failed", "dir": str(save_dir), "error": "session exiting"})
+        raise
+    except Exception as e:
+        _log.exception(f"Scene reset failed ({type(e).__name__}: {e}); reset the scene by hand and carry on")
+        _emit_event({"event": "reset_failed", "dir": str(save_dir), "error": f"{type(e).__name__}: {e}"})
+    finally:
+        if file_handler is not None:
+            remove_file_handler(file_handler)
 
 
 async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration, output_dir: str, execute_plan: bool):
@@ -826,10 +1057,14 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # prompt) ends the session without moving to capture + opening the gripper --
                 # which would drop whatever is currently held. Reuses the warmed container.
                 task_instruction = _get_task_instruction()  # Let UserExitException propagate
-                # A robot nudge ('home'/'open') from the UI's top bar or the prompt: run it against
-                # the warm container and go straight back to the prompt -- no rollout, no episode.
+                # A robot command from the UI or the prompt: run it against the warm container and go
+                # straight back to the prompt -- no rollout, no episode. 'home'/'open' are single
+                # nudges; 'reset' is a whole unrecorded perceive-plan-execute cycle, hence async.
                 if task_instruction in ROBOT_COMMANDS:
-                    _run_robot_command(container, cfg, task_instruction)
+                    if task_instruction == "reset":
+                        await _run_scene_reset(session, container, config, output_dir)
+                    else:
+                        _run_robot_command(container, cfg, task_instruction)
                     continue
                 _log.info(f"User entered instruction: {task_instruction}")
 

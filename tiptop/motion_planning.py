@@ -526,10 +526,18 @@ def go_to_q(
     plan = result.interpolated_plan
     dt = result.interpolation_dt
     timings = [dt] * plan.position.shape[0]
+    # NOTE: do NOT close the client here. `get_robot_client()` is a process-wide cached singleton
+    # (utils.get_bamboo_client is @cache'd) that the warm session holds for the rest of its life --
+    # tiptop_run's container, execute_cutamp_plan's gripper commands, the LeRobot samplers. Closing
+    # it terminated the shared ZMQ context, and only the CONTROL path recovers from that: a control
+    # send hits ZMQError -> _recreate_control_socket -> the terminated context refuses a new socket
+    # -> it rebuilds context + gripper socket. The gripper path (_send_robotiq_command) has no such
+    # recovery, so a gripper call landing before the next control call raised ENOTSOCK. That is why
+    # "return home, then open the gripper" silently failed at the start of every episode.
+    # _sync_entrypoint's finally owns the teardown.
     result = client.execute_joint_impedance_path(
         joint_confs=plan.position.cpu().numpy(), joint_vels=plan.velocity.cpu().numpy(), durations=timings
     )
-    client.close()
     if not result["success"]:
         raise RuntimeError(f"Failed to execute trajectory on robot. {result['error']}")
     _log.info("Executed trajectory on the robot")
