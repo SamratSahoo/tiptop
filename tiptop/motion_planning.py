@@ -13,6 +13,7 @@ from cutamp.motion_solver import MotionPlanningError
 from cutamp.robots import (
     get_panda_robotiq_ik_solver,
     load_bimanual_yam_container,
+    load_bimanual_yam_dual_container,
     load_fr3_robotiq_container,
     load_panda_container,
     load_panda_robotiq_container,
@@ -62,10 +63,16 @@ def get_ik_solver(world_cfg: WorldConfig, num_particles: int, warmup_iters: int 
             container = load_ur5_container(TensorDeviceType())
         elif cfg.robot.type in YAM_ROBOT_TYPES:
             # The bimanual YAM is registered once per arm; the suffix picks which arm plans and
-            # which one is locked as an obstacle. See cutamp/robots/bimanual_yam.py.
+            # which one is locked as an obstacle. See cutamp/robots/bimanual_yam.py. "dual" is a
+            # different container entirely (both arms as one 12-DOF chain, not a per-arm
+            # parameterization of the single-arm one) -- get_bimanual_yam_ik_solver already accepts
+            # it via _check_arm(allow_dual=True), but the RobotContainer loader does not.
             arm = cfg.robot.type.rsplit("_", 1)[1]
             ik_solver = get_bimanual_yam_ik_solver(world_cfg, arm)
-            container = load_bimanual_yam_container(arm, TensorDeviceType())
+            if arm == "dual":
+                container = load_bimanual_yam_dual_container(TensorDeviceType())
+            else:
+                container = load_bimanual_yam_container(arm, TensorDeviceType())
         else:
             raise ValueError(f"Unknown robot type: {cfg.robot.type}")
 
@@ -267,6 +274,25 @@ def resolve_traj_length_norm(overrides: dict | None, default: float = 2.0) -> fl
     return float(val)
 
 
+def resolve_max_motion_refine_attempts(overrides: dict | None, default: int | None = 32) -> int | None:
+    """Effective cap on how many satisfying particles cuTAMP tries motion refinement on.
+
+    cuTAMP works through satisfying particles in cost order until one motion-refines successfully or
+    this cap is reached (cutamp/config.py's own default is ``None`` = try all of them). TiPToP bounds
+    it at 32 by default to cap planning time when a scene has many satisfying particles. A
+    dual/handover scene can need more tries than that: with few grasp candidates on the object (a
+    thin M2T2 harvest), most satisfying particles share a similar, hard approach geometry, so a run
+    can exhaust 32 attempts -- all failing at the same TRAJOPT_FAIL step -- while satisfying particles
+    it never tried might have succeeded. Set ``max_motion_refine_attempts`` in cfg/tamp
+    ``tamp_overrides`` to raise the cap, or to ``null`` to try every satisfying particle.
+    """
+    overrides = overrides or {}
+    if "max_motion_refine_attempts" not in overrides:
+        return default
+    val = overrides["max_motion_refine_attempts"]
+    return None if val is None else int(val)
+
+
 def resolve_grasp_orientation_cost(overrides: dict | None) -> bool:
     """Whether to enable cuTAMP's grasp orientation-change soft cost, from cfg/tamp tamp_overrides.
 
@@ -364,7 +390,15 @@ def get_motion_gen(
         raise ValueError(f"Unknown robot type: {cfg.robot.type}")
 
     if num_spheres is not None:
-        robot_cfg["robot_cfg"]["kinematics"]["extra_collision_spheres"]["attached_object"] = num_spheres
+        extra_spheres = robot_cfg["robot_cfg"]["kinematics"]["extra_collision_spheres"]
+        if cfg.robot.type == "bimanual_yam_dual":
+            # The dual config has one attachment slot PER HAND (bimanual_yam_dual.yml:
+            # left_attached_object / right_attached_object), not the single "attached_object" every
+            # other robot (including the single-arm YAM configs) uses -- both need the same budget.
+            extra_spheres["left_attached_object"] = num_spheres
+            extra_spheres["right_attached_object"] = num_spheres
+        else:
+            extra_spheres["attached_object"] = num_spheres
         _log.debug(f"Setting number of spheres for attachments to {num_spheres}")
 
     # Apply UI cuRobo cost overrides by substituting a modified gradient-trajopt config DICT
@@ -479,8 +513,17 @@ def go_to_q(
     time_dilation_factor: float,
     dist_tol: float = 0.05,
     motion_gen: MotionGen | None = None,
-) -> None:
-    """Move the robot to the target joint positions using motion planning against the workspace."""
+) -> dict | None:
+    """Move the robot to the target joint positions using motion planning against the workspace.
+
+    Returns ``{"positions", "velocities", "dt", "t_start", "t_end"}`` describing the trajectory that
+    was actually executed, or ``None`` when the arm was already at the target and nothing ran.
+
+    A bimanual YAM episode needs that: parking one arm before the other plans is a real commanded
+    motion inside the recorded window, so it has to reach the action channel like any plan segment
+    (``tiptop.yam.capture.segment_from_motion``). Callers that only want the motion can keep
+    ignoring the return value.
+    """
     dof = tiptop_cfg().robot.dof
     if isinstance(q_target, np.ndarray) and (q_target.ndim != 1 or len(q_target) != dof):
         raise ValueError(f"Expected q_target to be a ({dof},) np.ndarray, but got {q_target.shape}")
@@ -505,7 +548,7 @@ def go_to_q(
     dist = torch.norm(q_start - q_target)
     if dist <= dist_tol:
         _log.info(f"Robot already at target joint positions with {dist=:.2f}")
-        return
+        return None
 
     # Motion plan!
     js_start, js_target = JointState.from_position(q_start), JointState.from_position(q_target)
@@ -535,21 +578,113 @@ def go_to_q(
     # recovery, so a gripper call landing before the next control call raised ENOTSOCK. That is why
     # "return home, then open the gripper" silently failed at the start of every episode.
     # _sync_entrypoint's finally owns the teardown.
+    positions = plan.position.cpu().numpy()
+    velocities = plan.velocity.cpu().numpy()
+    t_start = time.time()
     result = client.execute_joint_impedance_path(
-        joint_confs=plan.position.cpu().numpy(), joint_vels=plan.velocity.cpu().numpy(), durations=timings
+        joint_confs=positions, joint_vels=velocities, durations=timings
     )
+    t_end = time.time()
     if not result["success"]:
         raise RuntimeError(f"Failed to execute trajectory on robot. {result['error']}")
     _log.info("Executed trajectory on the robot")
+    return {"positions": positions, "velocities": velocities, "dt": dt, "t_start": t_start, "t_end": t_end}
 
 
-def go_to_home(time_dilation_factor: float, motion_gen: MotionGen | None = None) -> None:
-    """Go to home configuration"""
+def go_to_home(time_dilation_factor: float, motion_gen: MotionGen | None = None) -> dict | None:
+    """Go to home configuration. Returns the executed trajectory (see :func:`go_to_q`)."""
     cfg = tiptop_cfg()
-    go_to_q(q_target=list(cfg.robot.q_home), time_dilation_factor=time_dilation_factor, motion_gen=motion_gen)
+    return go_to_q(q_target=list(cfg.robot.q_home), time_dilation_factor=time_dilation_factor, motion_gen=motion_gen)
 
 
-def go_to_capture(time_dilation_factor: float, motion_gen: MotionGen | None = None) -> None:
-    """Go to capture configuration"""
+def go_to_capture(time_dilation_factor: float, motion_gen: MotionGen | None = None) -> dict | None:
+    """Go to capture configuration. Returns the executed trajectory (see :func:`go_to_q`)."""
     cfg = tiptop_cfg()
-    go_to_q(q_target=list(cfg.robot.q_capture), time_dilation_factor=time_dilation_factor, motion_gen=motion_gen)
+    return go_to_q(q_target=list(cfg.robot.q_capture), time_dilation_factor=time_dilation_factor, motion_gen=motion_gen)
+
+
+def go_to_dual_q(
+    q_target: Float[np.ndarray, "12"] | list[float],
+    time_dilation_factor: float,
+    dist_tol: float = 0.05,
+    motion_gen: MotionGen | None = None,
+) -> dict | None:
+    """12-DOF analogue of :func:`go_to_q`, for the ``bimanual_yam_dual`` embodiment only.
+
+    Moves BOTH arms to one shared target configuration at once. This is a separate function, not a
+    branch inside ``go_to_q``, because execution genuinely differs: ``YamClient.execute_joint_impedance_path``
+    drives whichever ONE arm ``client.arm`` currently names (meaningless in dual mode, where there is
+    no single active arm -- see ``YamClient.arm``'s docstring), so this goes through
+    ``execute_plan._DualQueuedArm`` instead, the same dual queued-submission path
+    ``execute_cutamp_dual_plan`` uses for a cuTAMP plan's trajectory steps. Planning itself
+    (``motion_gen.plan_single_js``) is unchanged -- it is DOF-agnostic and already works correctly
+    against a 12-DOF ``motion_gen`` built for ``bimanual_yam_dual``.
+    """
+    from tiptop.yam import BIMANUAL_ARM_DOF
+
+    if len(q_target) != BIMANUAL_ARM_DOF:
+        raise ValueError(f"Expected a {BIMANUAL_ARM_DOF}-wide q_target for the dual embodiment, got {len(q_target)}")
+    if not 0 < time_dilation_factor <= 1:
+        raise ValueError(f"time_dilation_factor must be between 0 and 1, but got {time_dilation_factor}")
+
+    client = get_robot_client()
+    if motion_gen is None:
+        world_cfg = WorldConfig(cuboid=list(workspace_cuboids()))
+        motion_gen = get_motion_gen(world_cfg, collision_activation_distance=0.01, warmup_iters=0)
+
+    tensor_args = TensorDeviceType()
+    q_start = tensor_args.to_device(client.get_dual_joint_positions())
+    q_target = tensor_args.to_device(list(q_target))
+
+    dist = torch.norm(q_start - q_target)
+    if dist <= dist_tol:
+        _log.info(f"Both arms already at target joint positions with {dist=:.2f}")
+        return None
+
+    js_start, js_target = JointState.from_position(q_start), JointState.from_position(q_target)
+    plan_config = MotionGenPlanConfig(time_dilation_factor=time_dilation_factor)
+    torch.cuda.synchronize()
+    start_time = time.perf_counter()
+    result = motion_gen.plan_single_js(js_start[None], js_target[None], plan_config)
+    torch.cuda.synchronize()
+    mp_duration = time.perf_counter() - start_time
+    _log.info(f"Dual-arm motion planning took {mp_duration:.2f}s")
+    if not result.success.all():
+        raise MotionPlanningError(
+            f"Could not motion plan both arms to target joint positions. Reason: {result.status}.\n"
+            "You could try moving an arm in 'Programming' mode to more feasible initial joint positions."
+        )
+
+    plan = result.interpolated_plan
+    dt = result.interpolation_dt
+    positions = plan.position.cpu().numpy()
+    velocities = plan.velocity.cpu().numpy()
+
+    from tiptop.execute_plan import ExecutionFailure, _DualQueuedArm
+
+    dual = _DualQueuedArm()
+    if not dual.available:
+        raise ExecutionFailure(
+            "go_to_dual_q requires the arm server's trajectory queue -- there is no blocking "
+            "fallback for driving both arms at once."
+        )
+    t_start = time.time()
+    try:
+        dual.submit(positions, velocities, float(dt))
+        drained = dual.wait_done()
+        if not drained.get("success"):
+            dual.abort()
+            raise RuntimeError(f"Failed to execute dual-arm trajectory on the robot. {drained.get('error')}")
+    finally:
+        dual.close()
+    t_end = time.time()
+    _log.info("Executed dual-arm trajectory on the robot")
+    return {"positions": positions, "velocities": velocities, "dt": dt, "t_start": t_start, "t_end": t_end}
+
+
+def go_to_dual_home(time_dilation_factor: float, motion_gen: MotionGen | None = None) -> dict | None:
+    """Move both arms to home configuration. Returns the executed trajectory (see :func:`go_to_dual_q`)."""
+    cfg = tiptop_cfg()
+    return go_to_dual_q(
+        q_target=list(cfg.robot.q_home), time_dilation_factor=time_dilation_factor, motion_gen=motion_gen
+    )

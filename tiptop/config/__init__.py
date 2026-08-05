@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -72,6 +73,29 @@ def tiptop_cfg(force_reload: bool = False) -> DictConfig:
         cli = OmegaConf.from_cli()
         _cached_cfg = OmegaConf.merge(_cached_cfg, cli)
     return _cached_cfg
+
+
+@contextmanager
+def as_robot_type(robot_type: str):
+    """Make ``robot_type`` the active embodiment for the duration of the block.
+
+    ``robot.type`` is read by ~50 call sites to decide which robot they are talking about — cuRobo
+    solver selection, the workspace cuboids, the Rerun model, cuTAMP's ``TAMPConfiguration.robot``,
+    the hardware client. Swapping it here is what makes all of them agree at once.
+
+    Exists because one embodiment per process is not enough for a bimanual YAM: cuTAMP plans a
+    single kinematic chain, so an episode that uses both arms genuinely runs two embodiments in
+    sequence (``bimanual_yam_left`` then ``bimanual_yam_right``). Restoring on exit keeps a
+    single-embodiment session byte-identical. Not a lock: tiptop plans and executes one arm at a
+    time, and nothing else in the process mutates ``robot.type``.
+    """
+    cfg = tiptop_cfg()
+    previous = cfg.robot.type
+    cfg.robot.type = robot_type
+    try:
+        yield robot_type
+    finally:
+        cfg.robot.type = previous
 
 
 def load_calibration_info():

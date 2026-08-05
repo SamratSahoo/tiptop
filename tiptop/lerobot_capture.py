@@ -38,17 +38,21 @@ DEFAULT_TARGET_FPS = 15
 GRIPPER_MAX_WIDTH = 0.085
 
 
-def _read_gripper_width(robot) -> float | None:
+def _read_gripper_width(robot, arm: str | None = None) -> float | None:
     """Best-effort read of the measured gripper opening width in metres. None if unavailable.
 
     The bamboo client returns ``{"success": ..., "state": {"width": <m>, ...}}``; older
     code read ``["width"]`` directly and always missed, defaulting the gripper to a
     constant. Navigate the real payload, tolerating the flatter shapes too.
+
+    ``arm`` addresses a specific hand -- only meaningful for a YamClient in dual mode, where there
+    is no default active arm to fall back to (see ``YamClient.arm``); every other client/embodiment
+    leaves it None and nothing changes.
     """
     try:
         if not hasattr(robot, "get_gripper_state"):
             return None
-        res = robot.get_gripper_state()
+        res = robot.get_gripper_state(arm) if arm is not None else robot.get_gripper_state()
         if not isinstance(res, dict):
             return float(res)
         if res.get("success") is False:
@@ -239,11 +243,14 @@ def _load_plan(plan_path: Path) -> dict:
     return plan
 
 
-def _flatten_plan(plan: dict, timeline: list | None = None) -> dict:
+def _flatten_plan(plan: dict, timeline: list | None = None, dof: int = 7) -> dict:
     """Flatten plan steps into dense 50 Hz arrays.
 
+    ``dof`` is the arm's joint count — 7 for the Franka, 6 for one YAM arm. It only sizes the
+    zero-velocity hold rows and the ``q_init`` fallback; every other array comes from the plan.
+
     Returns a dict with, for the M dense rows:
-      positions[M,7], velocities[M,7], gripper[M], dt[M] (per-row duration),
+      positions[M,dof], velocities[M,dof], gripper[M], dt[M] (per-row duration),
       t_plan[M] (start time of each row on the plan clock), and
       t_wall[M] (wall-clock time of each row, NaN where no execution timeline).
 
@@ -267,7 +274,7 @@ def _flatten_plan(plan: dict, timeline: list | None = None) -> dict:
     """
     HOLD_DT = 0.02  # 50 Hz, matching the plan's trajectory rate, for inserted hold rows
     pos_chunks, vel_chunks, grip_chunks, dt_chunks, twall_chunks = [], [], [], [], []
-    q_init = np.asarray(plan.get("q_init", np.zeros(7)), dtype=np.float32).reshape(-1)
+    q_init = np.asarray(plan.get("q_init", np.zeros(dof)), dtype=np.float32).reshape(-1)
     last_pos = q_init  # arm pose to freeze at during a gripper pause
     g = 0.0  # DROID convention: 0 = open, 1 = closed. Episodes start open.
     for i, step in enumerate(plan["steps"]):
@@ -300,7 +307,7 @@ def _flatten_plan(plan: dict, timeline: list | None = None) -> dict:
                 ts, te = float(entry["t_start"]), float(entry["t_end"])
                 n_hold = max(1, round((te - ts) / HOLD_DT))
                 pos_chunks.append(np.tile(last_pos, (n_hold, 1)))
-                vel_chunks.append(np.zeros((n_hold, 7), dtype=np.float32))
+                vel_chunks.append(np.zeros((n_hold, dof), dtype=np.float32))
                 grip_chunks.append(np.full(n_hold, g, dtype=np.float32))
                 dt_chunks.append(np.full(n_hold, HOLD_DT, dtype=np.float64))
                 twall_chunks.append(np.linspace(ts, te, n_hold))

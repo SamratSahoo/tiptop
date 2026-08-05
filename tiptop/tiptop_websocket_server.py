@@ -33,6 +33,7 @@ from tiptop.config import tiptop_cfg
 from tiptop.motion_planning import (
     build_curobo_solvers,
     resolve_grasp_orientation_cost,
+    resolve_max_motion_refine_attempts,
     resolve_time_dilation_factor,
     resolve_traj_length_norm,
     resolve_trace_cfg,
@@ -124,6 +125,11 @@ class TiptopPlanningServer:
             time_dilation_factor=time_dilation_factor,
             traj_length_norm=resolve_traj_length_norm(self._curobo_overrides),
             grasp_orientation_cost=resolve_grasp_orientation_cost(self._curobo_overrides),
+            # Only meaningful for robot_type == "bimanual_yam_dual" (see tiptop_yam_dual.yml); every
+            # other config leaves robot.arm_mode/dual_task unset and gets cuTAMP's single-arm defaults.
+            arm_mode=self._cfg.robot.get("arm_mode", "single"),
+            dual_task=self._cfg.robot.get("dual_task", "parallel"),
+            max_motion_refine_attempts=resolve_max_motion_refine_attempts(self._curobo_overrides),
         )
         self._output_dir = Path("tiptop_server_outputs")
         # Concurrency model. The slow part of a plan is I/O-bound perception (Gemini / SAM2 / M2T2

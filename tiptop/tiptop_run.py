@@ -1,8 +1,8 @@
 import asyncio
 import ctypes
 import json
-import os
 import logging
+import os
 import shutil
 import signal
 import subprocess
@@ -29,16 +29,26 @@ from cutamp.utils.rerun_utils import log_curobo_mesh_to_rerun
 from jaxtyping import Bool, Float
 from scipy.spatial import KDTree
 
+from tiptop.config import as_robot_type as _as_robot_type
 from tiptop.config import load_calibration, tiptop_cfg
-from tiptop.execute_plan import execute_cutamp_plan
+from tiptop.execute_plan import execute_cutamp_dual_plan, execute_cutamp_plan
+from tiptop.lerobot_capture import (
+    GRIPPER_MAX_WIDTH,
+    GripperSampler,
+    JointSampler,
+    _read_gripper_width,
+    dump_raw_episode,
+)
 from tiptop.motion_planning import (
     build_curobo_solvers,
     go_to_capture,
+    go_to_dual_home,
     go_to_home,
     resolve_grasp_orientation_cost,
+    resolve_max_motion_refine_attempts,
     resolve_time_dilation_factor,
-    resolve_traj_length_norm,
     resolve_trace_cfg,
+    resolve_traj_length_norm,
     summarize_curobo_config,
 )
 from tiptop.perception.cameras import (
@@ -46,6 +56,7 @@ from tiptop.perception.cameras import (
     DepthEstimator,
     Frame,
     ZedCamera,
+    camera_mount,
     get_depth_estimator,
     get_external_camera,
     get_external_camera_2,
@@ -65,6 +76,7 @@ from tiptop.recording import (
 )
 from tiptop.scene_reset import build_reset_goal, reset_goal_builder
 from tiptop.utils import (
+    NumpyEncoder,
     RobotClient,
     add_file_handler,
     check_cutamp_version,
@@ -75,9 +87,18 @@ from tiptop.utils import (
     remove_file_handler,
     setup_logging,
 )
-from tiptop.lerobot_capture import GRIPPER_MAX_WIDTH, GripperSampler, JointSampler, _read_gripper_width, dump_raw_episode
 from tiptop.viz_utils import get_gripper_mesh, get_heatmap
 from tiptop.workspace import workspace_cuboids
+from tiptop.yam import IDLE_ARM_TOLERANCE_RAD, NEUTRAL_Q, active_arm, arm_of, is_yam
+from tiptop.yam.capture import (
+    BimanualJointSampler,
+    dump_bimanual_episode,
+    segment_from_motion,
+    segments_from_dual_plan,
+    segments_from_plan,
+)
+from tiptop.yam.task_split import arm_goal_builder, handover_goal_builder
+from tiptop.yam.yam_client import GRIPPER_STROKE_M as YAM_GRIPPER_STROKE_M
 
 _log = logging.getLogger(__name__)
 tensor_args = TensorDeviceType()
@@ -189,10 +210,33 @@ class _DemoContainer:
     ee_from_cam: Float[np.ndarray, "4 4"]
     depth_estimator: DepthEstimator
 
-    gripper_mask: Bool[np.ndarray, "h w"]
+    gripper_mask: Bool[np.ndarray, "h w"] | None
 
-    ik_solver: IKSolver
-    motion_gen: MotionGen
+    # How the perception camera's calibration entry is read: "ee" (world_from_cam = FK(q) @
+    # ee_from_cam, the Franka wrist camera) or "world" (the entry IS world_from_cam, a camera fixed
+    # in the scene — how the bimanual YAM perceives). See perception.cameras.camera_mount.
+    cam_mount: str
+
+    # cuRobo solvers keyed by ROBOT TYPE, because a bimanual YAM episode plans with two embodiments:
+    # each arm has its own ee_link and locks the other arm at the neutral posture, so each needs its
+    # own IKSolver and MotionGen. Single-embodiment robots have exactly one entry and the properties
+    # below resolve to it unconditionally, leaving the Franka path unchanged.
+    solvers: dict[str, tuple[IKSolver, MotionGen]]
+
+    # cuTAMP configuration per robot type — same reason: TAMPConfiguration carries `robot`.
+    tamp_configs: dict[str, TAMPConfiguration]
+
+    @property
+    def ik_solver(self) -> IKSolver:
+        return self.solvers[tiptop_cfg().robot.type][0]
+
+    @property
+    def motion_gen(self) -> MotionGen:
+        return self.solvers[tiptop_cfg().robot.type][1]
+
+    @property
+    def tamp_config(self) -> TAMPConfiguration:
+        return self.tamp_configs[tiptop_cfg().robot.type]
 
     # Resolved cuRobo cost/tamp-parameter config the solvers were built with (summarize_curobo_config).
     # Logged and saved per rollout so "did my cfg/tamp/*.yml override apply" is auditable after the
@@ -215,11 +259,28 @@ class ProcessedScene:
 
 
 def capture_live_observation(container: _DemoContainer) -> Observation:
-    """Read robot joint positions and compute world_from_cam via forward kinematics."""
-    q_curr = container.robot.get_joint_positions()
-    q_curr_pt = tensor_args.to_device(q_curr)
-    world_from_ee = container.motion_gen.kinematics.get_state(q_curr_pt).ee_pose.get_numpy_matrix()[0]
-    world_from_cam = world_from_ee @ container.ee_from_cam
+    """Read robot joint positions and resolve the camera's world pose.
+
+    For an END-EFFECTOR camera that is forward kinematics: ``FK(q) @ ee_from_cam``, so the pose is
+    only as good as the joint reading it was taken with. For a camera FIXED in the scene — the
+    bimanual YAM's third-person D435 — the calibration entry already IS ``world_from_cam`` and no
+    kinematics are involved; the arm's configuration cannot move it. ``q_init`` is read either way,
+    because cuTAMP plans from the measured state regardless of what is holding the camera.
+    """
+    # bimanual_yam_dual has no single active arm (see YamClient.arm) -- q_init has to be all 12
+    # numbers, both because cuTAMP's dual chain plans over all of them and because the FK branch
+    # below (unused by the YAM's fixed third-person camera, but generic) would need the full state
+    # too. get_joint_positions() would raise here; it reads whichever ONE arm is "active".
+    if tiptop_cfg().robot.type == "bimanual_yam_dual":
+        q_curr = container.robot.get_dual_joint_positions()
+    else:
+        q_curr = container.robot.get_joint_positions()
+    if container.cam_mount == "world":
+        world_from_cam = container.ee_from_cam
+    else:
+        q_curr_pt = tensor_args.to_device(q_curr)
+        world_from_ee = container.motion_gen.kinematics.get_state(q_curr_pt).ee_pose.get_numpy_matrix()[0]
+        world_from_cam = world_from_ee @ container.ee_from_cam
 
     # Grab a short burst of frames at this static pose for temporal depth smoothing. The first
     # frame is the representative one (used for rgb/intrinsics); the rest feed the median fusion.
@@ -233,6 +294,55 @@ def capture_live_observation(container: _DemoContainer) -> Observation:
     )
 
 
+def configured_arms() -> list[str]:
+    """Arms a bimanual YAM rollout uses, in execution order. Empty for any other embodiment.
+
+    ``robot.arms: [left, right]`` runs both in sequence (the sim's ``--bimanual``); a single-element
+    list collects with one arm and only parks the other.
+    """
+    cfg = tiptop_cfg()
+    # bimanual_yam_dual plans both arms as ONE 12-DOF chain (see tiptop.yam.task_split /
+    # _run_yam_dual_rollout) -- it is a yam type but has no per-arm sequential loop, so it must
+    # return [] here too. Without this check, arm_of(cfg.robot.type) below would raise: "dual" is
+    # not one of ARMS, even on a config that never sets `robot.arms` at all -- `dict.get`'s default
+    # argument is evaluated eagerly, so that call happens on every invocation, not just when the
+    # `arms` key is missing.
+    if not is_yam(cfg.robot.type) or cfg.robot.type == "bimanual_yam_dual":
+        return []
+    arms = list(cfg.robot.get("arms", [arm_of(cfg.robot.type)]))
+    if not arms:
+        raise ValueError("robot.arms is empty; name at least one arm")
+    for arm in arms:
+        arm_of(f"bimanual_yam_{arm}")  # validates, raises with a useful message
+    return arms
+
+
+def _planning_robot_types() -> list[str]:
+    """Every robot type this session needs solvers for — one per arm on a bimanual YAM."""
+    arms = configured_arms()
+    return [f"bimanual_yam_{arm}" for arm in arms] if arms else [tiptop_cfg().robot.type]
+
+
+def _check_recording_cameras(cam, external_cam, external_cam_2) -> None:
+    """Fail before any rollout if a configured camera cannot be recorded.
+
+    A ZED records through the SDK to an SVO; any other camera is encoded to MP4 directly
+    (``recording.record_cameras``). Either is fine — what is not fine is a camera that is configured
+    but did not open, because the run would then silently collect episodes missing a view.
+    """
+    for slot, camera in (("hand", cam), ("external", external_cam), ("external_2", external_cam_2)):
+        configured = tiptop_cfg().cameras.get(slot) is not None
+        if configured and camera is None:
+            raise RuntimeError(
+                f"Recording requires the configured camera cameras.{slot} "
+                f"(s/n {tiptop_cfg().cameras[slot].get('serial')}), but it is unavailable — it most "
+                "likely failed to open (e.g. LOW USB BANDWIDTH). Lower its fps/resolution, move it to "
+                "another USB3 controller, or check it is connected. Aborting before the run so no "
+                f"rollout is collected with a missing camera; to record without it, comment out "
+                f"cameras.{slot} in the config."
+            )
+
+
 def get_demo_container(
     num_particles: int,
     num_spheres: int,
@@ -240,6 +350,7 @@ def get_demo_container(
     enable_recording: bool = False,
     cost_overrides: dict | None = None,
     curobo_config_summary: dict | None = None,
+    tamp_configs: dict[str, TAMPConfiguration] | None = None,
 ) -> _DemoContainer:
     """Cache and warm-up everything needed for the live demo."""
     _log.info("Starting demo warmup...")
@@ -251,37 +362,36 @@ def get_demo_container(
     # Second exterior camera (DROID exterior_2). None if its config is commented out
     # (deliberate 2-camera setup) or if a configured camera failed to open.
     external_cam_2 = get_external_camera_2()
+    mount = camera_mount("hand")
+    # For an ee-mounted camera this is ee_from_cam; for a world-mounted one the same entry is read
+    # as world_from_cam. capture_live_observation branches on `cam_mount`.
     ee_from_cam = load_calibration(cam.serial)
 
-    # Recording needs every camera that is configured (uncommented) in tiptop.yml. Fail fast
-    # here, before any rollout, so we never silently collect data missing a configured camera.
     if enable_recording:
-        if not isinstance(cam, ZedCamera):
-            raise NotImplementedError(f"Recording requires a ZED hand camera, got {type(cam).__name__}")
-        if not isinstance(external_cam, ZedCamera):
-            raise NotImplementedError(f"Recording requires a ZED external camera, got {type(external_cam).__name__}")
-        # external_2 is only required when it's uncommented in tiptop.yml. If it's configured but
-        # failed to open, abort; if it's commented out, record with the two remaining cameras.
-        external_2_configured = tiptop_cfg().cameras.get("external_2") is not None
-        if external_2_configured and not isinstance(external_cam_2, ZedCamera):
-            raise RuntimeError(
-                "Recording requires the configured second external ZED "
-                "(cameras.external_2, s/n 31425515), but it is unavailable "
-                f"(got {type(external_cam_2).__name__}). It most likely failed to open "
-                "(e.g. LOW USB BANDWIDTH) — lower the camera fps/resolution in tiptop.yml or move it "
-                "to another USB3 controller; check it is connected. Aborting before the run so no "
-                "rollout is collected with a missing camera. To intentionally record with two cameras, "
-                "comment out cameras.external_2 in tiptop.yml."
-            )
+        _check_recording_cameras(cam, external_cam, external_cam_2)
 
     # Create depth estimator once — closed over camera intrinsics
     # Cache the SAM2 client
     sam2_client()
 
-    # Warm-up IK solver and motion generator (cost_overrides applies the cfg/tamp/*.yml cost knobs).
-    ik_solver, motion_gen, _ = build_curobo_solvers(
-        num_particles, num_spheres, collision_activation_distance, cost_overrides=cost_overrides
-    )
+    # Warm-up IK solver and motion generator, once per planning embodiment (cost_overrides applies
+    # the cfg/tamp/*.yml cost knobs). A sequential-bimanual session warms BOTH arms up front rather
+    # than lazily: the second arm's first plan would otherwise pay a full cuRobo warmup mid-episode,
+    # with the cameras rolling and the first arm holding whatever it just placed.
+    solvers: dict[str, tuple[IKSolver, MotionGen]] = {}
+    for robot_type in _planning_robot_types():
+        with _as_robot_type(robot_type):
+            _log.info(f"Warming up cuRobo solvers for {robot_type}...")
+            ik_solver, motion_gen, _ = build_curobo_solvers(
+                num_particles, num_spheres, collision_activation_distance, cost_overrides=cost_overrides
+            )
+            solvers[robot_type] = (ik_solver, motion_gen)
+
+    # The gripper mask erases a WRIST camera's own fingers from the point cloud. A camera fixed in
+    # the scene never sees the gripper in a fixed place, so masking a constant image region there
+    # would delete scene geometry instead.
+    gripper_mask = None if mount == "world" else load_gripper_mask()
+
     return _DemoContainer(
         robot=client,
         cam=cam,
@@ -290,9 +400,10 @@ def get_demo_container(
         enable_recording=enable_recording,
         ee_from_cam=ee_from_cam,
         depth_estimator=get_depth_estimator(cam),
-        gripper_mask=load_gripper_mask(),
-        ik_solver=ik_solver,
-        motion_gen=motion_gen,
+        gripper_mask=gripper_mask,
+        cam_mount=mount,
+        solvers=solvers,
+        tamp_configs=tamp_configs or {},
         curobo_config_summary=curobo_config_summary or {},
         cost_overrides=cost_overrides or {},
     )
@@ -355,14 +466,35 @@ _postprocess_procs: list[subprocess.Popen] = []
 ROBOT_COMMANDS = ("home", "open", "reset")
 
 
-def _open_gripper_if_needed(container) -> float | None:
-    """Open the gripper unless the measured width already reads open. Returns the measured width."""
-    width = _read_gripper_width(container.robot)
-    if width is not None and width >= GRIPPER_OPEN_WIDTH:
-        _log.info(f"Gripper already open (width={width:.3f} m >= {GRIPPER_OPEN_WIDTH:.3f} m); skipping open")
+def _gripper_open_threshold_m() -> float:
+    """Measured width at or above which the gripper counts as already open, in metres.
+
+    Per-embodiment, because it is 90% of that gripper's own full span and the two grippers do not
+    have the same one: the Robotiq 2F-85 opens to 0.085 m, the YAM's linear jaws to 0.096. Using the
+    Robotiq figure on a YAM would read a gripper still 15% closed on an object as "already open" and
+    skip the open that was supposed to release it.
+    """
+    if is_yam(tiptop_cfg().robot.type):
+        return 0.9 * YAM_GRIPPER_STROKE_M
+    return GRIPPER_OPEN_WIDTH
+
+
+def _open_gripper_if_needed(container, arm: str | None = None) -> float | None:
+    """Open the gripper unless the measured width already reads open. Returns the measured width.
+
+    ``arm`` addresses a specific hand -- only meaningful in dual mode (see ``YamClient.arm``); every
+    other call site leaves it None and this behaves exactly as before the parameter existed.
+    """
+    width = _read_gripper_width(container.robot, arm)
+    threshold = _gripper_open_threshold_m()
+    if width is not None and width >= threshold:
+        _log.info(f"Gripper already open (width={width:.3f} m >= {threshold:.3f} m); skipping open")
         return width
     _log.info(f"Opening gripper (measured width={width})")
-    container.robot.open_gripper()
+    if arm is not None:
+        container.robot.open_gripper(arm=arm)
+    else:
+        container.robot.open_gripper()
     return width
 
 
@@ -373,12 +505,32 @@ def _run_robot_command(container, cfg, cmd: str) -> None:
     warmed session -- the user should just land back at the prompt and be able to retry.
     """
     try:
+        arms = configured_arms()
+        dual_handover = cfg.robot.type == "bimanual_yam_dual"
         if cmd == "home":
-            _log.info("Manual command: returning the arm home")
-            go_to_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+            if arms:
+                # Every configured arm, through cuRobo. This is the documented recovery after an
+                # aborted rollout left an arm away from the neutral posture, which is the one state
+                # that makes the other arm's plans untrustworthy (see _assert_idle_arm_parked).
+                _log.info(f"Manual command: returning arms {arms} home")
+                home_all_arms(container)
+            elif dual_handover:
+                _log.info("Manual command: returning both arms home (dual)")
+                go_to_dual_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+            else:
+                _log.info("Manual command: returning the arm home")
+                go_to_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
         elif cmd == "open":
             _log.info("Manual command: opening the gripper")
-            _open_gripper_if_needed(container)
+            if arms:
+                for arm in arms:
+                    with active_arm(arm):
+                        _open_gripper_if_needed(container)
+            elif dual_handover:
+                for arm in ("left", "right"):
+                    _open_gripper_if_needed(container, arm=arm)
+            else:
+                _open_gripper_if_needed(container)
         else:
             raise ValueError(f"Unknown robot command: {cmd}")
         _emit_event({"event": "robot_command", "command": cmd, "ok": True})
@@ -397,12 +549,12 @@ def _get_task_instruction() -> str:
     runs it and re-prompts. It is deliberately NOT remembered as the last task, so a later bare Enter
     still repeats the real instruction rather than nudging the robot (or resetting the scene) again."""
     global _LAST_TASK
-    env_task = os.environ.get('TIPTOP_TASK', '')
+    env_task = os.environ.get("TIPTOP_TASK", "")
     if env_task:
-        os.environ['TIPTOP_TASK'] = ''  # consume the launch task
+        os.environ["TIPTOP_TASK"] = ""  # consume the launch task
         instr = env_task.strip()
-        if not instr or instr.lower() in ('exit', 'q', 'quit'):
-            raise UserExitException('TIPTOP_TASK empty/exit')
+        if not instr or instr.lower() in ("exit", "q", "quit"):
+            raise UserExitException("TIPTOP_TASK empty/exit")
         _LAST_TASK = instr
         return instr
     # Interactive: keep reusing the warm container for back-to-back rollouts.
@@ -414,15 +566,15 @@ def _get_task_instruction() -> str:
             f"'reset' to put the scene back, 'q' to quit): "
         ).strip()
     except EOFError:
-        raise UserExitException('EOF; ending session')
-    if raw.lower() in ('q', 'exit', 'quit'):
-        raise UserExitException('user quit')
+        raise UserExitException("EOF; ending session")
+    if raw.lower() in ("q", "exit", "quit"):
+        raise UserExitException("user quit")
     if raw.lower() in ROBOT_COMMANDS:
         return raw.lower()  # a robot nudge, not a task -- leave _LAST_TASK alone
     if not raw:
         if _LAST_TASK:
             return _LAST_TASK
-        raise UserExitException('no task entered; ending session')
+        raise UserExitException("no task entered; ending session")
     _LAST_TASK = raw
     return raw
 
@@ -438,7 +590,9 @@ def _spawn_postprocess(rollout_dir: Path) -> None:
         logf = open(rollout_dir / "postprocess.log", "ab")
         proc = subprocess.Popen(
             ["bash", script, str(rollout_dir)],
-            stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
+            stdout=logf,
+            stderr=logf,
+            stdin=subprocess.DEVNULL,
             start_new_session=True,  # detach so it survives and never blocks the run loop
         )
         _postprocess_procs.append(proc)
@@ -800,7 +954,9 @@ async def run_perception(
     # PATCH: dump scene_objects.json {label: {centroid, extents}} for /drop_above fallback in cortex_tamp_server
     try:
         import json as _json
+
         import numpy as _np
+
         _scene_objs = {}
         for _name, _m in processed_scene.object_meshes.items():
             if getattr(_m, "pose", None) is None or len(_m.pose) < 3:
@@ -825,6 +981,7 @@ async def run_perception(
         # poses are world_from_TCP — directly usable by cuRobo IK in pick_cached.
         try:
             from tiptop.perception.m2t2 import m2t2_to_tiptop_transform as _m2t2_xf
+
             _xf = _m2t2_xf()
             _TOP_K = 30
             for _gname, _gdict in (processed_scene.grasps or {}).items():
@@ -850,6 +1007,7 @@ async def run_perception(
     # PATCH: detect-only mode for cortex /perceive. scene_objects.json is already
     # written above; bail out before any motion planning / grasp execution.
     import os as _os_detect
+
     if _os_detect.environ.get("TIPTOP_DETECT_ONLY"):
         raise UserExitException("TIPTOP_DETECT_ONLY: perception complete; skipping planning/motion")
 
@@ -943,6 +1101,485 @@ def _plan_largest_solvable_reset(
     return None, [], skipped
 
 
+# Camera slot -> (episode filename, LeRobot image key) for the bimanual YAM. Deliberately NOT the
+# DROID names: this rig's three views are a fixed third-person camera and two wrist cameras, which
+# do not map onto exterior_1 / exterior_2 / wrist. data-collection's CAMERA_FILES allowlists
+# (collect/episodes.py and server/lib/episodes.js) carry both sets.
+YAM_CAMERA_FILES = {
+    "hand": ("top_cam.mp4", "observation.images.top"),
+    "external": ("left_wrist_cam.mp4", "observation.images.left_wrist"),
+    "external_2": ("right_wrist_cam.mp4", "observation.images.right_wrist"),
+}
+
+
+def _yam_recording_targets(container: _DemoContainer, save_dir: Path) -> tuple[list, dict[str, str]]:
+    """``(record_cameras arg, {lerobot key: filename})`` for whichever YAM cameras are present."""
+    targets, keys = [], {}
+    for slot, camera in (
+        ("hand", container.cam),
+        ("external", container.external_cam),
+        ("external_2", container.external_cam_2),
+    ):
+        if camera is None:
+            continue
+        filename, lerobot_key = YAM_CAMERA_FILES[slot]
+        # raw_path is only used by the ZED SDK recorder; a RealSense encodes straight to the mp4.
+        targets.append((camera, save_dir / f"{Path(filename).stem}.svo", save_dir / filename))
+        keys[lerobot_key] = filename
+    return targets, keys
+
+
+def _binary_gripper(state: dict) -> float:
+    """The arm's last gripper COMMAND, on the binary convention (0 = open, 1 = closed).
+
+    Reads ``gripper_target`` — what the gripper was last told — in preference to ``gripper``, where
+    it actually ended up. The two differ exactly when the jaws stop on an object: a gripper
+    commanded shut but held half open by a wide toy is commanded CLOSED, and thresholding the
+    measurement would record it as open. The measurement is only a fallback for a server too old to
+    report the target.
+
+    The command channel must be exactly 0.0 or 1.0 — a continuous value there is the feedback trap
+    the capture rewrite exists to prevent, and both ``dump_bimanual_episode`` and ``build_lerobot``
+    reject an episode containing one. Proprioception keeps the continuous measurement; only the
+    command is binarised.
+    """
+    opening = state.get("gripper_target")
+    if opening is None:
+        opening = state.get("gripper", 1.0)
+    return float(1.0 - float(opening) >= 0.5)
+
+
+def _read_bimanual_start(client) -> tuple[np.ndarray, np.ndarray]:
+    """``(q[12], binary gripper command[2])`` at the start of an episode.
+
+    Seeds the commanded timeline: before the first segment runs, "what was commanded" is "hold where
+    the arms are, with the grippers as they are".
+    """
+    from tiptop.yam import ARMS
+    from tiptop.yam.capture import ARM_SLICES, GRIPPER_INDEX
+
+    q = np.zeros(len(ARMS) * 6, dtype=np.float32)
+    gripper = np.zeros(len(ARMS), dtype=np.float32)
+    for arm in ARMS:
+        state = client.get_arm_state(arm)
+        q[ARM_SLICES[arm]] = np.asarray(state["q"], dtype=np.float32)[:6]
+        gripper[GRIPPER_INDEX[arm]] = _binary_gripper(state)
+    return q, gripper
+
+
+def _current_gripper_command(client, arm: str) -> float:
+    """The arm's gripper command (binary; 0 open, 1 closed) to hold across a non-plan motion."""
+    try:
+        return _binary_gripper(client.get_arm_state(arm))
+    except Exception:
+        _log.warning(f"Could not read the {arm} gripper; assuming open for the hold segment")
+        return 0.0
+
+
+def _assert_idle_arm_parked(container: _DemoContainer) -> None:
+    """Refuse to plan while the other arm is somewhere cuRobo does not think it is.
+
+    This is the one invariant sequential-bimanual TAMP rests on. The planning arm's cuRobo config
+    locks the other arm's joints at NEUTRAL_Q and collision-checks it there, so if the parked arm
+    has been left mid-motion — after an aborted rollout, say — every plan is validated against a
+    robot that does not exist, and the planner will happily route straight through it.
+
+    Recovering automatically is not safe: getting there is a long joint-space move the server would
+    have to interpolate blind, with no collision checking. Homing through cuRobo is what the `home`
+    robot command does, so say so and stop.
+    """
+    from tiptop.yam import other_arm
+
+    idle = other_arm(arm_of(tiptop_cfg().robot.type))
+    measured = np.asarray(container.robot.get_arm_state(idle)["q"], dtype=np.float64)[:6]
+    error = float(np.abs(measured - np.asarray(NEUTRAL_Q)).max())
+    if error > IDLE_ARM_TOLERANCE_RAD:
+        raise RuntimeError(
+            f"the {idle} arm is {error:.3f} rad from the neutral posture (limit "
+            f"{IDLE_ARM_TOLERANCE_RAD}), but the planner collision-checks it there. Run the 'home' "
+            "robot command to bring both arms back through cuRobo before collecting."
+        )
+    _log.debug(f"{idle} arm parked at neutral (max error {error:.3f} rad)")
+
+
+def home_all_arms(container: _DemoContainer) -> None:
+    """Return every configured arm to the neutral posture, through cuRobo, one at a time.
+
+    Order matters. Each arm's plan assumes the other is already at NEUTRAL_Q, so homing an arm while
+    the other is displaced is exactly the situation :func:`_assert_idle_arm_parked` refuses. Nothing
+    can make that first move fully safe when both arms are out of place, so it is done with the
+    workspace-clear assumption a manual `home` already carries, and warns when it applies.
+    """
+    from tiptop.yam import ARMS, other_arm
+
+    tdf = tiptop_cfg().robot.time_dilation_factor
+    for arm in ARMS:
+        # Only arms this session warmed solvers for. A single-arm config still has the other arm
+        # physically present, but it is never planned for, so it cannot be homed through cuRobo.
+        if f"bimanual_yam_{arm}" not in container.solvers:
+            continue
+        with active_arm(arm):
+            idle = other_arm(arm)
+            measured = np.asarray(container.robot.get_arm_state(idle)["q"], dtype=np.float64)[:6]
+            if float(np.abs(measured - np.asarray(NEUTRAL_Q)).max()) > IDLE_ARM_TOLERANCE_RAD:
+                _log.warning(
+                    f"Homing the {arm} arm while the {idle} arm is away from the neutral posture — "
+                    "the collision model does not describe the parked arm for this move. Keep the "
+                    "workspace clear and watch the arms."
+                )
+            go_to_home(time_dilation_factor=tdf, motion_gen=container.motion_gen)
+
+
+async def _run_one_arm(
+    session: aiohttp.ClientSession,
+    container: _DemoContainer,
+    save_dir: Path,
+    task_instruction: str,
+    arm: str,
+    base_y: float,
+) -> dict:
+    """Perceive, plan and execute one arm's share of the goal. Returns segments + metadata.
+
+    Perception runs fresh for each arm — the same choice the sim harness makes — because by the time
+    the second arm plans, the first has already moved its objects and the world model from before is
+    stale. The goal is not re-grounded though: ``arm_goal_builder`` filters the atoms Gemini already
+    produced for the whole instruction, so the two arms cannot disagree about the task and neither
+    depends on the VLM naming an object the same way twice.
+    """
+    cfg = tiptop_cfg()
+    tdf = cfg.robot.time_dilation_factor
+    arm_dir = save_dir / arm
+    segments, meta = [], {"arm": arm}
+
+    _assert_idle_arm_parked(container)
+
+    # Getting to the capture posture is a real commanded motion inside the recorded window, so it is
+    # recorded as a segment. Without that the video would show the arm moving while the action
+    # channel said "hold" — the proprioception/action mismatch the capture rewrite exists to avoid.
+    gripper_cmd = _current_gripper_command(container.robot, arm)
+    homing = go_to_home(time_dilation_factor=tdf, motion_gen=container.motion_gen)
+    if homing is not None:
+        segments.append(
+            segment_from_motion(
+                arm, homing["positions"], homing["velocities"], homing["t_start"], homing["t_end"], gripper_cmd
+            )
+        )
+    # Opening the gripper is a COMMAND, inside the recorded window, that no plan step covers. Left
+    # out, the action channel would keep saying "closed" for the whole perception pause while the
+    # video shows the jaws opening -- the same command/observation mismatch the parking segments
+    # above exist to avoid. Recorded as a stationary segment at the pose the arm is already holding.
+    gripper_open_start = time.time()
+    try:
+        _open_gripper_if_needed(container)
+    except Exception as e:
+        _log.exception(f"Gripper open/check failed for the {arm} arm: {e}")
+    gripper_after = _current_gripper_command(container.robot, arm)
+    if gripper_after != gripper_cmd:
+        # Two rows so the change spans the measured actuation window rather than landing on an
+        # instant; the arm is stationary throughout, so both carry the same pose at zero velocity.
+        held = np.tile(np.asarray(container.robot.get_joint_positions(), dtype=np.float32), (2, 1))
+        segments.append(segment_from_motion(arm, held, None, gripper_open_start, time.time(), gripper_after))
+    gripper_cmd = gripper_after
+
+    observation = capture_live_observation(container)
+    perception_start = time.perf_counter()
+    env, all_surfaces, processed_scene, grounded_atoms = await run_perception(
+        session,
+        observation,
+        task_instruction,
+        arm_dir,
+        depth_estimator=container.depth_estimator,
+        gripper_mask=container.gripper_mask,
+        goal_builder=arm_goal_builder(arm, base_y),
+    )
+    meta["perception_duration"] = time.perf_counter() - perception_start
+    meta["grounded_atoms"] = grounded_atoms
+    meta["q_at_capture"] = observation.q_init
+    meta["world_from_cam"] = observation.world_from_cam
+    save_run_outputs(arm_dir, env, processed_scene.grasps)
+
+    if not grounded_atoms:
+        _log.info(f"{arm} arm: nothing on its side of the midline to do; skipping")
+        meta["status"] = "nothing_to_do"
+        return {"segments": [s for s in segments if s is not None], "meta": meta, "plan_path": None}
+
+    _log.info(f"{arm} arm: planning for {[a['args'] for a in grounded_atoms]}")
+    cutamp_plan, planning_duration, failure_reason = run_planning(
+        env,
+        container.tamp_config,
+        q_init=observation.q_init,
+        ik_solver=container.ik_solver,
+        grasps=processed_scene.grasps,
+        motion_gen=container.motion_gen,
+        all_surfaces=all_surfaces,
+        experiment_dir=arm_dir / "cutamp",
+        cost_overrides=container.cost_overrides,
+    )
+    meta["planning_duration"] = planning_duration
+    meta["planning_failure_reason"] = failure_reason
+    meta["planning_success"] = cutamp_plan is not None
+    if cutamp_plan is None:
+        _log.warning(f"{arm} arm: no plan found ({failure_reason})")
+        meta["status"] = "no_plan"
+        return {"segments": [s for s in segments if s is not None], "meta": meta, "plan_path": None}
+
+    plan_path = save_dir / f"tiptop_plan_{arm}.json"
+    trace_cfg = resolve_trace_cfg(container.cost_overrides)
+    save_tiptop_plan(serialize_plan(cutamp_plan, observation.q_init, trace_cfg=trace_cfg), plan_path)
+
+    _log.info(f"{arm} arm: executing plan ({len(cutamp_plan)} steps)")
+    timeline: list[dict] = []
+    execute_cutamp_plan(cutamp_plan, client=container.robot, timeline=timeline)
+    segments.extend(segments_from_plan(arm, plan_path, timeline))
+
+    # Park this arm again so the OTHER arm's collision model is true before it plans.
+    gripper_cmd = _current_gripper_command(container.robot, arm)
+    parking = go_to_home(time_dilation_factor=tdf, motion_gen=container.motion_gen)
+    if parking is not None:
+        segments.append(
+            segment_from_motion(
+                arm, parking["positions"], parking["velocities"], parking["t_start"], parking["t_end"], gripper_cmd
+            )
+        )
+
+    meta["status"] = "executed"
+    return {"segments": [s for s in segments if s is not None], "meta": meta, "plan_path": plan_path}
+
+
+async def _run_yam_rollout(
+    session: aiohttp.ClientSession,
+    container: _DemoContainer,
+    save_dir: Path,
+    task_instruction: str,
+) -> dict:
+    """One sequential-bimanual episode: each arm plans and executes its own share, in turn.
+
+    This is the shape ``droid-sim-evals/eval/yam_tiptop_eval.py --bimanual`` runs in simulation —
+    split the objects at the robot's midline, give each arm the part of the goal on its side, and
+    run the two plans back to back inside one rollout. It is sequential bimanual, not simultaneous
+    dual-arm TAMP: cuTAMP plans one kinematic chain, and the arm that is not planning is a locked
+    obstacle in the other's collision model.
+
+    Cameras and the state sampler run across the WHOLE episode, including the perception and
+    planning pauses between the two arms. Those pauses are genuinely stationary and are recorded as
+    explicit hold rows, so the frames are honest — they are simply not very interesting, and they
+    are what the non-idle training filter is for.
+    """
+    cfg = tiptop_cfg()
+    arms = configured_arms()
+    base_y = float(cfg.robot.get("base_y", 0.0))
+    _log.info(f"Bimanual rollout: arms {arms}, splitting objects at y = {base_y}")
+
+    cameras_to_record, lerobot_cameras = _yam_recording_targets(container, save_dir)
+    if not cameras_to_record:
+        raise RuntimeError("no cameras configured to record; check the `cameras` block of the config")
+
+    segments, per_arm, plan_paths = [], [], {}
+    with BimanualJointSampler(
+        host=cfg.robot.get("host", "127.0.0.1"),
+        port=int(os.environ.get("TIPTOP_STATE_PORT", cfg.robot.get("state_port", 5557))),
+    ) as sampler:
+        with record_cameras(cameras_to_record) as rec_window:
+            q_start, gripper_start = _read_bimanual_start(container.robot)
+            for arm in arms:
+                with active_arm(arm):
+                    result = await _run_one_arm(session, container, save_dir, task_instruction, arm, base_y)
+                segments.extend(result["segments"])
+                per_arm.append(result["meta"])
+                if result["plan_path"] is not None:
+                    plan_paths[arm] = result["plan_path"].name
+
+    # The combined plan index. data-collection counts an episode as collected only when
+    # `tiptop_plan.json` exists next to `robot_state.npz` (collect/config.py::_is_complete), and a
+    # bimanual episode has one plan per arm — so this names them rather than being a plan itself.
+    (save_dir / "tiptop_plan.json").write_text(
+        json.dumps(
+            {
+                "version": "2.0.0-bimanual",
+                "embodiment": "bimanual_yam",
+                "arms": arms,
+                "plans": plan_paths,
+                "instruction": task_instruction,
+            },
+            indent=2,
+            cls=NumpyEncoder,
+        )
+    )
+
+    n_frames = 0
+    npz_path = dump_bimanual_episode(
+        save_dir,
+        segments=segments,
+        joint_samples=sampler.samples,
+        instruction=task_instruction,
+        cameras=lerobot_cameras,
+        q_start=q_start,
+        gripper_start=gripper_start,
+        fps=LEROBOT_FPS,
+        config_id=os.environ.get("TIPTOP_CONFIG_ID"),
+        record_start=rec_window.get("t_start"),
+        record_stop=rec_window.get("t_stop"),
+        arms_used=[m["arm"] for m in per_arm if m.get("status") == "executed"],
+    )
+    if npz_path is not None:
+        n_frames = json.loads((save_dir / "_meta.json").read_text()).get("n_frames", 0)
+
+    return {"n_frames": n_frames, "per_arm": per_arm, "planned": bool(plan_paths)}
+
+
+async def _run_yam_dual_rollout(
+    session: aiohttp.ClientSession,
+    container: _DemoContainer,
+    save_dir: Path,
+    task_instruction: str,
+) -> dict:
+    """One SIMULTANEOUS dual-arm handover episode: one perceive-plan-execute cycle against the
+    12-DOF ``bimanual_yam_dual`` embodiment.
+
+    Unlike :func:`_run_yam_rollout`, this is NOT a per-arm loop: cuTAMP plans and collision-checks
+    both hands inside one 12-DOF configuration directly (see ``bimanual_yam_dual.yml``'s
+    self-collision spheres and ``DualKinematicConstraint``), so there is no "arm that isn't planning
+    is a locked obstacle" step and no need to re-perceive between arms — one perception pass and one
+    cuTAMP call cover the whole episode. :func:`tiptop.yam.task_split.handover_goal_builder` narrows
+    the grounded goal to the single atom that actually needs a handover (v1: at most one per
+    episode, a domain constraint of ``handover_tamp_operators``, not a simplification).
+    """
+    cfg = tiptop_cfg()
+    tdf = cfg.robot.time_dilation_factor
+    base_y = float(cfg.robot.get("base_y", 0.0))
+    _log.info(f"Dual-arm rollout: handover objects split at y = {base_y}")
+
+    cameras_to_record, lerobot_cameras = _yam_recording_targets(container, save_dir)
+    if not cameras_to_record:
+        raise RuntimeError("no cameras configured to record; check the `cameras` block of the config")
+
+    segments: list = []
+    meta: dict = {"arm": "dual"}
+    plan_path = None
+
+    with BimanualJointSampler(
+        host=cfg.robot.get("host", "127.0.0.1"),
+        port=int(os.environ.get("TIPTOP_STATE_PORT", cfg.robot.get("state_port", 5557))),
+    ) as sampler:
+        with record_cameras(cameras_to_record) as rec_window:
+            q_start, gripper_start = _read_bimanual_start(container.robot)
+
+            # Getting to the capture posture is a real commanded motion inside the recorded window
+            # (same reasoning as _run_one_arm's homing segment).
+            gripper_cmd = (
+                _current_gripper_command(container.robot, "left"),
+                _current_gripper_command(container.robot, "right"),
+            )
+            homing = go_to_dual_home(time_dilation_factor=tdf, motion_gen=container.motion_gen)
+            if homing is not None:
+                segments.append(
+                    segment_from_motion(
+                        "dual", homing["positions"], homing["velocities"],
+                        homing["t_start"], homing["t_end"], gripper_cmd,
+                    )
+                )
+            gripper_open_start = time.time()
+            for arm in ("left", "right"):
+                try:
+                    _open_gripper_if_needed(container, arm=arm)
+                except Exception as e:
+                    _log.exception(f"Gripper open/check failed for the {arm} arm: {e}")
+            gripper_after = (
+                _current_gripper_command(container.robot, "left"),
+                _current_gripper_command(container.robot, "right"),
+            )
+            if gripper_after != gripper_cmd:
+                held = np.tile(np.asarray(container.robot.get_dual_joint_positions(), dtype=np.float32), (2, 1))
+                segments.append(
+                    segment_from_motion("dual", held, None, gripper_open_start, time.time(), gripper_after)
+                )
+            gripper_cmd = gripper_after
+
+            observation = capture_live_observation(container)
+            perception_start = time.perf_counter()
+            env, all_surfaces, processed_scene, grounded_atoms = await run_perception(
+                session,
+                observation,
+                task_instruction,
+                save_dir,
+                depth_estimator=container.depth_estimator,
+                gripper_mask=container.gripper_mask,
+                goal_builder=handover_goal_builder(base_y),
+            )
+            meta["perception_duration"] = time.perf_counter() - perception_start
+            meta["grounded_atoms"] = grounded_atoms
+            meta["q_at_capture"] = observation.q_init
+            meta["world_from_cam"] = observation.world_from_cam
+            save_run_outputs(save_dir, env, processed_scene.grasps)
+
+            if grounded_atoms:
+                _log.info(f"dual: planning handover for {[a['args'] for a in grounded_atoms]}")
+                cutamp_plan, planning_duration, failure_reason = run_planning(
+                    env,
+                    container.tamp_config,
+                    q_init=observation.q_init,
+                    ik_solver=container.ik_solver,
+                    grasps=processed_scene.grasps,
+                    motion_gen=container.motion_gen,
+                    all_surfaces=all_surfaces,
+                    experiment_dir=save_dir / "cutamp",
+                    cost_overrides=container.cost_overrides,
+                )
+                meta["planning_duration"] = planning_duration
+                meta["planning_failure_reason"] = failure_reason
+                meta["planning_success"] = cutamp_plan is not None
+
+                if cutamp_plan is None:
+                    _log.warning(f"dual: no plan found ({failure_reason})")
+                    meta["status"] = "no_plan"
+                else:
+                    plan_path = save_dir / "tiptop_plan.json"
+                    trace_cfg = resolve_trace_cfg(container.cost_overrides)
+                    save_tiptop_plan(serialize_plan(cutamp_plan, observation.q_init, trace_cfg=trace_cfg), plan_path)
+
+                    _log.info(f"dual: executing plan ({len(cutamp_plan)} steps)")
+                    timeline: list[dict] = []
+                    execute_cutamp_dual_plan(cutamp_plan, client=container.robot, timeline=timeline)
+                    segments.extend(segments_from_dual_plan(plan_path, timeline))
+
+                    gripper_cmd = (
+                        _current_gripper_command(container.robot, "left"),
+                        _current_gripper_command(container.robot, "right"),
+                    )
+                    parking = go_to_dual_home(time_dilation_factor=tdf, motion_gen=container.motion_gen)
+                    if parking is not None:
+                        segments.append(
+                            segment_from_motion(
+                                "dual", parking["positions"], parking["velocities"],
+                                parking["t_start"], parking["t_end"], gripper_cmd,
+                            )
+                        )
+                    meta["status"] = "executed"
+            else:
+                _log.info("dual: nothing needs a handover this episode; skipping")
+                meta["status"] = "nothing_to_do"
+
+    n_frames = 0
+    npz_path = dump_bimanual_episode(
+        save_dir,
+        segments=[s for s in segments if s is not None],
+        joint_samples=sampler.samples,
+        instruction=task_instruction,
+        cameras=lerobot_cameras,
+        q_start=q_start,
+        gripper_start=gripper_start,
+        fps=LEROBOT_FPS,
+        config_id=os.environ.get("TIPTOP_CONFIG_ID"),
+        record_start=rec_window.get("t_start"),
+        record_stop=rec_window.get("t_stop"),
+        arms_used=["dual"] if meta.get("status") == "executed" else [],
+    )
+    if npz_path is not None:
+        n_frames = json.loads((save_dir / "_meta.json").read_text()).get("n_frames", 0)
+
+    return {"n_frames": n_frames, "per_arm": [meta], "planned": plan_path is not None}
+
+
 async def _run_scene_reset(
     session: aiohttp.ClientSession, container: _DemoContainer, config: TAMPConfiguration, output_dir: str
 ) -> None:
@@ -975,7 +1612,14 @@ async def _run_scene_reset(
         # Whatever the rollout ended holding has to go before we look at the scene, and the arm has
         # to be out of the cameras' way. Both no-op when already so, as at the start of an episode.
         _log.info("Scene reset: returning home and opening the gripper")
-        go_to_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+        if configured_arms():
+            # A reset is a normal single-arm plan, run with whichever arm the config starts on, so
+            # the OTHER arm has to be where that arm's collision model believes it is. Homing both
+            # first is also what makes the check below pass in the ordinary case.
+            home_all_arms(container)
+            _assert_idle_arm_parked(container)
+        else:
+            go_to_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
         _open_gripper_if_needed(container)
         go_to_capture(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
 
@@ -1044,6 +1688,13 @@ async def _run_scene_reset(
 async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration, output_dir: str, execute_plan: bool):
     """Main async entrypoint for the live robot demo."""
     cfg = tiptop_cfg()
+    arms = configured_arms()
+    bimanual = bool(arms)
+    dual_handover = cfg.robot.type == "bimanual_yam_dual"
+    if bimanual:
+        _log.info(f"Bimanual YAM session: arms {arms} (sequential — one cuTAMP plan per arm per episode)")
+    elif dual_handover:
+        _log.info("Dual-arm YAM session: bimanual_yam_dual (simultaneous — one cuTAMP plan per episode)")
 
     # Force TCP handshake for every request
     connector = aiohttp.TCPConnector(limit=10, force_close=True)
@@ -1062,7 +1713,20 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # nudges; 'reset' is a whole unrecorded perceive-plan-execute cycle, hence async.
                 if task_instruction in ROBOT_COMMANDS:
                     if task_instruction == "reset":
-                        await _run_scene_reset(session, container, config, output_dir)
+                        if dual_handover:
+                            # build_reset_goal/_plan_largest_solvable_reset assume a single-arm
+                            # pick-and-place domain; handover_tamp_operators has no general
+                            # Pick/Place to reset an arbitrary scene with. Refuse loudly rather than
+                            # let this hit arm_of("dual") deep inside the single-arm reset path.
+                            _log.error(
+                                "'reset' is not supported for bimanual_yam_dual yet -- move the "
+                                "object(s) back by hand between handover episodes."
+                            )
+                            _emit_event({
+                                "event": "reset_failed", "dir": "", "error": "unsupported in dual mode",
+                            })
+                        else:
+                            await _run_scene_reset(session, container, config, output_dir)
                     else:
                         _run_robot_command(container, cfg, task_instruction)
                     continue
@@ -1075,14 +1739,35 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # matters most right after a force-stop abort, where the arm may be left
                 # mid-motion still gripping an object.
                 _log.info("Resetting robot for new episode: return home + open gripper (if not already)")
-                go_to_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
-                try:
-                    _open_gripper_if_needed(container)
-                except Exception as _e:
-                    _log.exception('Gripper open/check failed: ' + str(_e))
+                if bimanual:
+                    # Both arms, because each one's plans collision-check the other at the neutral
+                    # posture. Doing this BEFORE the recording starts keeps the episode's first
+                    # frames at a settled pose rather than mid-recovery.
+                    home_all_arms(container)
+                    for _arm in arms:
+                        with active_arm(_arm):
+                            try:
+                                _open_gripper_if_needed(container)
+                            except Exception as _e:
+                                _log.exception(f"Gripper open/check failed for the {_arm} arm: {_e}")
+                elif dual_handover:
+                    # Both arms move together for a dual session -- there is no "other arm locked as
+                    # an obstacle" step to protect (see _run_yam_dual_rollout's docstring).
+                    go_to_dual_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+                    for _arm in ("left", "right"):
+                        try:
+                            _open_gripper_if_needed(container, arm=_arm)
+                        except Exception as _e:
+                            _log.exception(f"Gripper open/check failed for the {_arm} arm: {_e}")
+                else:
+                    go_to_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+                    try:
+                        _open_gripper_if_needed(container)
+                    except Exception as _e:
+                        _log.exception("Gripper open/check failed: " + str(_e))
 
-                _log.debug("Moving robot to capture joint positions")
-                go_to_capture(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+                    _log.debug("Moving robot to capture joint positions")
+                    go_to_capture(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
 
                 now = datetime.now()
                 timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
@@ -1105,6 +1790,81 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 _resolved = container.curobo_config_summary or {}
                 _log.info(f"cuRobo config for this rollout: {json.dumps(_resolved)}")
                 (save_dir / "curobo_config.json").write_text(json.dumps(_resolved, indent=2))
+                if bimanual:
+                    # Sequential-bimanual rollout: each arm perceives, plans and executes its own
+                    # share of the goal in turn. It owns the whole recorded window (cameras + the
+                    # 14-D state sampler), so it stands apart from the single-arm body below rather
+                    # than being threaded through it with per-arm conditionals.
+                    try:
+                        result = await _run_yam_rollout(session, container, save_dir, task_instruction)
+                        _emit_event({"event": "rollout_saved", "dir": str(save_dir), "n_frames": result["n_frames"]})
+                        save_run_metadata(
+                            save_dir=save_dir,
+                            timestamp=iso_timestamp,
+                            task_instruction=task_instruction,
+                            q_at_capture=result["per_arm"][0].get("q_at_capture") if result["per_arm"] else None,
+                            world_from_cam=result["per_arm"][0].get("world_from_cam") if result["per_arm"] else None,
+                            perception_duration=sum(m.get("perception_duration") or 0.0 for m in result["per_arm"]),
+                            grounded_atoms=[a for m in result["per_arm"] for a in (m.get("grounded_atoms") or [])],
+                            planning_success=result["planned"],
+                            planning_failure_reason="; ".join(
+                                f"{m['arm']}: {m['planning_failure_reason']}"
+                                for m in result["per_arm"]
+                                if m.get("planning_failure_reason")
+                            )
+                            or None,
+                            planning_duration=sum(m.get("planning_duration") or 0.0 for m in result["per_arm"]),
+                        )
+                        (save_dir / "bimanual_summary.json").write_text(
+                            json.dumps({"arms": arms, "per_arm": result["per_arm"]}, indent=2, cls=NumpyEncoder)
+                        )
+                        _log.info(
+                            f"Bimanual rollout finished: {[(m['arm'], m.get('status')) for m in result['per_arm']]}"
+                        )
+                    except Exception:
+                        _log.exception("Bimanual rollout failed")
+                        raise
+                    finally:
+                        remove_file_handler(file_handler)
+                    if execute_plan:
+                        final_dir = _label_rollout(save_dir, output_dir, timestamp)
+                        _spawn_postprocess(final_dir)
+                    continue
+
+                if dual_handover:
+                    # Simultaneous dual-arm/handover rollout: one perceive-plan-execute cycle
+                    # against the 12-DOF chain, not a per-arm loop. Owns the whole recorded window
+                    # the same way the sequential-bimanual branch above does.
+                    try:
+                        result = await _run_yam_dual_rollout(session, container, save_dir, task_instruction)
+                        _emit_event({"event": "rollout_saved", "dir": str(save_dir), "n_frames": result["n_frames"]})
+                        meta0 = result["per_arm"][0] if result["per_arm"] else {}
+                        save_run_metadata(
+                            save_dir=save_dir,
+                            timestamp=iso_timestamp,
+                            task_instruction=task_instruction,
+                            q_at_capture=meta0.get("q_at_capture"),
+                            world_from_cam=meta0.get("world_from_cam"),
+                            perception_duration=meta0.get("perception_duration") or 0.0,
+                            grounded_atoms=meta0.get("grounded_atoms") or [],
+                            planning_success=result["planned"],
+                            planning_failure_reason=meta0.get("planning_failure_reason"),
+                            planning_duration=meta0.get("planning_duration") or 0.0,
+                        )
+                        (save_dir / "dual_summary.json").write_text(
+                            json.dumps({"per_arm": result["per_arm"]}, indent=2, cls=NumpyEncoder)
+                        )
+                        _log.info(f"Dual-arm rollout finished: status={meta0.get('status')}")
+                    except Exception:
+                        _log.exception("Dual-arm rollout failed")
+                        raise
+                    finally:
+                        remove_file_handler(file_handler)
+                    if execute_plan:
+                        final_dir = _label_rollout(save_dir, output_dir, timestamp)
+                        _spawn_postprocess(final_dir)
+                    continue
+
                 try:
                     # Capture robot state and compute camera pose
                     observation = capture_live_observation(container)
@@ -1146,7 +1906,9 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                             experiment_dir=save_dir / "cutamp",
                             cost_overrides=container.cost_overrides,
                         )
-                        _log.info(f"Perception and cuTAMP planning took: {perception_duration + planning_duration:.2f}s")
+                        _log.info(
+                            f"Perception and cuTAMP planning took: {perception_duration + planning_duration:.2f}s"
+                        )
                         if cutamp_plan is not None:
                             plan_path = save_dir / "tiptop_plan.json"
                             trace_cfg = resolve_trace_cfg(container.cost_overrides)
@@ -1193,9 +1955,7 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                                     JointSampler() as joint_sampler,
                                 ):
                                     with record_cameras(cameras_to_record) as rec_window:
-                                        execute_cutamp_plan(
-                                            cutamp_plan, client=container.robot, timeline=exec_timeline
-                                        )
+                                        execute_cutamp_plan(cutamp_plan, client=container.robot, timeline=exec_timeline)
                                 # Save the raw measured gripper trace (wall_seconds, width_m) so the
                                 # open<->close shape can be inspected directly (snap vs ramp).
                                 try:
@@ -1304,7 +2064,9 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # otherwise "collect another" would lose the whole warmed container and force
                 # a full re-warm. Log it (the traceback streams to the data-collection UI),
                 # then loop back to the task prompt so the user can just retry.
-                _log.exception(f"Rollout failed ({type(e).__name__}: {e}); keeping session warm, returning to task prompt")
+                _log.exception(
+                    f"Rollout failed ({type(e).__name__}: {e}); keeping session warm, returning to task prompt"
+                )
                 continue
 
 
@@ -1370,25 +2132,45 @@ def _sync_entrypoint(
         _log.info(f"cuRobo cost overrides active: {cost_overrides}")
         _log.info(f"Resolved time_dilation_factor={time_dilation_factor}")
 
-    config = build_tamp_config(
-        num_particles=num_particles,
-        max_planning_time=max_planning_time,
-        opt_steps=opt_steps_per_skeleton,
-        robot_type=cfg.robot.type,
-        time_dilation_factor=time_dilation_factor,
-        collision_activation_distance=0.0,
-        enable_visualizer=cutamp_visualize,
-        # move-cost norm for cuTAMP (Euclidean unless a cfg/tamp yml opts into "inf"), same as
-        # time_dilation_factor this is a TAMP-config knob, not a cuRobo cost weight.
-        traj_length_norm=resolve_traj_length_norm(cost_overrides),
-        grasp_orientation_cost=resolve_grasp_orientation_cost(cost_overrides),
-    )
+    # One TAMPConfiguration per planning embodiment. A sequential-bimanual YAM episode plans with
+    # both `bimanual_yam_left` and `bimanual_yam_right`, and TAMPConfiguration carries `robot`;
+    # every other robot yields a single entry, identical to before. `arm_mode`/`dual_task` only
+    # apply to the `bimanual_yam_dual` embodiment (_planning_robot_types() yields exactly one entry
+    # for it), and default to cuTAMP's own single-arm defaults everywhere else.
+    tamp_configs = {
+        robot_type: build_tamp_config(
+            num_particles=num_particles,
+            max_planning_time=max_planning_time,
+            opt_steps=opt_steps_per_skeleton,
+            robot_type=robot_type,
+            time_dilation_factor=time_dilation_factor,
+            collision_activation_distance=0.0,
+            enable_visualizer=cutamp_visualize,
+            # move-cost norm for cuTAMP (Euclidean unless a cfg/tamp yml opts into "inf"), same as
+            # time_dilation_factor this is a TAMP-config knob, not a cuRobo cost weight.
+            traj_length_norm=resolve_traj_length_norm(cost_overrides),
+            grasp_orientation_cost=resolve_grasp_orientation_cost(cost_overrides),
+            arm_mode=cfg.robot.get("arm_mode", "single"),
+            dual_task=cfg.robot.get("dual_task", "parallel"),
+            max_motion_refine_attempts=resolve_max_motion_refine_attempts(cost_overrides),
+        )
+        for robot_type in _planning_robot_types()
+    }
+    # The scene-reset path takes a single config; it runs under whichever arm is active, and the
+    # first entry is the arm the config starts on.
+    config = tamp_configs[_planning_robot_types()[0]]
 
     global _executor_pool
     setup_logging(level=logging.DEBUG)
 
     container = get_demo_container(
-        num_particles, config.coll_n_spheres, 0.0, enable_recording, cost_overrides, curobo_config_summary
+        num_particles,
+        config.coll_n_spheres,
+        0.0,
+        enable_recording,
+        cost_overrides,
+        curobo_config_summary,
+        tamp_configs=tamp_configs,
     )
     # Workers fork from a process that has already initialised CUDA (curobo + the ZED cameras), so
     # they inherit its CUDA context. That costs no extra VRAM while we are alive, but the driver

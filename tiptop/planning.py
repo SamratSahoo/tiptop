@@ -54,11 +54,18 @@ def build_tamp_config(
     enable_visualizer: bool = False,
     traj_length_norm: float = 2.0,
     grasp_orientation_cost: bool = False,
+    arm_mode: str = "single",
+    dual_task: str = "parallel",
+    max_motion_refine_attempts: int | None = 32,
 ) -> TAMPConfiguration:
     """Build a TAMPConfiguration with TiPToP defaults.
 
     See https://github.com/tiptop-robot/cuTAMP/blob/main/cutamp/config.py for
     documentation of each TAMPConfiguration parameter.
+
+    ``arm_mode``/``dual_task`` opt into cuTAMP's simultaneous dual-arm planning (only valid with
+    ``robot_type == "bimanual_yam_dual"`` -- cuTAMP's own ``validate_tamp_config`` enforces the two
+    travel together). Every other embodiment leaves these at their single-arm defaults.
     """
     return TAMPConfiguration(
         num_particles=num_particles,
@@ -67,8 +74,10 @@ def build_tamp_config(
         m2t2_grasps=True,
         prop_satisfying_break=0.1,
         robot=robot_type,
+        arm_mode=arm_mode,
+        dual_task=dual_task,
         curobo_plan=True,
-        max_motion_refine_attempts=32,
+        max_motion_refine_attempts=max_motion_refine_attempts,
         warmup_ik=False,
         warmup_motion_gen=False,
         num_initial_plans=10,
@@ -281,5 +290,15 @@ def serialize_plan(cutamp_plan: list[dict], q_init: Float[np.ndarray, "d"], trac
                 }
             )
         elif step["type"] == "gripper":
-            steps.append({"type": "gripper", "label": step["label"], "action": step["action"]})
-    return {"version": "1.3.0", "q_init": q_init, "steps": steps}
+            entry = {"type": "gripper", "label": step["label"], "action": step["action"]}
+            # Present only on cuTAMP's dual-arm path (motion_solver.py::gripper_step): "arms" names
+            # every hand this step actuates (plural -> simultaneous, e.g. PickBoth/PlaceBoth); "arm"
+            # is set too when exactly one hand acts (PickGiver/PlaceTaker, or one side of a
+            # Handover), for consumers that only care about a single hand. Single-arm cuTAMP steps
+            # never carry either key, so this is purely additive for existing plans.
+            if "arm" in step:
+                entry["arm"] = step["arm"]
+            if "arms" in step:
+                entry["arms"] = list(step["arms"])
+            steps.append(entry)
+    return {"version": "1.4.0", "q_init": q_init, "steps": steps}
