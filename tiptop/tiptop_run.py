@@ -687,11 +687,24 @@ def create_tamp_environment(
     for surface in all_surfaces:
         statics.append(surface)
 
-    # Create TAMP environment
+    # Create TAMP environment.
+    #
+    # Detected surfaces are `pick_transparent`: an open container (a plate, a bowl) reconstructs as
+    # a mesh whose cuRobo collision proxy is a filled OBB spanning its full height, so every object
+    # resting in it is embedded in an obstacle and cannot be picked -- measured on a scene reset,
+    # grasp IK for the three toys was 0/25, 0/1 and 13/30 with the plate in the world and 25/25,
+    # 1/1 and 30/30 with it out. cuTAMP hides them from the IK solvers and from the reach-in motion
+    # segments only; they stay full obstacles for transit, keep their true top face for placement
+    # height, and are still screened against a PLACED object (movable_to_world and the candidate-
+    # placement filter keep the full checker), so placing ONTO the plate is unaffected. The table
+    # is excluded because it is not
+    # a reconstruction: segment_table_with_ransac already sinks it TABLE_BOX_CLEARANCE below the
+    # detected plane for exactly this reason.
     env = TAMPEnvironment(
         name="tiptop_cutamp",
         movables=movables,
         statics=statics,
+        pick_transparent=[surface.name for surface in surfaces],
         type_to_objects={"Movable": movables, "Surface": all_surfaces},
         goal_state=frozenset(goal_state),
     )
@@ -1580,6 +1593,84 @@ async def _run_yam_dual_rollout(
     return {"n_frames": n_frames, "per_arm": [meta], "planned": plan_path is not None}
 
 
+def _execute_plan_recorded(
+    container: _DemoContainer,
+    cutamp_plan: list,
+    plan_path: Path,
+    save_dir: Path,
+    instruction: str,
+) -> int:
+    """Execute a single-arm cuTAMP plan with the cameras and state samplers running.
+
+    Writes the camera mp4s, ``_gripper_trace.json`` and the data-collection raw episode
+    (``robot_state.npz`` + ``_meta.json``, ARCHITECTURE.md §3) into ``save_dir``, and returns the
+    episode's frame count -- 0 when the dump was skipped (see :func:`dump_raw_episode`).
+
+    Shared by the rollout body and the scene reset, which record identically; only where the
+    artifacts land differs. Single-arm only: the bimanual episode format is assembled from the
+    per-arm segments :func:`_run_one_arm` produces, which neither caller has here.
+    """
+    # Convert SVO -> MP4 after execution. Depth is disabled during conversion
+    # (see convert_svo_to_mp4) so it won't OOM the GPU.
+    cameras_to_record = [
+        (container.external_cam, save_dir / "external_cam.svo", save_dir / "external_cam.mp4"),
+    ]
+    if container.external_cam_2 is not None:
+        cameras_to_record.append(
+            (container.external_cam_2, save_dir / "external_cam_2.svo", save_dir / "external_cam_2.mp4"),
+        )
+    if isinstance(container.cam, ZedCamera):
+        cameras_to_record.append((container.cam, save_dir / "hand_cam.svo", save_dir / "hand_cam.mp4"))
+
+    # Sample the measured arm + gripper state over their own sockets while the cameras record and
+    # the plan executes; capture per-step wall-clock times so the export can align camera frames to
+    # the control timeline. The samplers are OUTER and record_cameras INNER so the cameras stop the
+    # instant execution returns: were the cameras outer, their exit would run while the ~2 s
+    # sampler-thread joins finished, padding the video tail with stationary frames past the last
+    # state frame.
+    exec_timeline: list[dict] = []
+    with GripperSampler(container.robot) as gripper_sampler, JointSampler() as joint_sampler:
+        with record_cameras(cameras_to_record) as rec_window:
+            execute_cutamp_plan(cutamp_plan, client=container.robot, timeline=exec_timeline)
+
+    # Save the raw measured gripper trace (wall_seconds, width_m) so the open<->close shape can be
+    # inspected directly (snap vs ramp).
+    try:
+        (save_dir / "_gripper_trace.json").write_text(json.dumps({"width_samples": gripper_sampler.width_samples}))
+    except Exception:
+        _log.exception("Failed to write gripper trace")
+
+    # mp4s are written on record_cameras exit; map them to DROID image keys.
+    lerobot_cameras = {"observation.images.exterior_1_left": "external_cam.mp4"}
+    if container.external_cam_2 is not None:
+        lerobot_cameras["observation.images.exterior_2_left"] = "external_cam_2.mp4"
+    if isinstance(container.cam, ZedCamera):
+        lerobot_cameras["observation.images.wrist_left"] = "hand_cam.mp4"
+
+    # Data-collection raw episode (robot_state.npz + _meta.json, ARCHITECTURE §3):
+    # MEASURED proprioception from the samplers + COMMANDED plan actions, decoupled.
+    n_frames = 0
+    try:
+        raw_path = dump_raw_episode(
+            save_dir,
+            plan_path,
+            timeline=exec_timeline,
+            joint_samples=joint_sampler.samples,
+            gripper_samples=gripper_sampler.samples,
+            instruction=instruction,
+            cameras=lerobot_cameras,
+            fps=LEROBOT_FPS,
+            config_id=os.environ.get("TIPTOP_CONFIG_ID"),
+            record_start=rec_window.get("t_start"),
+            record_stop=rec_window.get("t_stop"),
+        )
+        if raw_path is not None:
+            n_frames = json.loads((save_dir / "_meta.json").read_text()).get("n_frames", 0)
+    except Exception:
+        _log.exception("Failed to dump raw episode")
+    return n_frames
+
+
 async def _run_scene_reset(
     session: aiohttp.ClientSession, container: _DemoContainer, config: TAMPConfiguration, output_dir: str
 ) -> None:
@@ -1658,16 +1749,41 @@ async def _run_scene_reset(
         )
         if cutamp_plan is None:
             raise RuntimeError(f"cuTAMP found no reset plan for any of {sorted(skipped)}")
-        save_tiptop_plan(serialize_plan(cutamp_plan, observation.q_init), save_dir / "tiptop_plan.json")
+        plan_path = save_dir / "tiptop_plan.json"
+        save_tiptop_plan(serialize_plan(cutamp_plan, observation.q_init), plan_path)
 
         _log.info(f"Executing scene reset ({len(moved)} object(s) back to the table: {moved})")
-        execute_cutamp_plan(cutamp_plan, client=container.robot)
+        # A reset executes like a rollout, so it records like one: cameras + measured state land in
+        # this reset's own directory. That does NOT make it an episode -- resets/ is not one of
+        # data-collection's status buckets (server/lib/episodes.js STATUS_DIRS) and neither the
+        # collected-episode count nor the LeRobot build looks outside success/ (collect/config.py
+        # _count_collected, collect/build_lerobot.py), so a reset still cannot reach training data.
+        # Recording failures propagate to the handler below rather than falling back to a bare
+        # execute: the plan may already have run, and re-running it would move the objects twice.
+        n_frames = 0
+        if container.enable_recording and not configured_arms():
+            n_frames = _execute_plan_recorded(
+                container, cutamp_plan, plan_path, save_dir, f"scene reset: {instruction}"
+            )
+            _log.info(f"Recorded the reset: {n_frames} state frames + camera mp4s under {save_dir}")
+        else:
+            if container.enable_recording:
+                _log.info("Reset recording is single-arm only (see _execute_plan_recorded); executing unrecorded")
+            execute_cutamp_plan(cutamp_plan, client=container.robot)
         go_to_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
         if skipped:
             _log.warning(f"Scene reset complete, but {skipped} could not be planned -- move those by hand")
         else:
             _log.info("Scene reset complete")
-        _emit_event({"event": "reset_done", "dir": str(save_dir), "moved": len(moved), "skipped": skipped})
+        _emit_event(
+            {
+                "event": "reset_done",
+                "dir": str(save_dir),
+                "moved": len(moved),
+                "skipped": skipped,
+                "n_frames": n_frames,
+            }
+        )
     except KeyboardInterrupt:
         _log.info("Scene reset preempted (Ctrl-C)")
         _emit_event({"event": "reset_failed", "dir": str(save_dir), "error": "aborted"})
@@ -1921,76 +2037,9 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                             _log.info("Executing plan...")
                             # Execute with optional recording
                             if container.enable_recording:
-                                # Convert SVO -> MP4 after execution. Depth is disabled during
-                                # conversion (see convert_svo_to_mp4) so it won't OOM the GPU.
-                                cameras_to_record = [
-                                    (
-                                        container.external_cam,
-                                        save_dir / "external_cam.svo",
-                                        save_dir / "external_cam.mp4",
-                                    ),
-                                ]
-                                if container.external_cam_2 is not None:
-                                    cameras_to_record.append(
-                                        (
-                                            container.external_cam_2,
-                                            save_dir / "external_cam_2.svo",
-                                            save_dir / "external_cam_2.mp4",
-                                        ),
-                                    )
-                                if isinstance(container.cam, ZedCamera):
-                                    cameras_to_record.append(
-                                        (container.cam, save_dir / "hand_cam.svo", save_dir / "hand_cam.mp4"),
-                                    )
-                                # Sample the measured arm + gripper state over their own sockets while
-                                # the cameras record and the plan executes; capture per-step wall-clock
-                                # times so the export can align camera frames to the control timeline.
-                                # The samplers are OUTER and record_cameras INNER so the cameras stop the
-                                # instant execution returns: were the cameras outer, their exit would run
-                                # while the ~2 s sampler-thread joins finished, padding the video tail
-                                # with stationary frames past the last state frame.
-                                exec_timeline: list[dict] = []
-                                with (
-                                    GripperSampler(container.robot) as gripper_sampler,
-                                    JointSampler() as joint_sampler,
-                                ):
-                                    with record_cameras(cameras_to_record) as rec_window:
-                                        execute_cutamp_plan(cutamp_plan, client=container.robot, timeline=exec_timeline)
-                                # Save the raw measured gripper trace (wall_seconds, width_m) so the
-                                # open<->close shape can be inspected directly (snap vs ramp).
-                                try:
-                                    (save_dir / "_gripper_trace.json").write_text(
-                                        json.dumps({"width_samples": gripper_sampler.width_samples})
-                                    )
-                                except Exception:
-                                    _log.exception("Failed to write gripper trace")
-                                # mp4s are written on record_cameras exit; map them to DROID image keys.
-                                lerobot_cameras = {"observation.images.exterior_1_left": "external_cam.mp4"}
-                                if container.external_cam_2 is not None:
-                                    lerobot_cameras["observation.images.exterior_2_left"] = "external_cam_2.mp4"
-                                if isinstance(container.cam, ZedCamera):
-                                    lerobot_cameras["observation.images.wrist_left"] = "hand_cam.mp4"
-                                # Data-collection raw episode (robot_state.npz + _meta.json, ARCHITECTURE §3):
-                                # MEASURED proprioception from the samplers + COMMANDED plan actions, decoupled.
-                                n_frames = 0
-                                try:
-                                    raw_path = dump_raw_episode(
-                                        save_dir,
-                                        plan_path,
-                                        timeline=exec_timeline,
-                                        joint_samples=joint_sampler.samples,
-                                        gripper_samples=gripper_sampler.samples,
-                                        instruction=task_instruction,
-                                        cameras=lerobot_cameras,
-                                        fps=LEROBOT_FPS,
-                                        config_id=os.environ.get("TIPTOP_CONFIG_ID"),
-                                        record_start=rec_window.get("t_start"),
-                                        record_stop=rec_window.get("t_stop"),
-                                    )
-                                    if raw_path is not None:
-                                        n_frames = json.loads((save_dir / "_meta.json").read_text()).get("n_frames", 0)
-                                except Exception:
-                                    _log.exception("Failed to dump raw episode")
+                                n_frames = _execute_plan_recorded(
+                                    container, cutamp_plan, plan_path, save_dir, task_instruction
+                                )
                                 _emit_event({"event": "rollout_saved", "dir": str(save_dir), "n_frames": n_frames})
                             else:
                                 execute_cutamp_plan(cutamp_plan, client=container.robot)
