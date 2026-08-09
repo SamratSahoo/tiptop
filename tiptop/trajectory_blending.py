@@ -253,6 +253,18 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
                                         fresh draw per plan, which is the point in dataset generation.
     """
     o = overrides or {}
+    # vae_retiming means the VAE manifold cost owns the clock (it optimizes each waypoint interval's
+    # duration inside cuRobo's trajopt, and the result is baked into the emitted waypoints).
+    # Blending would refit the geometry with a smoothing spline and re-time it from its own model,
+    # discarding that. Gated HERE rather than at the call site so it covers every caller and both
+    # backends -- and before the blend_* validation below, so a stale or malformed blend stanza in a
+    # vae_retiming config cannot raise on values that are about to be ignored anyway.
+    from tiptop.motion_planning import resolve_vae_retiming  # local: keeps this module import-light
+
+    if resolve_vae_retiming(o):
+        if o.get("blend_trajectory"):
+            _log.warning("vae_retiming active: trajectory blending (blend_*) is DISABLED for this run")
+        return BlendConfig(enabled=False)
     raw_ops = o.get("blend_ops")
     ops = tuple(str(x) for x in raw_ops) if raw_ops else None
     speed_scale = float(o.get("blend_speed_scale", _DEFAULT_SPEED_SCALE))

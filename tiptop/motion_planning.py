@@ -153,6 +153,13 @@ def apply_cost_overrides(cost: dict, overrides: dict | None) -> None:
         vm = cost.setdefault("vae_manifold_cfg", {"weight": 0.0, "n_joints": 7, "source_dt": 0.15})
         if overrides.get("vae_manifold_weight") is not None:
             vm["weight"] = float(overrides["vae_manifold_weight"])
+        # vae_retiming promotes each waypoint interval's duration to a trajopt decision variable,
+        # optimized by the same LBFGS pass as the waypoints. The three guard knobs are optional.
+        if resolve_vae_retiming(overrides):
+            vm["retiming"] = True
+            for key in ("retime_scale", "retime_smooth_weight", "retime_limit_weight"):
+                if overrides.get(key) is not None:
+                    vm[key] = float(overrides[key])
         # vae_path selects WHICH checkpoint the manifold cost loads (encoder + DROID latent stats),
         # overriding the VAE_MANIFOLD_CKPT env default. Resolved to an absolute path so it is cwd-safe.
         if overrides.get("vae_path") is not None:
@@ -236,14 +243,45 @@ def _scale_kwargs(overrides: dict | None, n_cspace_joints: int) -> dict:
     return kw
 
 
+def resolve_vae_retiming(overrides: dict | None) -> bool:
+    """Whether the VAE manifold cost owns the trajectory clock (the ``vae_retiming`` override).
+
+    When on, the per-interval durations are decision variables of the cuRobo gradient trajopt (see
+    curobo cost/vae_manifold_cost.py) and every OTHER retiming stage is suppressed: the
+    time_dilation_factor, cuRobo's own time-optimal ``optimize_dt`` rescale, and trajectory
+    blending (both the analytic spline and the flow model). Requires a nonzero
+    ``vae_manifold_weight`` -- with the cost disabled there is nothing optimizing the clock, and
+    silently suppressing every retimer would just emit raw trajopt output at base_dt."""
+    ov = overrides or {}
+    if not ov.get("vae_retiming"):
+        return False
+    if not ov.get("vae_manifold_weight"):
+        _log.warning(
+            "vae_retiming is set but vae_manifold_weight is 0/absent -- nothing would optimize the "
+            "trajectory clock, so vae_retiming is IGNORED."
+        )
+        return False
+    return True
+
+
 def resolve_time_dilation_factor(overrides: dict | None, config_default: float) -> float:
     """Effective time_dilation_factor from UI/sweep overrides.
 
     ``time_dilation_factor_literal`` bypasses the 1.0 sentinel (used by the parameter sweep) so a
     requested value is applied verbatim. Otherwise a ``time_dilation_factor`` of None or 1.0 means
     "no extra scaling" and we fall back to the config default (tiptop.yml robot.time_dilation_factor).
+
+    ``vae_retiming`` wins over both: the VAE owns the clock, so returning anything but 1.0 would
+    rescale the timing it just optimized. 1.0 is cuRobo's no-op sentinel (MotionGenResult.
+    retime_trajectory returns immediately), whereas falling back to ``config_default`` would NOT be
+    a no-op -- tiptop.yml ships robot.time_dilation_factor: 0.2.
     """
     overrides = overrides or {}
+    if resolve_vae_retiming(overrides):
+        requested = overrides.get("time_dilation_factor_literal", overrides.get("time_dilation_factor"))
+        if requested is not None:
+            _log.info(f"vae_retiming active: time_dilation_factor={requested} IGNORED (forced to 1.0)")
+        return 1.0
     if overrides.get("time_dilation_factor_literal") is not None:
         return float(overrides["time_dilation_factor_literal"])
     tdf = overrides.get("time_dilation_factor")
@@ -325,6 +363,16 @@ def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dic
             "uniform_velocity_weight": c["uniform_velocity_cfg"]["weight"],
             "vae_manifold_weight": c.get("vae_manifold_cfg", {}).get("weight", 0.0),
             "vae_path": c.get("vae_manifold_cfg", {}).get("checkpoint_path"),
+            # With retiming on, the per-interval durations were trajopt decision variables and every
+            # other retimer was suppressed -- without this the record would be indistinguishable
+            # from a stock run.
+            "vae_retiming": c.get("vae_manifold_cfg", {}).get("retiming", False),
+            "vae_retime_scale": c.get("vae_manifold_cfg", {}).get("retime_scale"),
+            "retiming_suppressed": (
+                ["time_dilation_factor", "optimize_dt", "blending"]
+                if c.get("vae_manifold_cfg", {}).get("retiming", False)
+                else []
+            ),
             "rnd_novelty_weight": c.get("rnd_novelty_cfg", {}).get("weight", 0.0),
             "rnd_novelty_log": c.get("rnd_novelty_cfg", {}).get("use_log", True),
             "joint_density_weight": c.get("joint_density_cfg", {}).get("weight", 0.0),
