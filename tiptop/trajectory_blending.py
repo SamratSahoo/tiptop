@@ -666,7 +666,7 @@ def _blend_trajectory_steps(
     )
     if config.mode == "vae":
         # The VAE manifold cost picks this stroke's clock. Unlike the spline/flow laws it gets the
-        # group's wall-clock only as a SEARCH BOUND, not a target -- choosing the pace is the point.
+        # group's wall-clock only as a RANGE BOUND, not a target -- choosing the pace is the point.
         from tiptop.vae_retiming import vae_retime_group
 
         pos, vel, acc, dt_out = vae_retime_group(
