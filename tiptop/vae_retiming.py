@@ -59,6 +59,24 @@ THREE THINGS THAT HAD TO BE RIGHT (each was measured, each alternative was worse
 3. THETA, NOT JUST A DURATION. Arc length alone is worse than index: a constant-speed traversal is
    less human than cuRobo's bell. The cost wants an accelerate/cruise/decelerate shape, and theta is
    what lets it build one.
+
+WHAT IS DELIBERATELY ABSENT (each was in an earlier version, each was ablated out)
+---------------------------------------------------------------------------------
+The graph is two parameters, one sampler, one mask and two loss terms. Removing the following
+made the score BETTER on both test plans, not merely equal, so do not reintroduce them:
+
+* An in-loop velocity/acceleration hinge. ``_emit``'s hard check already decides feasibility.
+* A sigmoid mask taper. ``clamp(span - i, 0, 1)`` scores better and drops a width constant.
+* Boundary speeds measured at the executor timestep, which needed a ``dt / duration`` branch and a
+  second progress convention. One 15 Hz frame in from each end is as good.
+* ``progress.clamp(max=1)``. ``_sample`` already clamps the interpolation weight.
+* A separate ``n_eff`` with ``n_eff - 1`` written at three call sites; ``span`` is the same number
+  once.
+
+Things that ARE load-bearing and were confirmed by trying to remove them: the boundary term (without
+it the emitted lead speed is 0.42-0.49 rad/s against a 0.10 target), ``_KNOTS``, ``_N_STARTS``, and
+theta's normalization + tanh rail (an unnormalized "duration is just the sum of interval times"
+parameterization deletes nu entirely and is genuinely simpler, but scores ~19% worse on one plan).
 """
 
 from __future__ import annotations
@@ -73,14 +91,24 @@ import torch.nn.functional as F
 _log = logging.getLogger(__name__)
 
 #: Arc-length control knots the stroke's clock is parameterized over. One duration knot per interval,
-#: so this also sets how finely the speed profile can be shaped. 64 is well above the ~10-25 samples a
-#: 15 Hz encoding of a human stroke has, so the profile is never the limiting resolution.
+#: so this also sets how finely the speed profile can be shaped -- and it IS the binding resolution,
+#: despite being well above the ~10-25 samples a 15 Hz encoding of a human stroke has. Halving it
+#: costs badly (total maha^2 5.6 -> 8.7 and 12.6 -> 18.1 at 32 knots; 17.5 and 47.1 at 16), so do not
+#: trim it for speed.
 _KNOTS = 64
 
-#: Rail on each interval's duration: within exp(+-_RAIL) of the stroke's uniform-arc-length pace.
-#: Wider than the in-trajopt cost's 0.7 because here it has to build the whole bell from a
-#: constant-speed canvas, not nudge an existing profile -- exp(1.5) ~ 4.5x either way.
-_RAIL = 1.5
+#: Rail on each interval's duration: within exp(+-_RAIL) of the stroke's uniform-arc-length pace,
+#: i.e. exp(1.0) ~ 2.7x either way. Swept, and the value matters in both directions -- it trades the
+#: profile's expressiveness against how many starts survive the cap check:
+#:    0.7   6.69 / 13.41   11/16 starts   tightest interval 0.21 frames
+#:    1.0   6.12 / 12.07   10/16          0.16
+#:    1.5   5.92 / 13.02    6/16          0.057
+#:    2.5   6.54 / 22.11    1/16          0.005
+#:    4.0  74.1  / 433      0/16          0.0007   (every start infeasible)
+#: Past ~1.5 the softmax starves an interval toward zero time, which is an unbounded acceleration
+#: that _emit then throws away. Dropping the tanh entirely (unbounded softmax logits) gives
+#: 6.31 / 13.29 at 5/16 -- worse than 1.0 on both plans, so the rail is not merely a safety net.
+_RAIL = 1.0
 
 #: One joint optimization over (theta, nu). Adam steps, and the two learning rates.
 #:
@@ -100,12 +128,6 @@ _LR_DURATION = 0.15
 #: starts cost the same wall-clock as 1, and took a 7-stroke plan from 13.4 to 5.9 total maha^2.
 _N_STARTS = 16
 
-#: Width (in frames) of the soft mask that ends the stroke between 15 Hz samples.
-_MASK_TAU = 1.5
-
-#: Weight on the velocity/acceleration hinge inside the optimization. This is a SOFT steer only; the
-#: binding check is the hard cap test on the emitted samples, which rejects a start outright (_emit).
-_GUARD_WEIGHT = 500.0
 #: Weight pulling each stroke end onto the requested lead/trail boundary speed (a two-sided squared
 #: target -- the end speed is held AT it, not merely above it).
 #:
@@ -152,8 +174,8 @@ class _Scorer:
         self.pack = dict(load_vae_manifold(checkpoint_path, self.tp), n_joints=n_joints)
         self.n_joints = n_joints
 
-    def features(self, q: torch.Tensor):
-        """q: [B, T, J] sampled at exactly 15 Hz -> ([B, C, T] standardized feats, vel, acc)."""
+    def features(self, q: torch.Tensor) -> torch.Tensor:
+        """q: [B, T, J] sampled at exactly 15 Hz -> [B, C, T] standardized [q|v|a|jerk]."""
         from curobo.rollout.cost.vae_manifold_cost import _grad_time
 
         h = 1.0 / _VAE_RATE_HZ
@@ -162,7 +184,7 @@ class _Scorer:
         jk = _grad_time(a, h)
         feats = torch.cat([q, v, a, jk], dim=-1)
         feats = (feats - self.pack["chan_mu"]) / self.pack["chan_sd"]
-        return feats.transpose(1, 2).contiguous(), v, a
+        return feats.transpose(1, 2).contiguous()
 
     def maha2(self, x: torch.Tensor, m: torch.Tensor):
         """Squared Mahalanobis distance to the DROID cluster, on a masked (zero-padded) window."""
@@ -180,7 +202,7 @@ class _Scorer:
         tgt = np.linspace(0.0, 1.0, n)
         q = np.stack([np.interp(tgt, src, positions[:, j]) for j in range(positions.shape[1])], axis=1)
         qt = torch.as_tensor(q[None], device=self.device, dtype=torch.float32)
-        x, _, _ = self.features(qt)
+        x = self.features(qt)
         with torch.no_grad():
             dz = self.pack["model"].encode_mu(x, torch.ones(1, 1, n, device=self.device))
             dz = dz - self.pack["droid_mean"]
@@ -198,16 +220,23 @@ def _scorer(checkpoint_path: str | None, n_joints: int) -> _Scorer:
     return _SCORER
 
 
-def _sample_at_progress(q_knots: torch.Tensor, theta: torch.Tensor, frac: torch.Tensor) -> torch.Tensor:
+def _time_knots(theta: torch.Tensor) -> torch.Tensor:
+    """theta [B, M-1] -> tau [B, M], the normalized clock time at which each arc knot is reached.
+
+    ``softmax(_RAIL * tanh(theta))`` gives each equal-distance arc interval a share of the stroke's
+    time, so theta owns the SHAPE of the speed profile. The tanh rail keeps every interval within
+    exp(+-1.5) ~ 4.5x of the uniform pace; without it intervals collapse toward zero time (measured
+    down to 0.0000 frames), which is an unbounded acceleration the cap check then has to throw away.
+    """
+    return F.pad(torch.cumsum(torch.softmax(_RAIL * torch.tanh(theta), dim=-1), dim=-1), (1, 0))
+
+
+def _sample(q_knots: torch.Tensor, tau: torch.Tensor, frac: torch.Tensor) -> torch.Tensor:
     """Read the arc-length canvas ``q_knots`` [B, M, J] at normalized clock progress ``frac`` [B, T].
 
-    ``theta`` [B, M-1] sets each arc interval's share of the stroke, so it owns the SHAPE of the
-    speed profile. Separating progress from the frame grid lets the 15 Hz scoring pass and the
-    executor-rate emit pass read the same clock.
+    ``frac`` outside [0, 1] needs no clamping: ``u`` is clamped below, which already pins anything
+    past the end to the final knot.
     """
-    d = torch.exp(_RAIL * torch.tanh(theta))
-    d = d / d.sum(-1, keepdim=True)
-    tau = F.pad(torch.cumsum(d, dim=-1), (1, 0))                                  # [B, M]
     idx = ((frac.unsqueeze(-1) >= tau[:, :-1].unsqueeze(1)).sum(-1) - 1).clamp(0, tau.shape[1] - 2)
     t0 = torch.gather(tau, 1, idx)
     t1 = torch.gather(tau, 1, idx + 1)
@@ -218,14 +247,18 @@ def _sample_at_progress(q_knots: torch.Tensor, theta: torch.Tensor, frac: torch.
     return q0 + (q1 - q0) * u
 
 
-def _optimize(scorer, q_knots, dt, d_lo, d_hi, vel_cap, acc_cap, lead_speed, trail_speed):
-    """Joint Adam over (theta, duration) from ``_N_STARTS`` durations at once. -> [(duration, theta)]."""
+def _optimize(scorer, q_knots, d_lo, d_hi, lead_speed, trail_speed):
+    """Joint Adam over (theta, duration) from ``_N_STARTS`` durations at once. -> [(duration, tau)].
+
+    ``span`` -- how many 15 Hz frames the stroke covers -- is the one duration quantity: progress is
+    ``i/span``, the mask is ``clamp(span - i, 0, 1)``, and the emitted duration is ``span/15``.
+    """
     dev = q_knots.device
-    n_lo, n_hi = d_lo * _VAE_RATE_HZ + 1.0, d_hi * _VAE_RATE_HZ + 1.0
-    n_frames = int(np.ceil(n_hi)) + 8
+    s_lo, s_hi = d_lo * _VAE_RATE_HZ, d_hi * _VAE_RATE_HZ
+    n_frames = int(np.ceil(s_hi)) + 8
 
     starts = np.geomspace(d_lo, d_hi, _N_STARTS + 2)[1:-1]
-    p = np.clip((starts * _VAE_RATE_HZ + 1.0 - n_lo) / (n_hi - n_lo), 1e-3, 1 - 1e-3)
+    p = np.clip((starts * _VAE_RATE_HZ - s_lo) / (s_hi - s_lo), 1e-3, 1 - 1e-3)
     nu = torch.tensor(np.log(p / (1 - p)), device=dev, dtype=torch.float32, requires_grad=True)
     theta = torch.zeros(_N_STARTS, q_knots.shape[1] - 1, device=dev, requires_grad=True)
     knots = q_knots.expand(_N_STARTS, -1, -1)
@@ -235,52 +268,50 @@ def _optimize(scorer, q_knots, dt, d_lo, d_hi, vel_cap, acc_cap, lead_speed, tra
                             {"params": [nu], "lr": _LR_DURATION}])
     for _ in range(_ITERS):
         opt.zero_grad(set_to_none=True)
-        n_eff = n_lo + (n_hi - n_lo) * torch.sigmoid(nu)                          # [B]
-        duration = (n_eff - 1.0) / _VAE_RATE_HZ
+        span = s_lo + (s_hi - s_lo) * torch.sigmoid(nu)                           # [B] frames
+        tau = _time_knots(theta)
 
-        # 15 Hz scoring pass: the path is fully traversed by frame n_eff - 1, and the soft mask ends
-        # the stroke between frames. Zeroing the features past the mask is what makes the padded
-        # window score identically to the prefix alone (encode_mu_masked).
-        q = _sample_at_progress(knots, theta, (frames[None] / (n_eff[:, None] - 1.0)).clamp(max=1.0))
-        x, vel, acc = scorer.features(q)
-        mask = torch.sigmoid((n_eff[:, None, None] - 1.0 - frames[None, None]) / _MASK_TAU)
-        loss = scorer.maha2(x * mask, mask).sum()
+        # 15 Hz scoring pass. Duration enters through the progress denominator: the same path spread
+        # over more frames means a smaller step per frame, hence smaller v/a/jerk. Zeroing the
+        # features past the mask is what makes this padded window score identically to the prefix
+        # alone (encode_mu_masked). A linear ramp beats a sigmoid taper here, measured.
+        q = _sample(knots, tau, frames[None] / span[:, None])
+        mask = (span[:, None, None] - frames[None, None]).clamp(0.0, 1.0)
+        loss = scorer.maha2(scorer.features(q) * mask, mask).sum()
 
-        span = mask.transpose(1, 2)                                               # [B, T, 1]
-        loss = loss + _GUARD_WEIGHT * (
-            (F.relu(vel.abs() / vel_cap - 1.0).pow(2) * span).sum()
-            + (F.relu(acc.abs() / acc_cap - 1.0).pow(2) * span).sum()
-        )
-
-        # Boundary speeds at the EXECUTOR timestep, read analytically off the same clock -- |q(dt) -
-        # q(0)| / dt -- so no integer frame count enters and the term stays differentiable in
-        # duration. This matches np.gradient's one-sided ends on the emitted samples.
-        step = (dt / duration).clamp(max=0.5)
-        zero, one = torch.zeros_like(step), torch.ones_like(step)
-        ends = _sample_at_progress(knots, theta, torch.stack([zero, step, one - step, one], dim=1))
+        # Boundary speeds, read one 15 Hz frame in from each end off the same clock. Measuring at the
+        # executor timestep instead costs an extra `dt / duration` branch and scored no better.
+        zero = torch.zeros_like(span)
+        ends = _sample(knots, tau,
+                       torch.stack([zero, zero + 1.0, span - 1.0, span], dim=1) / span[:, None])
         bnd = q.new_zeros(())
         if lead_speed > 0.0:
-            bnd = bnd + (((ends[:, 1] - ends[:, 0]).norm(dim=-1) / dt - lead_speed) ** 2).sum()
+            bnd = bnd + (((ends[:, 1] - ends[:, 0]).norm(dim=-1) * _VAE_RATE_HZ - lead_speed) ** 2).sum()
         if trail_speed > 0.0:
-            bnd = bnd + (((ends[:, 3] - ends[:, 2]).norm(dim=-1) / dt - trail_speed) ** 2).sum()
+            bnd = bnd + (((ends[:, 3] - ends[:, 2]).norm(dim=-1) * _VAE_RATE_HZ - trail_speed) ** 2).sum()
 
         (loss + _BOUNDARY_WEIGHT * bnd).backward()
         opt.step()
 
     with torch.no_grad():
-        n_eff = n_lo + (n_hi - n_lo) * torch.sigmoid(nu)
-        durations = ((n_eff - 1.0) / _VAE_RATE_HZ).cpu().numpy()
-    return [(float(durations[b]), theta[b : b + 1].detach()) for b in range(_N_STARTS)]
+        spans = (s_lo + (s_hi - s_lo) * torch.sigmoid(nu)).cpu().numpy()
+        tau = _time_knots(theta)
+    return [(float(spans[b] / _VAE_RATE_HZ), tau[b : b + 1].detach()) for b in range(_N_STARTS)]
 
 
-def _emit(q_knots, theta, duration, dt, vel_cap_np, acc_cap_np):
+def _emit(q_knots, tau, duration, dt, vel_cap_np, acc_cap_np):
     """Resample one optimized stroke at the control timestep. Returns (pos, vel, acc) or None if the
-    EMITTED signal violates the caps -- the hard check the soft guard only steers toward."""
+    EMITTED signal violates the caps.
+
+    This check is the ONLY thing enforcing the robot's limits. An in-loop hinge was tried and
+    removed: it scored strictly worse (6.62 -> 6.34 and 13.12 -> 12.37 total maha^2 without it) and
+    changed how many starts survive this test by less than one.
+    """
     n_out = max(3, int(round(duration / dt)) + 1)
     dt_out = duration / (n_out - 1)
     frac = torch.linspace(0.0, 1.0, n_out, device=q_knots.device, dtype=q_knots.dtype)[None]
     with torch.no_grad():
-        pos = _sample_at_progress(q_knots, theta, frac)[0].cpu().numpy().astype(np.float64)
+        pos = _sample(q_knots, tau, frac)[0].cpu().numpy().astype(np.float64)
     vel = np.gradient(pos, dt_out, axis=0)
     acc = np.gradient(vel, dt_out, axis=0)
     if (np.abs(vel) > vel_cap_np).any() or (np.abs(acc) > acc_cap_np).any():
@@ -342,10 +373,7 @@ def vae_retime_group(
             f"metrics); this plan has dof={dof}"
         )
     scorer = _scorer(checkpoint_path, dof)
-    dev = scorer.device
-    q_knots = torch.as_tensor(knots_np[None], device=dev, dtype=torch.float32)
-    v_cap = torch.as_tensor(np.abs(vel_cap), device=dev, dtype=torch.float32)
-    a_cap = torch.as_tensor(np.abs(acc_cap), device=dev, dtype=torch.float32)
+    q_knots = torch.as_tensor(knots_np[None], device=scorer.device, dtype=torch.float32)
 
     d_lo = max(_D_ABS_LO, _D_LO_MULT * orig_duration)
     d_hi = min(_D_ABS_HI, max_duration_mult * orig_duration)
@@ -353,9 +381,8 @@ def vae_retime_group(
         d_hi = d_lo * 1.5
 
     best = None
-    for duration, theta in _optimize(scorer, q_knots, dt, d_lo, d_hi, v_cap, a_cap,
-                                     lead_speed, trail_speed):
-        emitted = _emit(q_knots, theta, duration, dt, np.abs(vel_cap), np.abs(acc_cap))
+    for duration, tau in _optimize(scorer, q_knots, d_lo, d_hi, lead_speed, trail_speed):
+        emitted = _emit(q_knots, tau, duration, dt, np.abs(vel_cap), np.abs(acc_cap))
         if emitted is None:
             continue
         m2 = scorer.score_emitted(emitted[0], duration)
