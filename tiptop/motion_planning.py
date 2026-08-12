@@ -160,6 +160,18 @@ def apply_cost_overrides(cost: dict, overrides: dict | None) -> None:
             for key in ("retime_scale", "retime_smooth_weight", "retime_limit_weight"):
                 if overrides.get(key) is not None:
                     vm[key] = float(overrides[key])
+            # retime_param picks how the knots become durations: "rail" (retime_scale is a live
+            # knob on the reachable duration range) or "softplus" (simpler; retime_scale goes
+            # inert and the range comes from the optimizer's box on those rows instead).
+            if overrides.get("retime_param") is not None:
+                vm["retime_param"] = str(overrides["retime_param"])
+        # vae_conditional scores against a reference conditioned on the segment's own path geometry
+        # instead of one fixed DROID cluster mean. It is what stops the cost imposing a single
+        # duration on every segment regardless of how far it travels -- see path_descriptor and
+        # segment_maha2 in curobo cost/vae_manifold_cost.py. Requires a checkpoint carrying
+        # cond_coef / cond_precision (vae/train_stroke_style.py or vae/bake_conditional.py).
+        if overrides.get("vae_conditional") is not None:
+            vm["conditional"] = bool(overrides["vae_conditional"])
         # vae_path selects WHICH checkpoint the manifold cost loads (encoder + DROID latent stats),
         # overriding the VAE_MANIFOLD_CKPT env default. Resolved to an absolute path so it is cwd-safe.
         if overrides.get("vae_path") is not None:
@@ -363,11 +375,16 @@ def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dic
             "uniform_velocity_weight": c["uniform_velocity_cfg"]["weight"],
             "vae_manifold_weight": c.get("vae_manifold_cfg", {}).get("weight", 0.0),
             "vae_path": c.get("vae_manifold_cfg", {}).get("checkpoint_path"),
+            # Which reference the distance was taken to: the fixed DROID cluster mean, or one
+            # predicted from each segment's path geometry. The two produce very different timing, so
+            # a record without this is ambiguous.
+            "vae_conditional": c.get("vae_manifold_cfg", {}).get("conditional", False),
             # With retiming on, the per-interval durations were trajopt decision variables and every
             # other retimer was suppressed -- without this the record would be indistinguishable
             # from a stock run.
             "vae_retiming": c.get("vae_manifold_cfg", {}).get("retiming", False),
             "vae_retime_scale": c.get("vae_manifold_cfg", {}).get("retime_scale"),
+            "vae_retime_param": c.get("vae_manifold_cfg", {}).get("retime_param", "rail"),
             "retiming_suppressed": (
                 ["time_dilation_factor", "optimize_dt", "blending"]
                 if c.get("vae_manifold_cfg", {}).get("retiming", False)
