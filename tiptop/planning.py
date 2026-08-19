@@ -204,6 +204,29 @@ def _apply_blend(cutamp_plan, blend_config, vel_limit, acc_limit):
     return blend_cutamp_plan(cutamp_plan, blend_config, vel_limit=vel_limit, acc_limit=acc_limit)
 
 
+_EE_KIN_CACHE: dict = {}
+
+
+def _ee_kin_model(robot_type: str):
+    """Lazily build (and cache) a cuRobo kinematics model for the EE-pose cost trace.
+
+    The trace needs end-effector poses, but a serialized plan holds only joint positions and
+    serialize_plan has no solver in scope. Rebuilding the kinematics here keeps the six
+    serialize_plan call sites unchanged; it is cheap because it is cached per robot type and only
+    ever runs when the EE-pose cost was actually active.
+    """
+    if robot_type not in _EE_KIN_CACHE:
+        from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel, CudaRobotModelConfig
+
+        from tiptop.motion_planning import robot_curobo_cfg
+
+        cfg = robot_curobo_cfg(robot_type)
+        _EE_KIN_CACHE[robot_type] = CudaRobotModel(
+            CudaRobotModelConfig.from_data_dict(cfg["robot_cfg"]["kinematics"])
+        )
+    return _EE_KIN_CACHE[robot_type]
+
+
 def _per_timestep_cost(velocity, position=None, trace_cfg=None) -> dict:
     """Per-timestep trajectory-cost arrays for plotting / validation.
 
@@ -220,6 +243,8 @@ def _per_timestep_cost(velocity, position=None, trace_cfg=None) -> dict:
       - ``vae_manifold``  (DROID Mahalanobis distance; curobo cost/vae_manifold_cost.py)
       - ``joint_density`` (per-joint W1 to DROID; curobo cost/joint_density_cost.py)
       - ``rnd_novelty``   (raw RND novelty; curobo cost/rnd_novelty_cost.py)
+      - ``ee_manifold``   (EE-pose DROID Mahalanobis distance; curobo cost/ee_manifold_cost.py --
+        needs forward kinematics, so this one rebuilds the robot's kin model, see _ee_kin_model)
 
     ``trace_cfg`` carries ``source_dt`` (the trajopt base_dt the manifold costs finite-difference at,
     NOT the plan's playback dt) and ``n_joints``, plus a per-term sub-dict for each trace to emit.
@@ -266,6 +291,20 @@ def _per_timestep_cost(velocity, position=None, trace_cfg=None) -> dict:
             out["rnd_novelty"] = trajectory_novelty_trace(position, source_dt, n_joints=n_joints)
         except Exception as exc:
             _log.warning(f"RND-novelty cost trace skipped: {exc}")
+    if "ee_manifold" in trace_cfg:
+        try:
+            from curobo.rollout.cost.ee_manifold_cost import (
+                DEFAULT_EE_MANIFOLD_CKPT, trajectory_pose_trace,
+            )
+
+            kin = _ee_kin_model(trace_cfg["ee_manifold"].get("robot_type", "panda_robotiq"))
+            st = kin.get_state(position[:, :n_joints].contiguous())
+            out["ee_manifold"] = trajectory_pose_trace(
+                st.ee_position, st.ee_quaternion,
+                checkpoint_path=trace_cfg["ee_manifold"].get("checkpoint_path") or DEFAULT_EE_MANIFOLD_CKPT,
+            )
+        except Exception as exc:  # missing artifact / kinematics build error -> skip the trace
+            _log.warning(f"EE-manifold cost trace skipped: {exc}")
     return out
 
 
