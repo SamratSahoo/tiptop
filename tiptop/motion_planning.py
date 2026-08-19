@@ -132,6 +132,14 @@ def resolve_trace_cfg(overrides: dict | None) -> dict | None:
     if ov.get("rnd_novelty_weight"):
         cfg["rnd_novelty"] = {}
         active = True
+    if ov.get("ee_manifold_weight"):
+        # EE-pose manifold trace needs the segment's ee poses, which serialize_plan derives from the
+        # joint waypoints by forward kinematics -- see planning._per_timestep_cost.
+        cfg["ee_manifold"] = {
+            "checkpoint_path": resolve_vae_path(str(ov["ee_vae_path"])) if ov.get("ee_vae_path") else None,
+            "robot_type": tiptop_cfg().robot.type,
+        }
+        active = True
     return cfg if active else None
 
 
@@ -181,6 +189,23 @@ def apply_cost_overrides(cost: dict, overrides: dict | None) -> None:
     if overrides.get("joint_density_weight") is not None:
         jd = cost.setdefault("joint_density_cfg", {"weight": 0.0, "n_joints": 7, "huber_delta": 0.05})
         jd["weight"] = float(overrides["joint_density_weight"])
+    # End-effector pose manifold cost (see curobo cost/ee_manifold_cost.py): MINIMIZES the
+    # Mahalanobis distance between the segment's arc-length EE-pose fingerprint and the DROID latent
+    # cluster, pulling Cartesian path shape AND wrist orientation toward human teleop. Timing-blind
+    # by construction, so it composes with vae_manifold_weight rather than fighting it.
+    # ee_vae_path selects the checkpoint; ee_manifold_slack turns off the "stop once you are as
+    # DROID-like as a typical human stroke" threshold. Block may be absent -> create on demand.
+    if any(overrides.get(k) is not None for k in
+           ("ee_manifold_weight", "ee_vae_path", "ee_manifold_slack", "ee_manifold_slack_scale")):
+        em = cost.setdefault("ee_manifold_cfg", {"weight": 0.0, "slack": True, "slack_scale": 1.0})
+        if overrides.get("ee_manifold_weight") is not None:
+            em["weight"] = float(overrides["ee_manifold_weight"])
+        if overrides.get("ee_manifold_slack") is not None:
+            em["slack"] = bool(overrides["ee_manifold_slack"])
+        if overrides.get("ee_manifold_slack_scale") is not None:
+            em["slack_scale"] = float(overrides["ee_manifold_slack_scale"])
+        if overrides.get("ee_vae_path") is not None:
+            em["checkpoint_path"] = resolve_vae_path(str(overrides["ee_vae_path"]))
     for idx, val in (overrides.get("smooth_weight") or {}).items():
         cost["bound_cfg"]["smooth_weight"][int(idx)] = float(val)
     if overrides.get("primitive_collision_activation_distance") is not None:
@@ -207,6 +232,71 @@ def apply_cost_overrides(cost: dict, overrides: dict | None) -> None:
         cost["pose_cfg"]["weight"][int(idx)] = float(val)
     if overrides.get("run_vec_weight") is not None:
         cost["pose_cfg"]["run_vec_weight"] = [float(overrides["run_vec_weight"])] * 6
+
+
+def apply_particle_cost_overrides(cost: dict, overrides: dict | None) -> None:
+    """Mutate a PARTICLE-trajopt ``cost`` dict in place. Deliberately narrower than its gradient twin.
+
+    Only the EE-pose manifold weight is propagated here, and only because that cost is meant to vote
+    in MPPI's population reweighting as well as in the gradient descent -- a cost in the particle
+    phase influences WHICH sampled trajectory survives, not just how the winner is bent.
+
+    Everything else is left alone on purpose. ``vae_manifold_weight`` and ``joint_density_weight``
+    have historically applied to the gradient phase ONLY (get_motion_gen substitutes just
+    gradient_trajopt_file), even though both blocks exist in particle_trajopt.yml. Quietly widening
+    them here would change the meaning of every existing sweep and cfg/tamp preset, so it is left as
+    an explicit follow-up rather than a side effect of this function.
+    """
+    if not overrides:
+        return
+    if not resolve_ee_manifold_particle(overrides):
+        return
+    if overrides.get("ee_manifold_weight") is None:
+        return
+    em = cost.setdefault("ee_manifold_cfg", {"weight": 0.0, "slack": True, "slack_scale": 1.0})
+    em["weight"] = float(overrides["ee_manifold_weight"])
+    if overrides.get("ee_manifold_slack") is not None:
+        em["slack"] = bool(overrides["ee_manifold_slack"])
+    if overrides.get("ee_manifold_slack_scale") is not None:
+        em["slack_scale"] = float(overrides["ee_manifold_slack_scale"])
+    if overrides.get("ee_vae_path") is not None:
+        em["checkpoint_path"] = resolve_vae_path(str(overrides["ee_vae_path"]))
+
+
+def resolve_ee_manifold_particle(overrides: dict | None, default: bool = True) -> bool:
+    """Whether the EE-pose manifold cost also runs in the particle (MPPI) phase. Default on."""
+    val = (overrides or {}).get("ee_manifold_particle")
+    return default if val is None else bool(val)
+
+
+def resolve_seed_kwargs(overrides: dict | None) -> dict:
+    """Seed-diversity kwargs for MotionGenConfig.load_from_robot_config.
+
+    cuRobo runs ``num_trajopt_seeds`` candidates in parallel, refines each, and keeps the one with
+    the lowest total cost -- machinery for letting a cost CHOOSE a trajectory rather than only
+    refine one. It is wasted by default: ``trajopt_seed_ratio`` is {"linear": 1.0}, so every seed is
+    the same joint-space straight line and the "choice" is between identical candidates.
+
+    ``trajopt_seed_ratio`` mixes the seed generators (see TrajOptSolver.get_seeds):
+      linear -- straight line start->goal; bias -- via the arm's retract configuration;
+      start / goal -- held at one endpoint.
+    Each generator produces ONE shape repeated across its share of the seeds, so diversity comes
+    from mixing TYPES, not from raising the count. ``num_trajopt_noisy_seeds`` multiplies each with
+    MPPI's sampling noise on top.
+    """
+    ov = overrides or {}
+    kw: dict = {}
+    if ov.get("trajopt_seed_ratio") is not None:
+        ratio = {k: float(v) for k, v in dict(ov["trajopt_seed_ratio"]).items()}
+        bad = set(ratio) - {"linear", "bias", "start", "goal"}
+        if bad:
+            raise ValueError(f"unknown trajopt_seed_ratio key(s): {sorted(bad)}")
+        kw["trajopt_seed_ratio"] = ratio
+    if ov.get("num_trajopt_seeds") is not None:
+        kw["num_trajopt_seeds"] = int(ov["num_trajopt_seeds"])
+    if ov.get("num_trajopt_noisy_seeds") is not None:
+        kw["num_trajopt_noisy_seeds"] = int(ov["num_trajopt_noisy_seeds"])
+    return kw
 
 
 def apply_model_overrides(model: dict, overrides: dict | None) -> None:
@@ -376,6 +466,13 @@ def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dic
             "rnd_novelty_weight": c.get("rnd_novelty_cfg", {}).get("weight", 0.0),
             "rnd_novelty_log": c.get("rnd_novelty_cfg", {}).get("use_log", True),
             "joint_density_weight": c.get("joint_density_cfg", {}).get("weight", 0.0),
+            "ee_manifold_weight": c.get("ee_manifold_cfg", {}).get("weight", 0.0),
+            "ee_vae_path": c.get("ee_manifold_cfg", {}).get("checkpoint_path"),
+            "ee_manifold_slack": c.get("ee_manifold_cfg", {}).get("slack", True),
+            "ee_manifold_particle": resolve_ee_manifold_particle(ov) and bool(
+                c.get("ee_manifold_cfg", {}).get("weight", 0.0)
+            ),
+            "seed_kwargs": resolve_seed_kwargs(ov),
             "bound_smooth_weight": c["bound_cfg"]["smooth_weight"],
             "bound_weight": c["bound_cfg"]["weight"],
             "bound_activation_distance": c["bound_cfg"]["activation_distance"],
@@ -400,6 +497,27 @@ def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dic
     }
 
 
+def robot_curobo_cfg(robot_type: str) -> dict:
+    """cuRobo robot config dict for a tiptop robot type.
+
+    Extracted from get_motion_gen so anything else needing this robot's kinematics -- the EE-pose
+    cost trace in planning.py, for one -- selects it the same way instead of re-deriving the mapping.
+    """
+    if robot_type == "fr3_robotiq":
+        return fr3_robotiq_curobo_cfg()
+    if robot_type == "fr3":
+        return fr3_franka_curobo_cfg()
+    if robot_type == "panda_robotiq":
+        return panda_robotiq_curobo_cfg()
+    if robot_type == "panda":
+        return franka_curobo_cfg()
+    if robot_type == "ur5":
+        return ur5_curobo_cfg()
+    if robot_type in YAM_ROBOT_TYPES:
+        return bimanual_yam_curobo_cfg(robot_type.rsplit("_", 1)[1])
+    raise ValueError(f"Unknown robot type: {robot_type}")
+
+
 def get_motion_gen(
     world_cfg: WorldConfig,
     collision_activation_distance: float,
@@ -422,20 +540,7 @@ def get_motion_gen(
         raise ValueError(f"warmup_iters must be non-negative, got {warmup_iters}")
 
     cfg = tiptop_cfg()
-    if cfg.robot.type == "fr3_robotiq":
-        robot_cfg = fr3_robotiq_curobo_cfg()
-    elif cfg.robot.type == "fr3":
-        robot_cfg = fr3_franka_curobo_cfg()
-    elif cfg.robot.type == "panda_robotiq":
-        robot_cfg = panda_robotiq_curobo_cfg()
-    elif cfg.robot.type == "panda":
-        robot_cfg = franka_curobo_cfg()
-    elif cfg.robot.type == "ur5":
-        robot_cfg = ur5_curobo_cfg()
-    elif cfg.robot.type in YAM_ROBOT_TYPES:
-        robot_cfg = bimanual_yam_curobo_cfg(cfg.robot.type.rsplit("_", 1)[1])
-    else:
-        raise ValueError(f"Unknown robot type: {cfg.robot.type}")
+    robot_cfg = robot_curobo_cfg(cfg.robot.type)
 
     if num_spheres is not None:
         extra_spheres = robot_cfg["robot_cfg"]["kinematics"]["extra_collision_spheres"]
@@ -464,16 +569,23 @@ def get_motion_gen(
         grad_cfg = copy.deepcopy(load_yaml(join_path(get_task_configs_path(), "gradient_trajopt.yml")))
         apply_cost_overrides(grad_cfg["cost"], cost_overrides)
         apply_model_overrides(grad_cfg["model"], cost_overrides)
+        # The particle phase gets its own (narrower) substitution so the EE-pose manifold cost can
+        # vote in MPPI's reweighting -- see apply_particle_cost_overrides for why only that one.
+        part_cfg = copy.deepcopy(load_yaml(join_path(get_task_configs_path(), "particle_trajopt.yml")))
+        apply_particle_cost_overrides(part_cfg["cost"], cost_overrides)
+        if part_cfg["cost"].get("ee_manifold_cfg", {}).get("weight"):
+            extra_kwargs["particle_trajopt_file"] = part_cfg
         # Verification: log the RESOLVED cost weights that MotionGen is actually built with, so a
         # data-gen run can confirm the overrides propagated all the way into the cuRobo solver (not
         # just that the CLI arg parsed). Grep tiptop_*.log for "RESOLVED cuRobo cost".
         _gc = grad_cfg["cost"]
         _log.info(
-            "RESOLVED cuRobo cost after overrides: vae_manifold_weight=%s vae_path=%s rnd_novelty_weight=%s joint_density_weight=%s | overrides=%s",
+            "RESOLVED cuRobo cost after overrides: vae_manifold_weight=%s vae_path=%s rnd_novelty_weight=%s joint_density_weight=%s ee_manifold_weight=%s | overrides=%s",
             _gc.get("vae_manifold_cfg", {}).get("weight"),
             _gc.get("vae_manifold_cfg", {}).get("checkpoint_path"),
             _gc.get("rnd_novelty_cfg", {}).get("weight"),
             _gc.get("joint_density_cfg", {}).get("weight"),
+            _gc.get("ee_manifold_cfg", {}).get("weight"),
             cost_overrides,
         )
         grad_file = grad_cfg  # dict, not str
@@ -483,6 +595,7 @@ def get_motion_gen(
         # over the gradient_trajopt model dict. Joint-limit scales aren't in that dict at all.
         n_cspace = len(robot_cfg["robot_cfg"]["kinematics"]["cspace"]["joint_names"])
         extra_kwargs.update(_scale_kwargs(cost_overrides, n_cspace))
+        extra_kwargs.update(resolve_seed_kwargs(cost_overrides))
         if cost_overrides.get("horizon") is not None:
             extra_kwargs["trajopt_tsteps"] = int(cost_overrides["horizon"])
         if cost_overrides.get("base_dt") is not None:
