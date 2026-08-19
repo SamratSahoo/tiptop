@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import json
 import os
 import logging
@@ -281,19 +282,98 @@ def _spawn_postprocess(rollout_dir: Path) -> None:
         _log.exception("Failed to launch background post-processing")
 
 
+def _label_similarity(a: str, b: str) -> float:
+    """Fuzzy similarity in [0,1] between a goal-atom object name and a detected object label.
+
+    Combines substring containment, token (``_``/space-split) Jaccard overlap, and character-ratio,
+    so e.g. ``plate``~``cork_plate``, ``table_surface``~``table``, ``blue_toy``~``blue_robot_toy``.
+    Guarded by :func:`_label_structural_match` so pure character overlap alone (e.g. ``plate``~``table``,
+    ratio ~0.6 but zero shared tokens) does NOT count as a match.
+    """
+    la, lb = a.lower().strip(), b.lower().strip()
+    if la == lb:
+        return 1.0
+    contain = 0.85 if (la in lb or lb in la) else 0.0
+    ta = {t for t in la.replace(" ", "_").split("_") if t}
+    tb = {t for t in lb.replace(" ", "_").split("_") if t}
+    jaccard = len(ta & tb) / len(ta | tb) if (ta | tb) else 0.0
+    ratio = difflib.SequenceMatcher(None, la, lb).ratio()
+    return max(contain, jaccard, ratio)
+
+
+def _label_structural_match(a: str, b: str) -> bool:
+    """True if a and b share a real signal (substring containment, a common token, or near-identical
+    spelling >=0.8), i.e. not just incidental character overlap. Blocks false friends like plate/table."""
+    la, lb = a.lower().strip(), b.lower().strip()
+    if la in lb or lb in la:
+        return True
+    ta = {t for t in la.replace(" ", "_").split("_") if t}
+    tb = {t for t in lb.replace(" ", "_").split("_") if t}
+    if ta & tb:
+        return True
+    return difflib.SequenceMatcher(None, la, lb).ratio() >= 0.8
+
+
+def _resolve_grounded_atoms(grounded_atoms: list[dict], known_labels: set[str], table_name: str) -> None:
+    """Rewrite goal-atom args in place to the closest DETECTED object label (relaxed grounding).
+
+    The VLM's goal predicates and its own detection labels drift apart (``on(blue_toy, plate)`` while
+    it labels the objects ``toy1``/``cork_plate``), which is worse under a different renderer. Instead
+    of demanding an exact string match, resolve each arg to the best-matching detected label: surfaces
+    (2nd arg of ``on``) may be shared across atoms (all toys -> one plate), movables are assigned
+    uniquely so distinct goals don't collapse onto the same object. Raises only if an arg has no
+    reasonable match (below ``MIN_SIM``), which still guards cuTAMP from an ungroundable goal.
+    """
+    MIN_SIM = 0.34
+    surface_args = {atom["args"][1] for atom in grounded_atoms
+                    if atom.get("predicate") == "on" and len(atom.get("args", [])) == 2}
+
+    def best(arg: str, pool: set[str]) -> tuple[str | None, float]:
+        # Only consider candidates with a real structural signal, so incidental character overlap
+        # (plate/table) never resolves; among those, pick the highest similarity.
+        cands = [lbl for lbl in pool if _label_structural_match(arg, lbl)]
+        if not cands:
+            return None, 0.0
+        cand = max(cands, key=lambda lbl: _label_similarity(arg, lbl))
+        return cand, _label_similarity(arg, cand)
+
+    # Resolve surfaces first (shared), then movables uniquely from what remains.
+    resolved_surface: dict[str, str] = {}
+    for s in surface_args:
+        cand, score = best(s, known_labels)
+        if cand is None or score < MIN_SIM:
+            raise ValueError(f"Goal surface '{s}' has no match among detected objects {sorted(known_labels)}")
+        resolved_surface[s] = cand
+
+    used_movables: set[str] = set()
+    movable_pool = known_labels - {table_name} - set(resolved_surface.values())
+    for atom in grounded_atoms:
+        new_args = []
+        for i, arg in enumerate(atom.get("args", [])):
+            is_surface = atom.get("predicate") == "on" and i == 1
+            if is_surface:
+                match = resolved_surface[arg]
+            else:
+                cand, score = best(arg, movable_pool - used_movables)
+                if cand is None or score < MIN_SIM:  # fall back to full set if the pool is exhausted
+                    cand, score = best(arg, known_labels - set(resolved_surface.values()))
+                if cand is None or score < MIN_SIM:
+                    raise ValueError(f"Goal object '{arg}' has no match among detected objects {sorted(known_labels)}")
+                used_movables.add(cand)
+                match = cand
+            if match != arg:
+                _log.info(f"Relaxed grounding: '{arg}' -> detected '{match}'")
+            new_args.append(match)
+        atom["args"] = new_args
+
+
 def create_tamp_environment(
     object_meshes: dict[str, Mesh], table_cuboid: Cuboid, grounded_atoms: list[dict], include_workspace: bool
 ) -> tuple[TAMPEnvironment, list[Cuboid | Mesh]]:
     # Reject goals that reference objects not present in the perceived scene.
     # Without this, cuTAMP's BFS runs without stopping, expanding the move-chain on an unreachable goal.
     known_labels = set(object_meshes.keys()) | {table_cuboid.name}
-    for atom in grounded_atoms:
-        for arg in atom.get("args", []):
-            if arg not in known_labels:
-                raise ValueError(
-                    f"Goal predicate {atom['predicate']}({', '.join(atom['args'])}) "
-                    f"references unknown object '{arg}'. Known objects: {sorted(known_labels)}"
-                )
+    _resolve_grounded_atoms(grounded_atoms, known_labels, table_cuboid.name)
 
     # Identify which objects are used as surfaces (second arg in on(x, y))
     surface_labels = set()
@@ -311,6 +391,12 @@ def create_tamp_environment(
             movables.append(mesh)
     _log.info(f"Movables: {[m.name for m in movables]}")
     _log.info(f"Surfaces: {[s.name for s in surfaces]}")
+
+    # Reject degenerate scenes (e.g. a frame where only the plate got detected): with no movable to
+    # place, cuTAMP crashes downstream with an IndexError in get_conf_parameters. Fail cleanly instead
+    # so the worker just discards this env and retries.
+    if not movables:
+        raise ValueError("No movable objects detected in the scene; nothing to plan.")
 
     # Create goal state from grounded atoms
     goal_state: set = set()
