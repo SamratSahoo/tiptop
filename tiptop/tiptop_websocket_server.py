@@ -30,6 +30,7 @@ from curobo.wrap.reacher.ik_solver import IKSolver
 from curobo.wrap.reacher.motion_gen import MotionGen
 
 from tiptop.config import tiptop_cfg
+from tiptop.goal_clearing import resolve_clear_goal_surfaces
 from tiptop.motion_planning import (
     build_curobo_solvers,
     resolve_grasp_orientation_cost,
@@ -41,7 +42,7 @@ from tiptop.motion_planning import (
 from tiptop.perception.cameras import Frame
 from tiptop.planning import build_tamp_config, run_planning, save_tiptop_plan, serialize_plan
 from tiptop.recording import save_run_metadata, save_run_outputs
-from tiptop.tiptop_run import Observation, run_perception
+from tiptop.tiptop_run import Observation, plan_clear_then_task, run_perception
 from tiptop.utils import NumpyEncoder, add_file_handler, check_cutamp_version, get_robot_rerun, print_tiptop_banner, remove_file_handler, setup_logging
 
 _log = logging.getLogger(__name__)
@@ -316,7 +317,6 @@ class TiptopPlanningServer:
                         task_instruction,
                         save_dir,
                         depth_estimator=None,
-                        gripper_mask=None,
                         include_workspace=self._include_workspace,
                     )
                     perception_duration = time.monotonic() - perception_start
@@ -336,17 +336,33 @@ class TiptopPlanningServer:
             _log.info("Running cuTAMP planning...")
             async with self._gpu_lock:
                 self._reset_motion_planning()
-                cutamp_plan, planning_duration, failure_reason = await asyncio.to_thread(
-                    run_planning,
-                    env,
-                    self._config,
-                    q_init,
-                    self._ik_solver,
-                    processed_scene.grasps,
-                    self._motion_gen,
-                    all_surfaces,
-                    cost_overrides=self._curobo_overrides,
-                )
+                if resolve_clear_goal_surfaces(self._curobo_overrides):
+                    # Same knob and same two-phase planner as the TAMP datagen path: clear whatever
+                    # occupies a goal surface, then plan the task against that, and return the two
+                    # concatenated. The client executes one plan either way. See tiptop.goal_clearing.
+                    cutamp_plan, planning_duration, failure_reason, _ = await asyncio.to_thread(
+                        plan_clear_then_task,
+                        self._config,
+                        processed_scene,
+                        q_init,
+                        grounded_atoms,
+                        save_dir,
+                        ik_solver=self._ik_solver,
+                        motion_gen=self._motion_gen,
+                        cost_overrides=self._curobo_overrides,
+                    )
+                else:
+                    cutamp_plan, planning_duration, failure_reason = await asyncio.to_thread(
+                        run_planning,
+                        env,
+                        self._config,
+                        q_init,
+                        self._ik_solver,
+                        processed_scene.grasps,
+                        self._motion_gen,
+                        all_surfaces,
+                        cost_overrides=self._curobo_overrides,
+                    )
 
             if cutamp_plan is None:
                 return {

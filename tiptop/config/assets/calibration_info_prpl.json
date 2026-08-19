@@ -1,14 +1,14 @@
 {
   "13222437": {
     "pose": [
-      0.03450946516619256,
-      0.07165395298988964,
-      -0.1392939095771543,
-      -0.43264772101285853,
-      0.016648750883573316,
-      3.117053407855201
+      0.03248409488997367,
+      0.06982439842116614,
+      -0.13126433852707062,
+      -0.3453526819383341,
+      0.004192260479797705,
+      3.124541086636678
     ],
-    "timestamp": 1786298449.0611165
+    "timestamp": 1786984253.0329657
   },
   "39379013": {
     "pose": [
@@ -20,6 +20,18 @@
       -2.486228089521667
     ],
     "timestamp": 1783991597.6599455,
-    "source": "copied verbatim from droid 39379013_left; tiptop and droid agree exactly on third-person extrinsics (verified on 32439448)"
+    "source": "copied verbatim from droid 39379013_left; tiptop and droid agree exactly on third-person extrinsics (verified on 32439448). Stale: the side-view unit was swapped to 34032889, which is what TIPTOP_EXTERNAL_CAMERA_ID now points at"
+  },
+  "34032889": {
+    "pose": [
+      0.5692872333872196,
+      -0.5515242575492293,
+      0.37494721747803583,
+      -1.8218005906340848,
+      0.046845638554643854,
+      0.586737186097219
+    ],
+    "timestamp": 1786578132.566384,
+    "source": "copied from ~/hitl-tamp-vla assets/calibration_info_prpl.json on 2026-08-16 (same rig, same unit); originally from droid 34032889_left (droid/droid/calibration/calibration_info.json, varied_camera_1), recalibrated 2026-08-12 19:42. world_from_cam, the left ZED frame -- which is the frame tiptop's rgb/K_left come from, and what cameras.perception: external reads"
   }
 }

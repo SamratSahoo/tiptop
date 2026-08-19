@@ -27,14 +27,28 @@ cameras:
   # TIPTOP_HAND_CAMERA_ID / TIPTOP_EXTERNAL_CAMERA_ID / TIPTOP_EXTERNAL_2_CAMERA_ID instead of
   # editing this file; droid reads the same variables (droid/droid/misc/parameters.py). Any serial
   # you point at needs its own entry in calibration_info.json — extrinsics are keyed by serial.
-  # Hand (wrist) camera — used for perception
+  #
+  # Which camera the perception pipeline (depth -> point cloud -> detection/grasps) reads:
+  #   hand      wrist camera. Its pose is only known through the arm, so world_from_cam is
+  #             recomputed by forward kinematics at every capture and the arm first drives to
+  #             q_capture to aim it at the scene. The gripper is masked out of the point cloud.
+  #   external  third-person (side-view) camera. Its pose is static, read straight out of
+  #             calibration_info as world_from_cam, so the arm is left at q_home instead of driving
+  #             into the shot; the arm is dropped from the cloud by projecting cuRobo's collision
+  #             spheres into the frame. q_home should be clear of this camera's view.
+  # Either way both cameras are opened and recorded as usual — this only picks which one TAMP
+  # perceives through. data-collection sets TIPTOP_PERCEPTION_CAMERA from the top-bar selector.
+  perception: "${oc.env:TIPTOP_PERCEPTION_CAMERA,hand}"
+
+  # Hand (wrist) camera
   hand:
     serial: "${oc.env:TIPTOP_HAND_CAMERA_ID,14846828}"
     type: zed
     resolution: HD720
     fps: 15
 
-  # External (side) camera — optional, for recording / viz only
+  # External (side/third-person) camera — recorded as DROID exterior_1, and the camera TAMP
+  # perceives through when cameras.perception is "external"
   external:
     serial: "${oc.env:TIPTOP_EXTERNAL_CAMERA_ID,32439448}"
     type: zed
@@ -69,6 +83,12 @@ perception:
   voxel_downsample_size: 0.0075
   contact_threshold_m: 0.01
   mask_erosion_pixels: 3
+
+  # Padding added to each of the robot's cuRobo collision spheres before they are projected into the
+  # third-person view and dropped from the point cloud (see project_spheres_to_mask). Covers
+  # extrinsics and kinematics error; raise it if a rim of arm survives in the cloud. Unused when the
+  # wrist camera does perception — that view uses the painted gripper mask.
+  robot_mask_margin_m: 0.02
 
   # Temporal depth smoothing: at the (static) capture pose we grab num_frames stereo frames
   # back-to-back and per-pixel median-fuse their depth maps to suppress sensor noise / flicker.

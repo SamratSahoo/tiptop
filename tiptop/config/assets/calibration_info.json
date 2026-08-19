@@ -13,13 +13,25 @@
   },
   "13222437": {
     "pose": [
-      0.03450946516619256,
-      0.07165395298988964,
-      -0.1392939095771543,
-      -0.43264772101285853,
-      0.016648750883573316,
-      3.117053407855201
+      0.026605548281701908,
+      0.07046765493116523,
+      -0.13915621509130938,
+      -0.45091960933266706,
+      -0.0045196269688771995,
+      3.12590156923969
     ],
-    "timestamp": 1786298449.0611165
+    "timestamp": 1786519214.2278092
+  },
+  "34032889": {
+    "pose": [
+      0.5692872333872196,
+      -0.5515242575492293,
+      0.37494721747803583,
+      -1.8218005906340848,
+      0.046845638554643854,
+      0.586737186097219
+    ],
+    "timestamp": 1786578132.566384,
+    "source": "side-view ZED 2i, the third-person camera cameras.perception: external reads. Copied from ~/hitl-tamp-vla assets/calibration_info_prpl.json on 2026-08-16 (same rig); originally from droid 34032889_left (varied_camera_1), recalibrated 2026-08-12 19:42. world_from_cam, the left ZED frame -- which is the frame tiptop's rgb/K_left come from. The prpl workspace carries the same entry; this default exists for runs with no DC_WORKSPACE"
   }
 }

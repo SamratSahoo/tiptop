@@ -112,6 +112,7 @@ def run_planning(
     all_surfaces: list,
     experiment_dir: Path | None = None,
     cost_overrides: dict | None = None,
+    q_return: np.ndarray | list | None = None,
 ) -> tuple[list | None, float, str | None]:
     """Run cuTAMP planning and return (plan, planning_time_seconds, failure_reason).
 
@@ -120,6 +121,10 @@ def run_planning(
     ``cost_overrides`` is the config's ``tamp_overrides`` dict; it is used here only to resolve the
     trajectory-blending settings (``blend_trajectory`` etc. -- see resolve_blend_config). Blending is
     off unless the config opts in.
+
+    ``q_return`` overrides where the plan's closing GoToInitial drives to, which otherwise is the
+    ``q_init`` it started from. Only a caller concatenating plans needs it -- see
+    ``tiptop_run.plan_clear_then_task``, whose second plan starts mid-episode.
     """
     constraint_to_tol = default_constraint_to_tol.copy()
     constraint_to_mult = default_constraint_to_mult.copy()
@@ -151,6 +156,7 @@ def run_planning(
         grasps=grasps,
         motion_gen=motion_gen,
         experiment_dir=experiment_dir,
+        q_return=q_return,
     )
     elapsed = time.perf_counter() - start
     _log.info(f"cuTAMP planning took: {elapsed:.2f}s")

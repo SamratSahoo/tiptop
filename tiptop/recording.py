@@ -286,7 +286,7 @@ def save_perception_outputs(
     bboxes: list[dict],
     masks: np.ndarray,
     save_dir: Path,
-    gripper_mask: Bool[np.ndarray, "h w"] | None = None,
+    robot_mask: Bool[np.ndarray, "h w"] | None = None,
 ):
     """Save perception outputs to disk.
 
@@ -333,9 +333,11 @@ def save_perception_outputs(
     masks_bool = masks > 0.5
     np.savez_compressed(str(perception_dir / "masks.npz"), masks_bool)  # masks are sparse so can compress
 
-    if gripper_mask is not None:
-        gripper_mask_img = Image.fromarray(gripper_mask.astype(np.uint8) * 255)
-        gripper_mask_img.save(str(perception_dir / "gripper_mask.png"))
+    if robot_mask is not None:
+        # Filename predates third-person perception, where the mask covers the whole arm rather than
+        # just the gripper. Kept so viz-tiptop-run reads old and new runs the same way.
+        robot_mask_img = Image.fromarray(robot_mask.astype(np.uint8) * 255)
+        robot_mask_img.save(str(perception_dir / "gripper_mask.png"))
 
     save_dur = time.perf_counter() - start_time
     _log.info(f"Saved perception outputs to {save_dir} in {save_dur:.2f}s")
@@ -370,8 +372,16 @@ def save_run_metadata(
     planning_success: bool | None,
     planning_failure_reason: str | None,
     planning_duration: float | None,
+    cleared: list[str] | None = None,
 ) -> None:
-    """Save structured run metadata to metadata.json."""
+    """Save structured run metadata to metadata.json.
+
+    ``cleared`` names the objects this episode moved out of the way BEFORE doing what the instruction
+    asked (``tiptop.goal_clearing``). Those steps are part of the recorded episode while the
+    instruction says nothing about them, so an episode with a non-empty ``cleared`` opens with motion
+    the language does not account for -- recorded here so a dataset build can find or filter them
+    without re-deriving it from the plan.
+    """
     git_info = _collect_git_info()
     if git_info["dirty"]:
         diff = _get_git_diff()
@@ -393,6 +403,7 @@ def save_run_metadata(
             "success": planning_success,
             "failure_reason": planning_failure_reason,
             "duration": round(planning_duration, 3) if planning_duration is not None else None,
+            "cleared": list(cleared or []),
         },
         "version": "1.0.0",
         "tiptop_version": tiptop.__version__,

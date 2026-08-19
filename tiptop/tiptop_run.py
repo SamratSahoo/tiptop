@@ -32,6 +32,14 @@ from scipy.spatial import KDTree
 from tiptop.config import as_robot_type as _as_robot_type
 from tiptop.config import load_calibration, tiptop_cfg
 from tiptop.execute_plan import execute_cutamp_dual_plan, execute_cutamp_plan
+from tiptop.goal_clearing import (
+    build_clearing_goal,
+    drop_return_to_initial,
+    final_configuration,
+    move_meshes,
+    placed_poses,
+    resolve_clear_goal_surfaces,
+)
 from tiptop.lerobot_capture import (
     GRIPPER_MAX_WIDTH,
     GripperSampler,
@@ -65,7 +73,11 @@ from tiptop.perception.cameras import (
 from tiptop.perception.m2t2 import augment_flipped_grasps, m2t2_to_tiptop_transform
 from tiptop.perception.sam2 import sam2_client
 from tiptop.perception.segmentation import TABLE_BOX_CLEARANCE, segment_pointcloud_by_masks, segment_table_with_ransac
-from tiptop.perception.utils import convert_trimesh_box_to_curobo_cuboid, convert_trimesh_to_curobo_mesh
+from tiptop.perception.utils import (
+    convert_trimesh_box_to_curobo_cuboid,
+    convert_trimesh_to_curobo_mesh,
+    project_spheres_to_mask,
+)
 from tiptop.perception_wrapper import detect_and_segment, predict_depth_and_grasps
 from tiptop.planning import build_tamp_config, run_planning, save_tiptop_plan, serialize_plan
 from tiptop.recording import (
@@ -196,6 +208,10 @@ class Observation:
     # Additional stereo frames captured back-to-back at the same (static) pose, used for
     # temporal depth smoothing. Empty for replay/websocket paths, which fuse nothing.
     depth_frames: tuple[Frame, ...] = ()
+    # Image-space mask of the robot's own geometry, dropped from the point cloud: the static
+    # gripper mask in the wrist camera's view, the projected collision spheres in the third-person
+    # camera's (where the arm is in frame from wherever it happens to be standing).
+    robot_mask: Bool[np.ndarray, "h w"] | None = None
 
 
 @dataclass(frozen=True)
@@ -207,14 +223,24 @@ class _DemoContainer:
     external_cam: Camera | None
     external_cam_2: Camera | None
     enable_recording: bool
+
+    # Which camera slot perception reads: "hand" or "external" (cameras.perception). Stored as a key
+    # rather than a handle so the recording roles stay untouched — `cam` is always the hand slot and
+    # `external_cam` always exterior_1, whichever of them TAMP happens to perceive through. Resolve
+    # it with perception_camera().
+    perception_cam_key: str
+    # Calibration entry of the PERCEPTION camera, read per `cam_mount` below.
     ee_from_cam: Float[np.ndarray, "4 4"]
+    # Built from the PERCEPTION camera's intrinsics — FoundationStereo is given fx/fy/cx/cy and the
+    # baseline of the camera whose stereo pair it is fed.
     depth_estimator: DepthEstimator
 
     gripper_mask: Bool[np.ndarray, "h w"] | None
 
     # How the perception camera's calibration entry is read: "ee" (world_from_cam = FK(q) @
     # ee_from_cam, the Franka wrist camera) or "world" (the entry IS world_from_cam, a camera fixed
-    # in the scene — how the bimanual YAM perceives). See perception.cameras.camera_mount.
+    # in the scene — the bimanual YAM's top camera, or the third-person camera when
+    # cameras.perception is "external"). See perception.cameras.camera_mount.
     cam_mount: str
 
     # cuRobo solvers keyed by ROBOT TYPE, because a bimanual YAM episode plans with two embodiments:
@@ -258,14 +284,34 @@ class ProcessedScene:
     grasps: dict[str, dict]  # Label -> grasp data with tensor versions
 
 
+def perception_camera(container: _DemoContainer) -> Camera:
+    """The camera perception reads — the hand slot, or the exterior one when ``cameras.perception``
+    says so.
+
+    Resolved per call rather than held, so the container keeps one handle per RECORDING slot and the
+    perception role never renames a camera in the episode (``hand_cam.svo`` / ``external_cam.svo``).
+    """
+    cam = container.cam if container.perception_cam_key == "hand" else container.external_cam
+    if cam is None:
+        raise RuntimeError(
+            f"The {container.perception_cam_key} camera does perception (cameras.perception) but is not open"
+        )
+    return cam
+
+
 def capture_live_observation(container: _DemoContainer) -> Observation:
     """Read robot joint positions and resolve the camera's world pose.
 
     For an END-EFFECTOR camera that is forward kinematics: ``FK(q) @ ee_from_cam``, so the pose is
     only as good as the joint reading it was taken with. For a camera FIXED in the scene — the
-    bimanual YAM's third-person D435 — the calibration entry already IS ``world_from_cam`` and no
-    kinematics are involved; the arm's configuration cannot move it. ``q_init`` is read either way,
-    because cuTAMP plans from the measured state regardless of what is holding the camera.
+    bimanual YAM's third-person D435, or the side-view ZED when ``cameras.perception: external`` —
+    the calibration entry already IS ``world_from_cam`` and no kinematics are involved; the arm's
+    configuration cannot move it. ``q_init`` is read either way, because cuTAMP plans from the
+    measured state regardless of what is holding the camera.
+
+    A third-person camera also sees the arm itself, so the robot's collision spheres are projected
+    into the frame and dropped from the point cloud (the wrist view uses its painted gripper mask
+    instead).
     """
     # bimanual_yam_dual has no single active arm (see YamClient.arm) -- q_init has to be all 12
     # numbers, both because cuTAMP's dual chain plans over all of them and because the FK branch
@@ -275,22 +321,54 @@ def capture_live_observation(container: _DemoContainer) -> Observation:
         q_curr = container.robot.get_dual_joint_positions()
     else:
         q_curr = container.robot.get_joint_positions()
+    cfg = tiptop_cfg()
+    kin_state = None
     if container.cam_mount == "world":
         world_from_cam = container.ee_from_cam
     else:
         q_curr_pt = tensor_args.to_device(q_curr)
-        world_from_ee = container.motion_gen.kinematics.get_state(q_curr_pt).ee_pose.get_numpy_matrix()[0]
-        world_from_cam = world_from_ee @ container.ee_from_cam
+        kin_state = container.motion_gen.kinematics.get_state(q_curr_pt)
+        world_from_cam = kin_state.ee_pose.get_numpy_matrix()[0] @ container.ee_from_cam
 
     # Grab a short burst of frames at this static pose for temporal depth smoothing. The first
     # frame is the representative one (used for rgb/intrinsics); the rest feed the median fusion.
-    num_frames = max(1, int(tiptop_cfg().perception.depth_smoothing.num_frames))
-    frames = [container.cam.read_camera() for _ in range(num_frames)]
+    num_frames = max(1, int(cfg.perception.depth_smoothing.num_frames))
+    frames = [perception_camera(container).read_camera() for _ in range(num_frames)]
+
+    if container.perception_cam_key == "external":
+        # The side-view camera sees the arm itself, from wherever it is standing, and no fixed
+        # image-space mask can cover that. Project the same collision spheres cuRobo plans against
+        # into this frame instead -- they follow the joints, so the arm is dropped from the point
+        # cloud whether it is at home or holding something. (Gemini is already told not to report
+        # the robot, so only the geometry needs handling.) The YAM's fixed top camera keeps its
+        # current behaviour -- no self-mask at all -- since nothing in that setup has been
+        # calibrated against a projected-sphere mask.
+        if kin_state is None:
+            kin_state = container.motion_gen.kinematics.get_state(tensor_args.to_device(q_curr))
+        if kin_state.link_spheres_tensor is None:
+            raise RuntimeError(
+                "cuRobo returned no collision spheres for the current joint state, so the robot "
+                "cannot be masked out of the third-person view"
+            )
+        robot_mask = project_spheres_to_mask(
+            kin_state.link_spheres_tensor[0].cpu().numpy(),
+            world_from_cam,
+            frames[0].intrinsics,
+            frames[0].rgb.shape[:2],
+            # Defaulted rather than required: TIPTOP_CONFIG replaces tiptop.yml wholesale, so an
+            # embodiment config that opts into external perception need not repeat this knob.
+            margin_m=float(cfg.perception.get("robot_mask_margin_m", 0.02)),
+        )
+        _log.debug(f"Robot self-mask covers {robot_mask.mean():.1%} of the third-person view")
+    else:
+        robot_mask = container.gripper_mask
+
     return Observation(
         frame=frames[0],
         world_from_cam=world_from_cam,
         q_init=q_curr,
         depth_frames=tuple(frames),
+        robot_mask=robot_mask,
     )
 
 
@@ -362,10 +440,27 @@ def get_demo_container(
     # Second exterior camera (DROID exterior_2). None if its config is commented out
     # (deliberate 2-camera setup) or if a configured camera failed to open.
     external_cam_2 = get_external_camera_2()
-    mount = camera_mount("hand")
+
+    # Which camera perception reads, and how its calibration entry is interpreted. A third-person
+    # camera is bolted to the room: its entry IS world_from_cam (droid stores third-person
+    # extrinsics base-relative, wrist extrinsics gripper-relative), so nothing about it depends on
+    # where the arm is. The hand slot follows its own `mount` — "ee" on the Franka wrist, "world"
+    # for the YAM's top camera.
+    perception_cam_key = str(tiptop_cfg().cameras.get("perception", "hand"))
+    if perception_cam_key == "hand":
+        perception_cam = cam
+        mount = camera_mount("hand")
+    elif perception_cam_key == "external":
+        # get_external_camera() raises if the camera cannot be opened, so reaching here means it is
+        # live — unlike external_2, a missing exterior camera is never shrugged off.
+        perception_cam = external_cam
+        mount = "world"
+    else:
+        raise ValueError(f"cameras.perception must be 'hand' or 'external', got {perception_cam_key!r}")
     # For an ee-mounted camera this is ee_from_cam; for a world-mounted one the same entry is read
     # as world_from_cam. capture_live_observation branches on `cam_mount`.
-    ee_from_cam = load_calibration(cam.serial)
+    ee_from_cam = load_calibration(perception_cam.serial)
+    _log.info(f"Perception reads the {perception_cam_key} camera (s/n {perception_cam.serial}, {mount}-mounted)")
 
     if enable_recording:
         _check_recording_cameras(cam, external_cam, external_cam_2)
@@ -387,9 +482,10 @@ def get_demo_container(
             )
             solvers[robot_type] = (ik_solver, motion_gen)
 
-    # The gripper mask erases a WRIST camera's own fingers from the point cloud. A camera fixed in
-    # the scene never sees the gripper in a fixed place, so masking a constant image region there
-    # would delete scene geometry instead.
+    # The gripper mask erases a WRIST camera's own fingers from the point cloud — it is painted in
+    # that camera's image. A camera fixed in the scene never sees the gripper in a fixed place, so
+    # the same mask there would delete an arbitrary patch of the scene; the third-person path masks
+    # the arm by projecting cuRobo's collision spheres instead (capture_live_observation).
     gripper_mask = None if mount == "world" else load_gripper_mask()
 
     return _DemoContainer(
@@ -398,8 +494,9 @@ def get_demo_container(
         external_cam=external_cam,
         external_cam_2=external_cam_2,
         enable_recording=enable_recording,
+        perception_cam_key=perception_cam_key,
         ee_from_cam=ee_from_cam,
-        depth_estimator=get_depth_estimator(cam),
+        depth_estimator=get_depth_estimator(perception_cam),
         gripper_mask=gripper_mask,
         cam_mount=mount,
         solvers=solvers,
@@ -718,6 +815,7 @@ def process_scene_geometry(
     masks: np.ndarray,
     bboxes: list,
     grasps: dict,
+    valid_mask: np.ndarray | None = None,
     object_pcds: dict[str, o3d.geometry.PointCloud] | None = None,
 ) -> ProcessedScene:
     """Process perception results into 3D scene geometry for TAMP.
@@ -728,13 +826,15 @@ def process_scene_geometry(
         masks: Segmentation masks from SAM2
         bboxes: Bounding boxes from Gemini
         grasps: Grasp predictions from M2T2
+        valid_mask: Optional (H, W) mask of usable points (see predict_depth_and_grasps): the robot's
+            own geometry and invalid depth are excluded from the table fit and the object meshes
         object_pcds: Optional pre-computed object point clouds
 
     Returns:
         ProcessedScene with table cuboid, object meshes, pcds, and filtered grasps
     """
     # Segment table with RANSAC (returns trimesh Box)
-    table_trimesh = segment_table_with_ransac(xyz_map, rgb_map, masks)
+    table_trimesh = segment_table_with_ransac(xyz_map, rgb_map, masks, valid_mask=valid_mask)
     table_cuboid = convert_trimesh_box_to_curobo_cuboid(table_trimesh, name="table")
     log_curobo_mesh_to_rerun("world/table", table_cuboid.get_mesh(), static_transform=True)
 
@@ -749,6 +849,7 @@ def process_scene_geometry(
         table_top_z,
         return_pcd=True,
         erode_pixels=tiptop_cfg().perception.mask_erosion_pixels,
+        valid_mask=valid_mask,
     )
 
     # Use provided point clouds if available, otherwise use computed ones
@@ -888,7 +989,6 @@ async def run_perception(
     task_instruction: str,
     save_dir: Path,
     depth_estimator: DepthEstimator | None = None,
-    gripper_mask: Bool[np.ndarray, "h w"] | None = None,
     include_workspace: bool = True,
     log_to_rerun: bool = True,
     goal_builder=None,
@@ -916,7 +1016,7 @@ async def run_perception(
             observation.world_from_cam,
             tiptop_cfg().perception.voxel_downsample_size,
             depth_estimator=depth_estimator,
-            gripper_mask=gripper_mask,
+            robot_mask=observation.robot_mask,
             depth_frames=observation.depth_frames,
         ),
         detect_and_segment(rgb, task_instruction),
@@ -936,7 +1036,7 @@ async def run_perception(
         detection_results["bboxes"],
         detection_results["masks"],
         save_dir,
-        gripper_mask,
+        observation.robot_mask,
     )
 
     if log_to_rerun:
@@ -956,6 +1056,7 @@ async def run_perception(
         detection_results["masks"],
         detection_results["bboxes"],
         depth_results["grasps"],
+        depth_results["valid_mask"],
     )
     processed_scene, save_result = await asyncio.gather(process_coroutine, save_future)
 
@@ -1039,6 +1140,126 @@ async def run_perception(
     _log.info(f"Processing scene and perception results took {time.perf_counter() - proc_st:.2f}s")
     _log.info(f"Perception pipeline completed, took {time.perf_counter() - start_time:.2f}s")
     return env, all_surfaces, processed_scene, grounded_atoms
+
+
+def plan_clear_then_task(
+    config: TAMPConfiguration,
+    processed_scene: ProcessedScene,
+    q_init,
+    detected_atoms: list[dict],
+    save_dir: Path,
+    *,
+    ik_solver: IKSolver,
+    motion_gen: MotionGen,
+    cost_overrides: dict | None = None,
+) -> tuple[list | None, float, str | None, list[str]]:
+    """Plan the blockers off the goal surfaces, then the task, and CONCATENATE the two plans.
+
+    Returns ``(plan, planning_seconds, failure_reason, cleared_labels)``. With nothing in the way
+    this is exactly ``run_planning`` on the instruction's own goal, so a scene that needs no clearing
+    plans as it always did.
+
+    **Why two plans and not one goal with the clearing atoms appended.** cuTAMP would then be free to
+    order the 5 objects however BFS enumerates them, and nothing in the symbolic layer knows the
+    blocker has to go first -- so most orderings place onto a still-occupied surface and fail. That
+    enumeration order also depends on PYTHONHASHSEED, which is unset, so it is drawn afresh per
+    PROCESS: measured on ``failure/2026-08-16_23-48-17``, the appended atom was grounded correctly
+    and all five skeletons still came back with the banana 4th or 5th. Planning the clearing on its
+    own removes the ordering question instead of gambling on it (``tiptop.goal_clearing``).
+
+    **The second plan is not re-perceived**, deliberately. Both halves execute inside ONE recorded
+    episode, and a perception pass between them would park the arm at the capture pose for several
+    seconds mid-episode -- a stationary stretch in the middle of the demonstration, with the same
+    command/observation mismatch the parking segments elsewhere in this file exist to avoid. Instead
+    the blocker's new pose is read off the first plan itself (:func:`placed_poses`): cuTAMP stamps
+    each Place step with the pose it updated the collision world to, so no reconstruction is involved
+    and the two phases agree on where the object is by construction.
+
+    **Nor does the arm go home in between.** cuTAMP ends every plan with a ``GoToInitial``, so
+    concatenating two of them verbatim drives the arm back to the home pose after the clearing and
+    straight back out again for the first pick. The clearing's copy is dropped
+    (:func:`drop_return_to_initial`) and the task plans from wherever the clearing actually left the
+    arm, so its opening ``MoveFree`` is one motion between the two configurations instead of two
+    through home. The task's own ``GoToInitial`` stays -- that one ends the episode.
+    """
+    meshes, table = processed_scene.object_meshes, processed_scene.table_cuboid
+    clearing_atoms, goal_surfaces = build_clearing_goal(meshes, table, detected_atoms)
+    blockers = [atom["args"][0] for atom in clearing_atoms]
+
+    def _plan(env, all_surfaces, q, subdir, grasps, q_return=None):
+        return run_planning(
+            env,
+            config,
+            q_init=q,
+            ik_solver=ik_solver,
+            grasps=grasps,
+            motion_gen=motion_gen,
+            all_surfaces=all_surfaces,
+            experiment_dir=save_dir / subdir,
+            cost_overrides=cost_overrides,
+            q_return=q_return,
+        )
+
+    if not blockers:
+        _log.info("No goal surface is blocked; planning the task directly")
+        env, all_surfaces = create_tamp_environment(meshes, table, detected_atoms, include_workspace=True)
+        plan, duration, failure = _plan(env, all_surfaces, q_init, "cutamp", processed_scene.grasps)
+        return plan, duration, failure, []
+
+    _log.info(f"Goal surfaces are blocked by {blockers}; planning the clearing first, then the task")
+    env, all_surfaces = create_tamp_environment(
+        meshes, table, clearing_atoms, include_workspace=True, extra_surface_labels=goal_surfaces
+    )
+    clear_plan, clear_duration, failure = _plan(
+        env, all_surfaces, q_init, "cutamp_clearing", processed_scene.grasps
+    )
+    if clear_plan is None:
+        return None, clear_duration, f"clearing {blockers} off the goal surface(s): {failure}", []
+
+    # Where the clearing plan leaves the arm and the blockers, so the task plans against that world
+    # rather than the one perception saw.
+    placed = placed_poses(clear_plan)
+    moved = move_meshes(meshes, placed)
+    # Drop the clearing plan's trailing GoToInitial: the task plan's own opening MoveFree will take
+    # the arm from wherever the clearing left it straight to the first grasp, instead of driving home
+    # in between and setting straight back out. Done AFTER placed_poses, which reads the Place
+    # steps earlier in the plan and is unaffected either way.
+    clear_plan = drop_return_to_initial(clear_plan)
+    for label in placed:
+        _log.info(
+            f"'{label}' cleared to {[round(float(x), 3) for x in moved[label].pose[:3]]} "
+            f"(was {[round(float(x), 3) for x in meshes[label].pose[:3]]})"
+        )
+    q_after = final_configuration(clear_plan)
+    if q_after is None:
+        return None, clear_duration, "clearing plan contained no trajectory to continue from", []
+
+    # The blockers' M2T2 grasps were harvested at their OLD poses, so they no longer describe the
+    # object. Empty them rather than dropping the key: cuTAMP indexes `self.grasps[obj]` without a
+    # membership check (particle_initialization._sample_grasps), so a missing entry is a KeyError the
+    # moment any skeleton picks that object -- and skeletons that do reach phase two. An empty
+    # `grasps_obj` takes the same branch a never-detected object takes, falling back to heuristic
+    # grasps computed at the pose the object is actually in.
+    task_grasps = dict(processed_scene.grasps)
+    for label in placed:
+        if label in task_grasps:
+            task_grasps[label] = {**task_grasps[label], "grasps_obj": [], "confidences_pt": []}
+    env, all_surfaces = create_tamp_environment(moved, table, detected_atoms, include_workspace=True)
+    # q_return: the task plan STARTS from where the clearing handed over, so its own notion of
+    # "initial" is that mid-episode pose -- without this the episode would end by driving back to
+    # where the blocker was set down instead of to the pose it began at.
+    task_plan, task_duration, failure = _plan(
+        env, all_surfaces, q_after, "cutamp", task_grasps, q_return=q_init
+    )
+    duration = clear_duration + task_duration
+    if task_plan is None:
+        return None, duration, f"task after clearing {blockers}: {failure}", []
+
+    _log.info(
+        f"Two-phase plan: {len(clear_plan)} step(s) to clear {blockers}, "
+        f"{len(task_plan)} for the task, executed as one episode"
+    )
+    return clear_plan + task_plan, duration, None, blockers
 
 
 def _plan_largest_solvable_reset(
@@ -1302,7 +1523,6 @@ async def _run_one_arm(
         task_instruction,
         arm_dir,
         depth_estimator=container.depth_estimator,
-        gripper_mask=container.gripper_mask,
         goal_builder=arm_goal_builder(arm, base_y),
     )
     meta["perception_duration"] = time.perf_counter() - perception_start
@@ -1516,7 +1736,6 @@ async def _run_yam_dual_rollout(
                 task_instruction,
                 save_dir,
                 depth_estimator=container.depth_estimator,
-                gripper_mask=container.gripper_mask,
                 goal_builder=handover_goal_builder(base_y),
             )
             meta["perception_duration"] = time.perf_counter() - perception_start
@@ -1712,7 +1931,12 @@ async def _run_scene_reset(
         else:
             go_to_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
         _open_gripper_if_needed(container)
-        go_to_capture(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+        if container.perception_cam_key == "hand":
+            go_to_capture(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+        else:
+            # The third-person camera already sees the whole table, and q_capture would only put the
+            # arm in front of it. Perceive from home instead (see the rollout path for why).
+            _log.debug("Scene reset: perception reads the exterior camera; staying at home")
 
         # The instruction only steers DETECTION -- the goal comes from geometry (scene_reset), so
         # nothing here depends on the VLM naming objects the same way twice. Reusing the last task
@@ -1729,7 +1953,6 @@ async def _run_scene_reset(
             instruction,
             save_dir,
             depth_estimator=container.depth_estimator,
-            gripper_mask=container.gripper_mask,
             goal_builder=reset_goal_builder(),
         )
         (save_dir / "reset.json").write_text(
@@ -1882,8 +2105,20 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                     except Exception as _e:
                         _log.exception("Gripper open/check failed: " + str(_e))
 
-                    _log.debug("Moving robot to capture joint positions")
-                    go_to_capture(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+                    if container.perception_cam_key == "hand":
+                        # Perception reads the WRIST camera, so the arm goes to q_capture to point it
+                        # at the scene.
+                        _log.debug("Moving robot to capture joint positions")
+                        go_to_capture(
+                            time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen
+                        )
+                    else:
+                        # The exterior camera already sees the scene, and q_capture would only put the
+                        # arm in front of it -- an arm in frame ends up in the point cloud, the RANSAC
+                        # table fit and the grasps. It is masked out by its collision spheres either
+                        # way, but a mask is not free: it erases whatever it occludes. Perceive from
+                        # home, which is further out of the shot.
+                        _log.debug("Perception reads the exterior camera; staying at home instead of q_capture")
 
                 now = datetime.now()
                 timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
@@ -1995,13 +2230,13 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         task_instruction,
                         save_dir,
                         depth_estimator=container.depth_estimator,
-                        gripper_mask=container.gripper_mask,
                     )
                     perception_duration = time.perf_counter() - perception_start
 
                     cutamp_plan = None
                     planning_duration = None
                     failure_reason = None
+                    cleared: list[str] = []
                     if os.environ.get("TIPTOP_DRY_RUN"):
                         _log.info("PATCH: TIPTOP_DRY_RUN=1 -> skipping planning/execute (perception-only)")
                         failure_reason = "dry_run"
@@ -2011,17 +2246,34 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         if os.environ.get("TIPTOP_DRY_RUN"):
                             raise RuntimeError("dry_run skip")
                         _log.info("Running Planning...")
-                        cutamp_plan, planning_duration, failure_reason = run_planning(
-                            env,
-                            config,
-                            q_init=observation.q_init,
-                            ik_solver=container.ik_solver,
-                            grasps=processed_scene.grasps,
-                            motion_gen=container.motion_gen,
-                            all_surfaces=all_surfaces,
-                            experiment_dir=save_dir / "cutamp",
-                            cost_overrides=container.cost_overrides,
-                        )
+                        # `clear_goal_surfaces` in cfg/tamp tamp_overrides opts into planning the
+                        # blockers off the goal surfaces first and concatenating that plan with the
+                        # task's, so both run inside this one recorded episode. Off -> exactly the
+                        # single run_planning call this has always made. See tiptop.goal_clearing.
+                        if resolve_clear_goal_surfaces(container.cost_overrides):
+                            cutamp_plan, planning_duration, failure_reason, cleared = plan_clear_then_task(
+                                config,
+                                processed_scene,
+                                observation.q_init,
+                                grounded_atoms,
+                                save_dir,
+                                ik_solver=container.ik_solver,
+                                motion_gen=container.motion_gen,
+                                cost_overrides=container.cost_overrides,
+                            )
+                        else:
+                            cleared = []
+                            cutamp_plan, planning_duration, failure_reason = run_planning(
+                                env,
+                                config,
+                                q_init=observation.q_init,
+                                ik_solver=container.ik_solver,
+                                grasps=processed_scene.grasps,
+                                motion_gen=container.motion_gen,
+                                all_surfaces=all_surfaces,
+                                experiment_dir=save_dir / "cutamp",
+                                cost_overrides=container.cost_overrides,
+                            )
                         _log.info(
                             f"Perception and cuTAMP planning took: {perception_duration + planning_duration:.2f}s"
                         )
@@ -2064,6 +2316,7 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                             planning_success=cutamp_plan is not None,
                             planning_failure_reason=failure_reason,
                             planning_duration=planning_duration,
+                            cleared=cleared,
                         )
                         _log.info(f"Logs, results, and visualizations saved to {save_dir}")
 

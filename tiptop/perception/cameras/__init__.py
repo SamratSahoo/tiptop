@@ -115,9 +115,14 @@ def get_hand_camera(depth: bool = False) -> Camera:
     return _build_camera(tiptop_cfg().cameras.hand, depth=depth)
 
 
-def get_external_camera() -> Camera:
-    """Get the external camera by serial number."""
-    return _build_camera(tiptop_cfg().cameras.external)
+def get_external_camera(depth: bool = False) -> Camera:
+    """The exterior (third-person) camera — recorded always, and TAMP's perception camera when
+    ``cameras.perception`` is ``external``.
+
+    ``depth`` turns on the camera's own depth stream, which perception does not need (it runs
+    FoundationStereo over the stereo pair) but ``viz-calibration`` reads directly.
+    """
+    return _build_camera(tiptop_cfg().cameras.external, depth=depth)
 
 
 def get_external_camera_2() -> Camera | None:
