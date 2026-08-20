@@ -57,6 +57,7 @@ from tiptop.motion_planning import (
     resolve_time_dilation_factor,
     resolve_trace_cfg,
     resolve_traj_length_norm,
+    resolve_transit_apex,
     summarize_curobo_config,
 )
 from tiptop.perception.cameras import (
@@ -2439,6 +2440,9 @@ def _sync_entrypoint(
     # every other robot yields a single entry, identical to before. `arm_mode`/`dual_task` only
     # apply to the `bimanual_yam_dual` embodiment (_planning_robot_types() yields exactly one entry
     # for it), and default to cuTAMP's own single-arm defaults everywhere else.
+    apex_height, apex_min_dist = resolve_transit_apex(cost_overrides)
+    if apex_height > 0:
+        _log.info(f"Transit apex active: {apex_height}m (min transit distance {apex_min_dist}m)")
     tamp_configs = {
         robot_type: build_tamp_config(
             num_particles=num_particles,
@@ -2455,6 +2459,10 @@ def _sync_entrypoint(
             arm_mode=cfg.robot.get("arm_mode", "single"),
             dual_task=cfg.robot.get("dual_task", "parallel"),
             max_motion_refine_attempts=resolve_max_motion_refine_attempts(cost_overrides),
+            # Apex waypoint in each Pick/Place transit (0 = off); a TAMP-config knob, not a
+            # cuRobo cost weight. See resolve_transit_apex.
+            transit_apex_height=apex_height,
+            transit_apex_min_dist=apex_min_dist,
         )
         for robot_type in _planning_robot_types()
     }

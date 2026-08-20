@@ -57,6 +57,8 @@ def build_tamp_config(
     arm_mode: str = "single",
     dual_task: str = "parallel",
     max_motion_refine_attempts: int | None = 32,
+    transit_apex_height: float = 0.0,
+    transit_apex_min_dist: float = 0.10,
 ) -> TAMPConfiguration:
     """Build a TAMPConfiguration with TiPToP defaults.
 
@@ -99,6 +101,12 @@ def build_tamp_config(
         # Gate for the grasp orientation-change soft cost (weight set in run_planning). Enabled from
         # cfg/tamp when `grasp_pose_change_weight` is present; see resolve_grasp_orientation_cost.
         grasp_orientation_cost=grasp_orientation_cost,
+        # Explicit apex waypoint in each Pick/Place free-space transit: planned as
+        # retract -> apex -> pre-grasp so the end-effector lifts, traverses and descends instead of
+        # sweeping low across the table. Off (0.0) unless a cfg/tamp yml sets `transit_apex_height`
+        # in tamp_overrides; see resolve_transit_apex and cuTAMP's TAMPConfiguration.
+        transit_apex_height=transit_apex_height,
+        transit_apex_min_dist=transit_apex_min_dist,
     )
 
 

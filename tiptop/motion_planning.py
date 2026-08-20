@@ -312,6 +312,26 @@ def resolve_traj_length_norm(overrides: dict | None, default: float = 2.0) -> fl
     return float(val)
 
 
+def resolve_transit_apex(overrides: dict | None) -> tuple[float, float]:
+    """Effective (apex height, min horizontal distance) for the transit apex waypoint, in metres.
+
+    Read from the ``transit_apex_height`` / ``transit_apex_min_dist`` keys of a cfg/tamp
+    ``tamp_overrides`` block. A nonzero height makes cuTAMP plan each Pick/Place free-space transit as
+    retract -> apex -> pre-grasp instead of retract -> pre-grasp, where the apex sits that far above
+    the higher of the two end-effector positions (see cuTAMP ``TAMPConfiguration.transit_apex_height``).
+    That is what turns the planner's low lateral sweep into a lift-traverse-descend arc; no cuRobo cost
+    weight can do it, because the trajopt objective never reads the end-effector's Cartesian path.
+
+    Height 0 (the default) disables the apex entirely and the transit is planned exactly as before.
+    """
+    ov = overrides or {}
+    height = float(ov.get("transit_apex_height") or 0.0)
+    min_dist = ov.get("transit_apex_min_dist")
+    # cuTAMP's own default for the guard, kept here so a config setting only the height gets it.
+    min_dist = 0.10 if min_dist is None else float(min_dist)
+    return height, min_dist
+
+
 def resolve_max_motion_refine_attempts(overrides: dict | None, default: int | None = 32) -> int | None:
     """Effective cap on how many satisfying particles cuTAMP tries motion refinement on.
 
@@ -395,6 +415,10 @@ def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dic
             # planning-time knobs (read by tiptop_gt_plan.py), echoed for a self-describing record.
             "num_particles": ov.get("num_particles"),
             "opt_steps_per_skeleton": ov.get("opt_steps_per_skeleton"),
+            # Transit apex (cuTAMP-side geometry, not a cuRobo cost) -- resolved rather than echoed so
+            # the record shows the guard distance a config that set only the height actually got.
+            "transit_apex_height": resolve_transit_apex(ov)[0],
+            "transit_apex_min_dist": resolve_transit_apex(ov)[1],
         },
         "plan_overrides": {"enable_finetune_trajopt": False, "time_dilation_factor": time_dilation_factor},
     }
