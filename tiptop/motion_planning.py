@@ -190,9 +190,17 @@ def apply_cost_overrides(cost: dict, overrides: dict | None) -> None:
         jd = cost.setdefault("joint_density_cfg", {"weight": 0.0, "n_joints": 7, "huber_delta": 0.05})
         jd["weight"] = float(overrides["joint_density_weight"])
     # End-effector pose manifold cost (see curobo cost/ee_manifold_cost.py): MINIMIZES the
-    # Mahalanobis distance between the segment's arc-length EE-pose fingerprint and the DROID latent
+    # Mahalanobis distance between the segment's arc-length EE-pose description and the DROID
     # cluster, pulling Cartesian path shape AND wrist orientation toward human teleop. Timing-blind
     # by construction, so it composes with vae_manifold_weight rather than fighting it.
+    #
+    # SCALE CHANGED with the invariant manifold (ee_manifold.pt, now the default). Measured on 56
+    # real planner segments at weight 1: the legacy VAE charges a median excess of 464 with
+    # |dC/dpos| 1.3e4, the invariant manifold 12.4 with 3.1e2 -- it scores 22 whitened quantities
+    # rather than a 12-d latent with an inflated precision. Converting the legacy 5000 gives 187k by
+    # value parity (what the particle phase sees) and 216k by gradient parity (what the gradient
+    # phase sees); they agree, so ~200k is equal authority. Start below it and sweep -- the old
+    # weight was over-strong as well as mis-aimed.
     # ee_vae_path selects the checkpoint; ee_manifold_slack turns off the "stop once you are as
     # DROID-like as a typical human stroke" threshold. Block may be absent -> create on demand.
     if any(overrides.get(k) is not None for k in
