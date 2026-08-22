@@ -33,6 +33,8 @@ from tiptop.config import tiptop_cfg
 from tiptop.goal_clearing import resolve_clear_goal_surfaces
 from tiptop.motion_planning import (
     build_curobo_solvers,
+    apply_perception_overrides,
+    resolve_grasp_center_cost,
     resolve_grasp_orientation_cost,
     resolve_max_motion_refine_attempts,
     resolve_time_dilation_factor,
@@ -99,6 +101,10 @@ class TiptopPlanningServer:
         # cuRobo cost/tamp-parameter overrides (empty by default -> stock gradient_trajopt.yml +
         # tiptop.yml behavior). Applied at solver build time so every plan uses these tamp params.
         self._curobo_overrides = _load_curobo_overrides(curobo_overrides)
+        # Perception knobs travel in the same dict; applied before any perception so the grasp
+        # candidates cuTAMP receives reflect them. See apply_perception_overrides.
+        for _key, (_old, _new) in apply_perception_overrides(self._cfg, self._curobo_overrides).items():
+            _log.info(f"Perception override: {_key} {_old} -> {_new}")
         time_dilation_factor = resolve_time_dilation_factor(
             self._curobo_overrides, self._cfg.robot.time_dilation_factor
         )
@@ -130,6 +136,7 @@ class TiptopPlanningServer:
             time_dilation_factor=time_dilation_factor,
             traj_length_norm=resolve_traj_length_norm(self._curobo_overrides),
             grasp_orientation_cost=resolve_grasp_orientation_cost(self._curobo_overrides),
+            grasp_center_cost=resolve_grasp_center_cost(self._curobo_overrides),
             # Only meaningful for robot_type == "bimanual_yam_dual" (see tiptop_yam_dual.yml); every
             # other config leaves robot.arm_mode/dual_task unset and gets cuTAMP's single-arm defaults.
             arm_mode=self._cfg.robot.get("arm_mode", "single"),

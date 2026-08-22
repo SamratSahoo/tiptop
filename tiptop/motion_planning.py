@@ -361,6 +361,88 @@ def resolve_grasp_orientation_cost(overrides: dict | None) -> bool:
     return bool((overrides or {}).get("grasp_pose_change_weight"))
 
 
+def resolve_grasp_center_cost(overrides: dict | None) -> bool:
+    """Whether to enable cuTAMP's off-center grasp soft cost, from cfg/tamp tamp_overrides.
+
+    Enabled iff a truthy ``grasp_center_weight`` is present (the same key run_planning reads for the
+    weight), so a single YAML knob both gates the cost (this bool -> TAMPConfiguration) and sets its
+    multiplier. A zero/absent weight leaves it off.
+    """
+    return bool((overrides or {}).get("grasp_center_weight"))
+
+
+# cfg/tamp `tamp_overrides` keys that retune PERCEPTION rather than the solver, mapped to their
+# path in tiptop.yml. Everything else in tamp_overrides is a cuRobo cost weight or a TAMP-config
+# knob; these are the exceptions, because the grasp candidates perception hands cuTAMP bound what
+# any downstream cost can choose between. Add a key here to make it settable per data-gen config.
+_PERCEPTION_OVERRIDE_KEYS = {
+    # Max distance from an M2T2 grasp's contact point to a reconstructed object point for that
+    # grasp to be associated with the object (tiptop_run.process_scene). Grasps beyond it are
+    # dropped outright, so raising this recovers candidates on objects whose surface reconstructs
+    # imprecisely -- plush/fuzzy toys especially, where the stock 0.01 can leave an object with a
+    # single usable grasp and nothing for GraspCost to select between. Raising it too far starts
+    # stealing grasps from a neighbouring object, since the association is nearest-point over the
+    # combined cloud.
+    "contact_threshold_m": (("perception", "contact_threshold_m"), float),
+    # M2T2's own confidence floor for emitting a grasp (its `mask_thresh`). This is the knob that
+    # actually controls how many candidates each object gets: replayed on the 2026-08-22_01-56-41
+    # scene, dropping it from the stock 0.035 to 0.02 took the blue toy from 9 candidates to 32 and
+    # the tan toy from 5 to 84, while widening contact_threshold_m over the same range moved each by
+    # one or two. Lower admits grasps M2T2 is less sure of, so it trades candidate count against
+    # per-grasp quality -- and M2T2 confidence appears nowhere in cuTAMP's objective, it only ranks
+    # particle initialization, so a low-confidence but well-centered grasp can now win.
+    "grasp_threshold": (("perception", "m2t2", "grasp_threshold"), float),
+    # How many stochastic M2T2 passes are POOLED into one grasp set. This is the strongest lever on
+    # candidate count and, unlike grasp_threshold, it is quality-neutral -- it samples the same
+    # distribution more times rather than lowering the bar. Replayed on the 2026-08-22_02-25-22
+    # scene at grasp_threshold 0.02, three plush toys got 0 / 0 / 0 candidates at the stock 5 passes
+    # and 8 / 3 / 21 at 15. Cost is linear wall-clock: ~0.9 s at 5, ~3.2 s at 20, ~4.7 s at 30.
+    "m2t2_num_runs": (("perception", "m2t2", "num_runs"), int),
+    # Voxel size the scene cloud is downsampled to BEFORE it is handed to M2T2 (it feeds nothing
+    # else -- the object meshes and point clouds are built from the full xyz_map). Uniform voxels
+    # mean a small object collapses to very few points: on the 2026-08-22_02-35-00 scene the three
+    # toys held ~118-141 points each at the stock 0.0075 against the plate's 982, and M2T2 proposed
+    # roughly nothing on them. Halving it to 0.005 raised the toys' grasp count 4.7x (10 -> 47,
+    # mean of 3 calls) for ~0.2 s. Note the gain was uneven -- one toy went 9 -> 44, the other two
+    # stayed near zero -- so this raises the floor, it does not guarantee any given object.
+    "voxel_downsample_size": (("perception", "voxel_downsample_size"), float),
+}
+
+
+def apply_perception_overrides(cfg, overrides: dict | None) -> dict:
+    """Apply cfg/tamp ``tamp_overrides`` perception knobs onto the live tiptop config, in place.
+
+    Returns ``{key: (old, new)}`` for what changed, for logging. Mutating the cached DictConfig is
+    how tiptop already retargets process-wide config (see ``config.as_robot_type``); doing it here,
+    before any perception runs, is what makes the value take effect for the whole session.
+
+    NOTE ON PROVENANCE: ``recording.save_run_outputs`` copies tiptop.yml into the run directory as a
+    raw file, so that copy shows the ON-DISK value, not the override. The effective value is
+    recorded in the run's ``curobo_config.json`` (which carries the raw tamp_overrides dict) and
+    logged at INFO here.
+    """
+    applied = {}
+    for key, (path, cast) in _PERCEPTION_OVERRIDE_KEYS.items():
+        value = (overrides or {}).get(key)
+        if value is None:
+            continue
+        # Cast before comparing: an int knob given 20.0 by JSON must land as 20, not 20.0.
+        value = cast(value)
+        if value <= 0:
+            raise ValueError(f"{key} must be positive, got {value}")
+        node = cfg
+        for part in path[:-1]:
+            node = node[part]
+        # OmegaConf raises on an unknown key in a struct node, which is what we want: a key listed
+        # here but missing from tiptop.yml is a bug in this table, not something to swallow.
+        previous = node.get(path[-1])
+        if previous == value:
+            continue
+        node[path[-1]] = value
+        applied[key] = (previous, value)
+    return applied
+
+
 def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dict:
     """Resolved cuRobo trajopt config used for a plan, for saving with each run.
 

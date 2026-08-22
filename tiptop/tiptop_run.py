@@ -52,6 +52,8 @@ from tiptop.motion_planning import (
     go_to_capture,
     go_to_dual_home,
     go_to_home,
+    apply_perception_overrides,
+    resolve_grasp_center_cost,
     resolve_grasp_orientation_cost,
     resolve_max_motion_refine_attempts,
     resolve_time_dilation_factor,
@@ -2423,6 +2425,11 @@ def _sync_entrypoint(
         )
     _log.info(f"Solver effort: num_particles={num_particles}, opt_steps_per_skeleton={opt_steps_per_skeleton}")
     cfg = tiptop_cfg()
+    # Perception knobs from the same tamp_overrides dict. Applied HERE -- before the entrypoint runs
+    # any perception -- because they change the grasp candidates cuTAMP is given, and no downstream
+    # cost can select a grasp perception never handed over. See apply_perception_overrides.
+    for _key, (_old, _new) in apply_perception_overrides(cfg, cost_overrides).items():
+        _log.info(f"Perception override: {_key} {_old} -> {_new}")
     # time_dilation_factor[_literal] is a plan-time knob (not a cuRobo cost weight), so it is NOT
     # handled by build_curobo_solvers/apply_cost_overrides — resolve it here and thread it into the
     # TAMP config, mirroring tiptop_websocket_server. Without this, cfg/tamp/{tdf,vae_tdf}.yml's
@@ -2456,6 +2463,7 @@ def _sync_entrypoint(
             # time_dilation_factor this is a TAMP-config knob, not a cuRobo cost weight.
             traj_length_norm=resolve_traj_length_norm(cost_overrides),
             grasp_orientation_cost=resolve_grasp_orientation_cost(cost_overrides),
+            grasp_center_cost=resolve_grasp_center_cost(cost_overrides),
             arm_mode=cfg.robot.get("arm_mode", "single"),
             dual_task=cfg.robot.get("dual_task", "parallel"),
             max_motion_refine_attempts=resolve_max_motion_refine_attempts(cost_overrides),
