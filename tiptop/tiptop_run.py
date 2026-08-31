@@ -54,9 +54,11 @@ from tiptop.motion_planning import (
     go_to_home,
     apply_perception_overrides,
     resolve_grasp_center_cost,
+    resolve_grasp_rank_conf_weight,
     resolve_grasp_orientation_cost,
     resolve_max_motion_refine_attempts,
     resolve_posture_selection,
+    resolve_require_m2t2_grasps,
     resolve_time_dilation_factor,
     resolve_trace_cfg,
     resolve_traj_length_norm,
@@ -2473,6 +2475,7 @@ def _sync_entrypoint(
             traj_length_norm=resolve_traj_length_norm(cost_overrides),
             grasp_orientation_cost=resolve_grasp_orientation_cost(cost_overrides),
             grasp_center_cost=resolve_grasp_center_cost(cost_overrides),
+            grasp_rank_conf_weight=resolve_grasp_rank_conf_weight(cost_overrides),
             arm_mode=cfg.robot.get("arm_mode", "single"),
             dual_task=cfg.robot.get("dual_task", "parallel"),
             max_motion_refine_attempts=resolve_max_motion_refine_attempts(cost_overrides),
@@ -2483,6 +2486,10 @@ def _sync_entrypoint(
             # IK branch selection by teleop posture (off unless the cfg sets
             # posture_selection_seeds). See resolve_posture_selection.
             posture_selection=posture_selection,
+            # Fail instead of silently substituting collision-sphere heuristic grasps for an object
+            # perception proposed nothing for (off unless the cfg sets it). See
+            # resolve_require_m2t2_grasps.
+            require_m2t2_grasps=resolve_require_m2t2_grasps(cost_overrides),
         )
         for robot_type in _planning_robot_types()
     }

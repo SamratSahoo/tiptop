@@ -376,6 +376,23 @@ def resolve_posture_selection(overrides: dict | None) -> dict:
     return out
 
 
+def resolve_require_m2t2_grasps(overrides: dict | None) -> bool:
+    """Whether a zero-candidate object should FAIL planning instead of taking heuristic grasps.
+
+    With ``m2t2_grasps`` on, an object M2T2 proposed nothing for is not dropped: cuTAMP's
+    ``_sample_grasps`` falls through to the 4-/6-DOF heuristic sampler, which draws grasps from the
+    object's COLLISION-SPHERE approximation rather than from perception. Measured over shipped runs'
+    ``scene_objects.json``, 18-43% of picked objects took that path, and it is a direct mechanism
+    for closing on empty air (analysis_dataset_diff/TELEOP_VS_APEX.md, Finding 5).
+
+    Off by default so existing configs keep their planning outcomes -- the fallback is warned about
+    either way. Data-collection configs should set ``require_m2t2_grasps: true``, where a guessed
+    grasp that misses costs a whole mislabelled episode; raise ``m2t2_num_runs`` alongside it so
+    objects actually get candidates rather than just failing more.
+    """
+    return bool((overrides or {}).get("require_m2t2_grasps"))
+
+
 def resolve_ik_num_seeds(overrides: dict | None) -> int | None:
     """How many seeds the IKSolver optimizes per problem.
 
@@ -432,6 +449,22 @@ def resolve_grasp_center_cost(overrides: dict | None) -> bool:
     multiplier. A zero/absent weight leaves it off.
     """
     return bool((overrides or {}).get("grasp_center_weight"))
+
+
+def resolve_grasp_rank_conf_weight(overrides: dict | None) -> float | None:
+    """Weight on M2T2 confidence when ranking satisfying particles, from cfg/tamp tamp_overrides.
+
+    ``None`` (key absent) keeps cuTAMP's historical ranking, which orders the satisfying particles
+    by summed grasp confidence ALONE. That ranking, not the optimizer, picks the plan that runs --
+    motion refinement takes the first particle cuRobo can plan, essentially always rank 0 -- so with
+    it in force `grasp_center_weight` and `grasp_pose_change_weight` do not affect the executed
+    grasp at all. Setting this key ranks on `soft_cost - weight * summed_confidence` instead.
+
+    Read with a sentinel rather than a truthiness test (unlike `grasp_center_weight`) because 0.0 is
+    a meaningful setting here: rank on the soft costs alone, dropping confidence from the score.
+    """
+    weight = (overrides or {}).get("grasp_rank_conf_weight")
+    return None if weight is None else float(weight)
 
 
 # cfg/tamp `tamp_overrides` keys that retune PERCEPTION rather than the solver, mapped to their
