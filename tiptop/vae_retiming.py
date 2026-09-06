@@ -22,8 +22,8 @@ WHAT IS OPTIMIZED, AND WHY THERE IS NO DURATION SEARCH
 One batched Adam run over two things at once:
 
 * ``theta`` -- one duration knot per arc-length interval, the SHAPE of the speed profile.
-* ``nu``    -- a single scalar squashed into the allowed duration range: how many 15 Hz frames the
-               stroke spans, and hence its duration.
+* ``span``  -- a single scalar, projected onto the allowed duration range after each step: how many
+               15 Hz frames the stroke spans, and hence its duration.
 
 Duration used to be a grid search (a coarse geomspace sweep plus a refine bracket, each candidate
 getting its own independently-converged ``theta``) because the obvious parameterization makes it
@@ -76,11 +76,13 @@ made the score BETTER on both test plans, not merely equal, so do not reintroduc
 Things that ARE load-bearing and were confirmed by trying to remove them: the boundary term (without
 it the emitted lead speed is 0.42-0.49 rad/s against a 0.10 target), ``_KNOTS``, ``_N_STARTS``, and
 theta's normalization + tanh rail (an unnormalized "duration is just the sum of interval times"
-parameterization deletes nu entirely and is genuinely simpler, but scores ~19% worse on one plan).
+parameterization deletes the duration parameter entirely and is genuinely simpler, but scores
+~19% worse on one plan).
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 
@@ -110,16 +112,26 @@ _KNOTS = 64
 #: 6.31 / 13.29 at 5/16 -- worse than 1.0 on both plans, so the rail is not merely a safety net.
 _RAIL = 1.0
 
-#: One joint optimization over (theta, nu). Adam steps, and the two learning rates.
+#: One joint optimization over (theta, span). Adam steps, and the two learning rates.
 #:
-#: The duration rate is NOT a free tuning knob to raise: duration is a single scalar competing with
-#: 63 profile knots, so on its own a larger step just walks the duration somewhere bad before theta
-#: has shaped anything. Measured on a 7-stroke plan, raising it alone monotonically hurt (total
-#: maha^2 13.4 -> 17.7 -> 26.1 -> 205 for 0.05/0.15/0.30/0.60 at a single start). What actually fixes
-#: the imbalance is starting from several durations at once -- see _N_STARTS.
+#: The duration rate is a FRACTION OF THE ALLOWED RANGE per step, not an absolute frame count: Adam
+#: moves a parameter by ~lr in its own units, and a stroke's [s_lo, s_hi] range spans an order of
+#: magnitude across strokes, so an absolute rate is far too slow for a wide range and too coarse for
+#: a narrow one. Ablated (analysis_dataset_diff/NU_PARAM_ABLATION.txt): with the rate scaled this
+#: way, optimizing the frame count directly matches the previous sigmoid-squashed parameterization
+#: (median maha^2 0.79 vs 0.82, paired -0.03) with more cap-feasible candidates (8.5 vs 7.0 of 16);
+#: with an unscaled rate it is far worse (1.44, 2.0 of 16) because 500 steps cannot cross the range.
+#: 0.0375 reproduces the old sigmoid's midpoint sensitivity, 0.15 * (s_hi - s_lo) / 4, exactly.
+#:
+#: It is NOT a free tuning knob to raise: duration is a single scalar competing with 63 profile
+#: knots, so on its own a larger step just walks the duration somewhere bad before theta has shaped
+#: anything. Measured on a 7-stroke plan under the old parameterization, raising it alone
+#: monotonically hurt (total maha^2 13.4 -> 17.7 -> 26.1 -> 205 for 0.05/0.15/0.30/0.60 at a single
+#: start, in logit units). What fixes the imbalance is starting from several durations at once --
+#: see _N_STARTS.
 _ITERS = 500
 _LR_THETA = 0.08
-_LR_DURATION = 0.15
+_LR_DURATION = 0.0375
 
 #: Initial durations, log-spaced across the allowed range, optimized SIMULTANEOUSLY as one batch.
 #: Strokes differ in where their basin sits -- most land near the middle of the range, but a Place
@@ -152,13 +164,24 @@ _N_STARTS = 16
 _BOUNDARY_WEIGHT = 50.0
 
 #: Allowed duration range, as multiples of the stroke's own cuRobo wall-clock, and the absolute
-#: seconds it is clipped to. These are BOX BOUNDS on the optimized duration (nu is squashed into
-#: them), not a set of candidates. The lower multiple is what lets the VAE speed a stroke up; the
-#: upper one is `blend_max_duration_mult`, passed in.
+#: seconds it is clipped to. These are BOX BOUNDS on the optimized duration (``span`` is projected
+#: onto them after each Adam step), not a set of candidates. The lower multiple is what lets the VAE
+#: speed a stroke up; the upper one is `blend_max_duration_mult`, passed in.
 _D_LO_MULT = 0.2
 _D_ABS_LO, _D_ABS_HI = 0.8, 20.0
 
 _VAE_RATE_HZ = 15.0
+
+# Shrinkage ladder for the sampled target draw (see target_latent). The draw is a TARGET, not a
+# feasibility statement, so an extreme one asks for a stroke the robot's velocity/acceleration caps
+# then reject -- measured 1-2 strokes in 10 unemittable at full scale. Each entry is tried in turn
+# and the first that emits wins; 0.0 is the cluster MEAN, i.e. the original objective.
+#
+# Graduated rather than all-or-nothing because the fallback costs exactly the variance this change
+# exists to restore: measured over 10 planner strokes, residual log-duration sd was 0.153 with the
+# mean target, 0.350 sampled with no guard, but only 0.207 when the 2 cap-failing strokes dropped
+# straight to the mean. Shrinking keeps those strokes sampled, just less far out.
+_TARGET_SCALES = (1.0, 0.6, 0.3, 0.0)
 
 
 class _Scorer:
@@ -186,16 +209,41 @@ class _Scorer:
         feats = (feats - self.pack["chan_mu"]) / self.pack["chan_sd"]
         return feats.transpose(1, 2).contiguous()
 
-    def maha2(self, x: torch.Tensor, m: torch.Tensor):
-        """Squared Mahalanobis distance to the DROID cluster, on a masked (zero-padded) window."""
-        dz = self.pack["model"].encode_mu_masked(x, m) - self.pack["droid_mean"]
+    @property
+    def chol_cov(self) -> torch.Tensor:
+        """Cholesky factor of the DROID latent covariance, for drawing target latents.
+
+        ``load_vae_manifold`` exposes the precision, not the covariance; they are exact inverses
+        (verified ``cov @ prec == I`` to 1e-3 on the shipped checkpoint), so inverting here avoids
+        touching the vendored cuRobo loader.
+        """
+        if getattr(self, "_chol", None) is None:
+            cov = torch.linalg.inv(self.pack["droid_prec"])
+            cov = 0.5 * (cov + cov.T)                       # symmetrise away inversion round-off
+            self._chol = torch.linalg.cholesky(cov)
+        return self._chol
+
+    def maha2(self, x: torch.Tensor, m: torch.Tensor, target: torch.Tensor | None = None):
+        """Squared Mahalanobis distance on a masked (zero-padded) window.
+
+        ``target`` defaults to the DROID cluster MEAN, which is the mode-seeking objective: its
+        optimum is the centroid, a point no real motion occupies (the checkpoint bakes
+        ``maha2_droid_mean = 7.04`` over 94,774 real DROID segments -- real motion sits at ~7, not 0).
+        Passing a target SAMPLED from the cluster is what makes this a distribution match instead;
+        see :func:`target_latent`.
+        """
+        z = self.pack["model"].encode_mu_masked(x, m)
+        dz = z - (self.pack["droid_mean"] if target is None else target)
         return torch.einsum("ni,ij,nj->n", dz, self.pack["droid_prec"], dz)
 
-    def score_emitted(self, positions: np.ndarray, duration: float) -> float:
+    def score_emitted(self, positions: np.ndarray, duration: float,
+                      target: torch.Tensor | None = None) -> float:
         """Score an EMITTED stroke: resample to exactly 15 Hz and encode it unpadded.
 
         Deliberately independent of the optimizer's own machinery -- this is what actually ships, so
-        it is what starts are ranked by.
+        it is what starts are ranked by. ``target`` must be the SAME latent the optimizer used: with
+        a sampled target, ranking starts by distance to the cluster mean would re-select the most
+        typical candidate and undo the sampling (an argmin over _N_STARTS is an extreme-value pick).
         """
         n = max(6, int(round(duration * _VAE_RATE_HZ)) + 1)
         src = np.linspace(0.0, 1.0, len(positions))
@@ -204,8 +252,8 @@ class _Scorer:
         qt = torch.as_tensor(q[None], device=self.device, dtype=torch.float32)
         x = self.features(qt)
         with torch.no_grad():
-            dz = self.pack["model"].encode_mu(x, torch.ones(1, 1, n, device=self.device))
-            dz = dz - self.pack["droid_mean"]
+            z = self.pack["model"].encode_mu(x, torch.ones(1, 1, n, device=self.device))
+            dz = z - (self.pack["droid_mean"] if target is None else target)
             return float(torch.einsum("ni,ij,nj->n", dz, self.pack["droid_prec"], dz))
 
 
@@ -218,6 +266,44 @@ def _scorer(checkpoint_path: str | None, n_joints: int) -> _Scorer:
     if _SCORER is None or _SCORER.n_joints != n_joints:
         _SCORER = _Scorer(checkpoint_path, n_joints)
     return _SCORER
+
+
+def target_latent(scorer: "_Scorer", knots_np: np.ndarray, enabled: bool,
+                  scale: float = 1.0) -> torch.Tensor | None:
+    """One latent for this stroke to aim at: a DRAW from the DROID cluster, or None for the mean.
+
+    WHY THIS EXISTS. The objective minimises Mahalanobis distance to ``droid_mean``, so its optimum
+    is the cluster CENTROID -- and ``vae_retime_group`` then takes an argmin over ``_N_STARTS``
+    candidates, which pushes further into "more typical than typical". Both levels select for
+    typicality, and the result is that every stroke of a given path length gets nearly the same
+    clock. Measured on gripper-delimited strokes matched for path length (1.5-4.0 rad), residual
+    log-duration sd after removing the duration~length law: DROID 0.414, this lab's teleop 0.288,
+    generated 0.148 -- between-stroke timing variance roughly 2.8x too small.
+
+    Minimising distance to a distribution's mean returns the mean. A distribution MATCH needs a
+    sample, so this draws ``z* ~ N(droid_mean, droid_cov)`` and the caller aims at that instead.
+
+    Feasibility was the real risk -- only the time law is free here, so a sampled target could just
+    project back onto the same latent. It does not: re-timing one fixed real DROID path over 5
+    durations x 5 profiles spans 4.98 Mahalanobis units against a real between-stroke spread of 2.18,
+    i.e. 229% of the variation that needs reproducing (analysis_dataset_diff/VAE_RETIMING_FIX.md).
+
+    The seed is derived from the stroke GEOMETRY, so a re-plan of the same scene reproduces the same
+    timing, different strokes draw independently, and no caller has to thread a stroke index through.
+    The hash is chaotic by design: near-identical geometries must give independent draws, or the
+    target becomes a smooth function of the path and re-introduces exactly the correlation being
+    removed.
+    """
+    if not enabled or scale <= 0.0:
+        return None
+    digest = hashlib.blake2b(np.ascontiguousarray(np.round(knots_np, 6)).tobytes(), digest_size=8)
+    seed = int.from_bytes(digest.digest(), "little") % (2 ** 63 - 1)
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    d = scorer.pack["droid_mean"].shape[-1]
+    eps = torch.randn(d, generator=gen, dtype=torch.float64).to(
+        device=scorer.device, dtype=scorer.pack["droid_mean"].dtype
+    )
+    return scorer.pack["droid_mean"] + float(scale) * (scorer.chol_cov @ eps).unsqueeze(0)
 
 
 def _time_knots(theta: torch.Tensor) -> torch.Tensor:
@@ -247,28 +333,31 @@ def _sample(q_knots: torch.Tensor, tau: torch.Tensor, frac: torch.Tensor) -> tor
     return q0 + (q1 - q0) * u
 
 
-def _optimize(scorer, q_knots, d_lo, d_hi, lead_speed, trail_speed):
-    """Joint Adam over (theta, duration) from ``_N_STARTS`` durations at once. -> [(duration, tau)].
+def _optimize(scorer, q_knots, d_lo, d_hi, lead_speed, trail_speed, target=None):
+    """Joint Adam over (theta, span) from ``_N_STARTS`` durations at once. -> [(duration, tau)].
 
-    ``span`` -- how many 15 Hz frames the stroke covers -- is the one duration quantity: progress is
-    ``i/span``, the mask is ``clamp(span - i, 0, 1)``, and the emitted duration is ``span/15``.
+    ``span`` -- how many 15 Hz frames the stroke covers -- is the one duration quantity, and it is
+    the optimized parameter itself: progress is ``i/span``, the mask is ``clamp(span - i, 0, 1)``,
+    and the emitted duration is ``span/15``. The range is held by projecting onto [s_lo, s_hi] after
+    each step rather than by squashing a logit through a sigmoid; the two are equivalent in solution
+    quality once the learning rate is scaled to the range (see _LR_DURATION), and the projection is
+    one fewer transform to reason about. The sigmoid's flat tails were never reached in practice
+    (measured: 0 of 16 starts ended at a bound), so nothing is lost by dropping it.
     """
     dev = q_knots.device
     s_lo, s_hi = d_lo * _VAE_RATE_HZ, d_hi * _VAE_RATE_HZ
     n_frames = int(np.ceil(s_hi)) + 8
 
     starts = np.geomspace(d_lo, d_hi, _N_STARTS + 2)[1:-1]
-    p = np.clip((starts * _VAE_RATE_HZ - s_lo) / (s_hi - s_lo), 1e-3, 1 - 1e-3)
-    nu = torch.tensor(np.log(p / (1 - p)), device=dev, dtype=torch.float32, requires_grad=True)
+    span = torch.tensor(starts * _VAE_RATE_HZ, device=dev, dtype=torch.float32, requires_grad=True)
     theta = torch.zeros(_N_STARTS, q_knots.shape[1] - 1, device=dev, requires_grad=True)
     knots = q_knots.expand(_N_STARTS, -1, -1)
     frames = torch.arange(n_frames, device=dev, dtype=q_knots.dtype)
 
     opt = torch.optim.Adam([{"params": [theta], "lr": _LR_THETA},
-                            {"params": [nu], "lr": _LR_DURATION}])
+                            {"params": [span], "lr": _LR_DURATION * (s_hi - s_lo)}])
     for _ in range(_ITERS):
         opt.zero_grad(set_to_none=True)
-        span = s_lo + (s_hi - s_lo) * torch.sigmoid(nu)                           # [B] frames
         tau = _time_knots(theta)
 
         # 15 Hz scoring pass. Duration enters through the progress denominator: the same path spread
@@ -277,7 +366,7 @@ def _optimize(scorer, q_knots, d_lo, d_hi, lead_speed, trail_speed):
         # alone (encode_mu_masked). A linear ramp beats a sigmoid taper here, measured.
         q = _sample(knots, tau, frames[None] / span[:, None])
         mask = (span[:, None, None] - frames[None, None]).clamp(0.0, 1.0)
-        loss = scorer.maha2(scorer.features(q) * mask, mask).sum()
+        loss = scorer.maha2(scorer.features(q) * mask, mask, target).sum()
 
         # Boundary speeds, read one 15 Hz frame in from each end off the same clock. Measuring at the
         # executor timestep instead costs an extra `dt / duration` branch and scored no better.
@@ -292,9 +381,11 @@ def _optimize(scorer, q_knots, d_lo, d_hi, lead_speed, trail_speed):
 
         (loss + _BOUNDARY_WEIGHT * bnd).backward()
         opt.step()
+        with torch.no_grad():                       # projection: the box, without a squash
+            span.clamp_(s_lo, s_hi)
 
     with torch.no_grad():
-        spans = (s_lo + (s_hi - s_lo) * torch.sigmoid(nu)).cpu().numpy()
+        spans = span.detach().cpu().numpy()
         tau = _time_knots(theta)
     return [(float(spans[b] / _VAE_RATE_HZ), tau[b : b + 1].detach()) for b in range(_N_STARTS)]
 
@@ -330,6 +421,7 @@ def vae_retime_group(
     trail_speed: float,
     max_duration_mult: float,
     checkpoint_path: str | None = None,
+    sample_target: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """Re-time one joined stroke so its motion sits as close as possible to the DROID manifold.
 
@@ -380,14 +472,38 @@ def vae_retime_group(
     if d_hi <= d_lo:
         d_hi = d_lo * 1.5
 
-    best = None
-    for duration, tau in _optimize(scorer, q_knots, d_lo, d_hi, lead_speed, trail_speed):
-        emitted = _emit(q_knots, tau, duration, dt, np.abs(vel_cap), np.abs(acc_cap))
-        if emitted is None:
-            continue
-        m2 = scorer.score_emitted(emitted[0], duration)
-        if best is None or m2 < best[0]:
-            best = (m2, duration, emitted)
+    # One target latent for this stroke, shared by all _N_STARTS candidates and by the ranking below.
+    # None (the default) reproduces the original mode-seeking objective exactly.
+    #
+    # A sampled target can ask for a stroke no admissible clock realizes -- it is a draw from the
+    # human cluster, not a feasibility statement, and _emit rejects anything past the robot's caps
+    # (measured 1 stroke in 10 at _TARGET_SCALE 1.0). Falling back to the mean target is strictly
+    # better than losing the plan: that stroke keeps the old, over-typical timing while every other
+    # stroke keeps its sampled one.
+    def _best_for(target):
+        best = None
+        for duration, tau in _optimize(scorer, q_knots, d_lo, d_hi, lead_speed, trail_speed, target):
+            emitted = _emit(q_knots, tau, duration, dt, np.abs(vel_cap), np.abs(acc_cap))
+            if emitted is None:
+                continue
+            # Ranked against the SAME target the optimizer used. Ranking by distance to the cluster
+            # mean instead would re-select the most typical candidate and undo the sampling entirely.
+            m2 = scorer.score_emitted(emitted[0], duration, target)
+            if best is None or m2 < best[0]:
+                best = (m2, duration, emitted)
+        return best
+
+    scales = _TARGET_SCALES if sample_target else (0.0,)
+    best, target = None, None
+    for scale in scales:
+        target = target_latent(scorer, knots_np, sample_target, scale)
+        best = _best_for(target)
+        if best is not None:
+            if scale not in (scales[0], 0.0):
+                _log.info("VAE re-timing: sampled target shrunk to %.1fx to meet the caps", scale)
+            break
+        if scale > 0.0:
+            _log.debug("VAE re-timing: target scale %.1f had no admissible clock; shrinking", scale)
 
     if best is None:
         raise RuntimeError(
@@ -396,8 +512,9 @@ def vae_retime_group(
         )
     m2, duration, (out_pos, out_vel, out_acc) = best
     _log.debug(
-        "VAE stroke re-timing: %.2f s -> %.2f s (maha2 %.2f, %d waypoints, %.1f s to fit)",
-        orig_duration, duration, m2, len(out_pos), time.perf_counter() - t_start,
+        "VAE stroke re-timing: %.2f s -> %.2f s (%s %.2f, %d waypoints, %.1f s to fit)",
+        orig_duration, duration, "d2(sampled target)" if target is not None else "maha2",
+        m2, len(out_pos), time.perf_counter() - t_start,
     )
     from tiptop.trajectory_blending import _finish_stroke
 

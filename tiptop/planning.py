@@ -13,6 +13,7 @@ from cutamp.config import TAMPConfiguration
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_reduction import CostReducer
 from cutamp.envs import TAMPEnvironment
+from cutamp.particle_initialization import NoGraspsError
 from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
 from cutamp.task_planning.constraints import StablePlacement
 from cutamp.task_planning.costs import GraspCost
@@ -55,12 +56,14 @@ def build_tamp_config(
     traj_length_norm: float = 2.0,
     grasp_orientation_cost: bool = False,
     grasp_center_cost: bool = False,
+    grasp_rank_conf_weight: float | None = None,
     arm_mode: str = "single",
     dual_task: str = "parallel",
     max_motion_refine_attempts: int | None = 32,
     transit_apex_height: float = 0.0,
     transit_apex_min_dist: float = 0.10,
     posture_selection: dict | None = None,
+    require_m2t2_grasps: bool = False,
 ) -> TAMPConfiguration:
     """Build a TAMPConfiguration with TiPToP defaults.
 
@@ -106,6 +109,11 @@ def build_tamp_config(
         # Gate for the off-center grasp soft cost (weight set in run_planning). Enabled from cfg/tamp
         # when `grasp_center_weight` is present; see resolve_grasp_center_cost.
         grasp_center_cost=grasp_center_cost,
+        # How the SATISFYING particles are ranked for motion refinement, and so which plan actually
+        # runs. None keeps cuTAMP's confidence-only ranking, under which the two grasp soft costs
+        # above are inert on the executed plan; a value ranks on soft cost minus this times the
+        # summed grasp confidence. See resolve_grasp_rank_conf_weight.
+        grasp_rank_conf_weight=grasp_rank_conf_weight,
         # Explicit apex waypoint in each Pick/Place free-space transit: planned as
         # retract -> apex -> pre-grasp so the end-effector lifts, traverses and descends instead of
         # sweeping low across the table. Off (0.0) unless a cfg/tamp yml sets `transit_apex_height`
@@ -117,6 +125,10 @@ def build_tamp_config(
         # teleop band, instead of cuRobo's top seed. Off unless a cfg/tamp yml sets
         # `posture_selection_seeds`; see resolve_posture_selection and cuTAMP's TAMPConfiguration.
         **(posture_selection or {}),
+        # Fail rather than substitute collision-sphere heuristic grasps when perception proposed
+        # nothing for an object that must be picked. Off unless a cfg/tamp yml sets
+        # `require_m2t2_grasps`; see resolve_require_m2t2_grasps and cuTAMP's TAMPConfiguration.
+        require_m2t2_grasps=require_m2t2_grasps,
     )
 
 
@@ -180,18 +192,25 @@ def run_planning(
     constraint_checker = ConstraintChecker(constraint_to_tol)
 
     start = time.perf_counter()
-    cutamp_plan, _, failure_reason = run_cutamp(
-        env,
-        config,
-        cost_reducer,
-        constraint_checker,
-        q_init=q_init,
-        ik_solver=ik_solver,
-        grasps=grasps,
-        motion_gen=motion_gen,
-        experiment_dir=experiment_dir,
-        q_return=q_return,
-    )
+    try:
+        cutamp_plan, _, failure_reason = run_cutamp(
+            env,
+            config,
+            cost_reducer,
+            constraint_checker,
+            q_init=q_init,
+            ik_solver=ik_solver,
+            grasps=grasps,
+            motion_gen=motion_gen,
+            experiment_dir=experiment_dir,
+            q_return=q_return,
+        )
+    except NoGraspsError as exc:
+        # `require_m2t2_grasps` refused to substitute heuristic collision-sphere grasps for an
+        # object perception proposed nothing for. That is a PLANNING failure, not a crash: reported
+        # the same way as any other, so the reset path drops the offending object and retries and the
+        # task path fails the episode cleanly instead of unwinding the session.
+        cutamp_plan, failure_reason = None, str(exc)
     elapsed = time.perf_counter() - start
     _log.info(f"cuTAMP planning took: {elapsed:.2f}s")
 
