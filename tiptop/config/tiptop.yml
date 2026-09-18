@@ -106,3 +106,25 @@ perception:
   # num_frames = 1 disables smoothing (single-frame behavior).
   depth_smoothing:
     num_frames: 5
+
+# Scene reset -- the extra, goal-from-geometry plan the data-collection UI's "Reset scene" button
+# runs to take the objects back off the plate (tiptop_run._run_scene_reset, scene_reset.py).
+scene_reset:
+  # Where a reset may PUT THINGS DOWN, as an absolute box in the robot base frame (metres).
+  # Picking is unaffected -- objects are still picked wherever they are; this only clips the table's
+  # placement surface (scene_reset.clip_surface_to_region), and the full-extent table stays in the
+  # world as a collision obstacle.
+  #
+  # The perceived table box is much bigger than the part of it anyone stages objects on: measured
+  # over the 46 archived reset scenes it spans x 0.33..0.71, y -0.57..0.52, while the 8642 perceived
+  # object centroids across every archived run sit inside x 0.35..0.62, y -0.36..0.30 (p1-p99). The
+  # sampler drew from the whole box, so 20 of 133 archived reset placements landed at y < -0.35 --
+  # the side the third-person ZED sits on, at (0.57, -0.55, 0.37) in this frame, with the closest
+  # placement putting the gripper 0.34 m from it -- and 15 more within 10 cm of a table edge.
+  #
+  # Bounds apply to the placed object's footprint; the gripper straddling it adds ~5 cm. Set to null
+  # to place anywhere on the perceived table (the behaviour before this key existed, and what the
+  # YAM configs still do -- their base frame is not this one).
+  placement_region:
+    x: [0.36, 0.62]
+    y: [-0.30, 0.30]

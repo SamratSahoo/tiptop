@@ -6,9 +6,10 @@ data-collection UI's "Reset scene" button runs one extra, deliberately UNRECORDE
 does exactly that against the already-warm session.
 
 This module is the pure half of that: given the perceived objects, decide which ones are stacked on
-another object and emit the ``on(obj, table)`` atoms that put them back. It touches no robot, no
-cuRobo solver and no GPU, so it is unit-testable (``tests/test_scene_reset.py``); the orchestration
-lives in ``tiptop_run._run_scene_reset``.
+another object and emit the ``on(obj, table)`` atoms that put them back, plus clip the table down to
+the sub-box those placements are allowed to land in (``reset_placement_region``,
+``clip_surface_to_region``). It touches no robot, no cuRobo solver and no GPU, so it is unit-testable
+(``tests/test_scene_reset.py``); the orchestration lives in ``tiptop_run._run_scene_reset``.
 
 **The rule is purely geometric, and deliberately so.** An object needs resetting iff some OTHER
 perceived object is supporting it, where "A supports B" means B's centroid lies inside A's XY
@@ -32,15 +33,102 @@ Neither the previous goal nor any table height is read here as a result.
 """
 
 import logging
+from dataclasses import replace
 
 import numpy as np
 from scipy.spatial import ConvexHull, QhullError
+
+from tiptop.config import tiptop_cfg
 
 _log = logging.getLogger(__name__)
 
 # An object counts as sitting on a surface when its centroid falls inside that surface's XY
 # footprint, grown by this margin -- so a toy perched half over a plate's rim still counts.
 DEFAULT_XY_MARGIN = 0.02
+
+# Smallest placement zone worth planning against, per axis (metres). A zone narrower than a couple
+# of object diameters has nowhere to put a second toy, so an empty/absurd config is refused loudly
+# rather than turned into "no reset plan" twenty seconds later.
+MIN_REGION_EXTENT = 0.10
+
+
+def reset_placement_region(overrides: dict | None = None) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """The configured ``((x_lo, x_hi), (y_lo, y_hi))`` reset placements are confined to, or None.
+
+    Robot base frame, metres. Two layers, most specific first: ``reset_placement_region`` in a
+    ``cfg/tamp/*.yml``'s ``tamp_overrides`` (per data-collection config, same JSON the other knobs
+    ride -- see :func:`goal_clearing.resolve_clear_goal_surfaces`), then
+    ``scene_reset.placement_region`` in the tiptop config. None at both -- the key absent, or
+    explicitly null in either -- means "anywhere on the perceived table", which is what every config
+    did before this existed.
+
+    Absolute rather than an inset from the perceived table because what this keeps the arm away from
+    -- the third-person camera on its tripod, the table edges -- does not move when RANSAC's table
+    fit wobbles by a few cm from run to run.
+    """
+    if overrides is not None and "reset_placement_region" in overrides:
+        # Present-but-null/false is a deliberate "no region for this config", not a fall-through.
+        region = overrides["reset_placement_region"] or None
+        source = "tamp_overrides"
+    else:
+        region = (tiptop_cfg().get("scene_reset") or {}).get("placement_region")
+        source = "tiptop config scene_reset.placement_region"
+    if region is None:
+        return None
+    try:
+        x_lo, x_hi = (float(v) for v in region["x"])
+        y_lo, y_hi = (float(v) for v in region["y"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"placement region from {source} must look like {{x: [lo, hi], y: [lo, hi]}}, got {region!r}"
+        ) from exc
+    for axis, (lo, hi) in (("x", (x_lo, x_hi)), ("y", (y_lo, y_hi))):
+        if hi - lo < MIN_REGION_EXTENT:
+            raise ValueError(
+                f"placement region from {source}: {axis} spans {hi - lo:.3f} m, under the "
+                f"{MIN_REGION_EXTENT} m floor -- too narrow to place into"
+            )
+    return (x_lo, x_hi), (y_lo, y_hi)
+
+
+def clip_surface_to_region(surface, region: tuple[tuple[float, float], tuple[float, float]] | None):
+    """``surface`` with its XY footprint intersected with ``region``, or ``surface`` unchanged.
+
+    Cuboid in, Cuboid out: only ``dims[:2]`` and ``pose[:2]`` move, so the z extent -- which is what
+    placement height is read off (``place_4dof_sampler`` takes the OBB's ``surface_z``) -- is
+    untouched, and the box stays axis-aligned as perception produced it.
+
+    Returns ``surface`` itself when ``region`` is None, and logs and returns it unchanged when the
+    intersection would be degenerate: a mis-set region must not silently become an unplaceable
+    sliver, and the un-clipped behaviour is the one every run before this had.
+    """
+    if region is None:
+        return surface
+    (x_lo, x_hi), (y_lo, y_hi) = region
+    center = np.asarray(surface.pose, dtype=float)[:2]
+    half = np.asarray(surface.dims, dtype=float)[:2] / 2.0
+    lo = np.maximum(center - half, [x_lo, y_lo])
+    hi = np.minimum(center + half, [x_hi, y_hi])
+    extent = hi - lo
+    if np.any(extent < MIN_REGION_EXTENT):
+        _log.warning(
+            f"Placement region x={[x_lo, x_hi]} y={[y_lo, y_hi]} meets the perceived "
+            f"'{surface.name}' (x={(center[0] - half[0]):.3f}..{(center[0] + half[0]):.3f}, "
+            f"y={(center[1] - half[1]):.3f}..{(center[1] + half[1]):.3f}) in only "
+            f"{extent[0]:.3f} x {extent[1]:.3f} m -- ignoring the region and placing on the whole "
+            "surface. Check the placement region against where the table actually is."
+        )
+        return surface
+    clipped_center = (lo + hi) / 2.0
+    _log.info(
+        f"Confining placements to x={lo[0]:.3f}..{hi[0]:.3f}, y={lo[1]:.3f}..{hi[1]:.3f} "
+        f"({extent[0]:.3f} x {extent[1]:.3f} m of '{surface.name}')"
+    )
+    return replace(
+        surface,
+        dims=[float(extent[0]), float(extent[1]), float(surface.dims[2])],
+        pose=[float(clipped_center[0]), float(clipped_center[1]), *surface.pose[2:]],
+    )
 
 
 def world_aabb(obj) -> tuple[np.ndarray, np.ndarray]:

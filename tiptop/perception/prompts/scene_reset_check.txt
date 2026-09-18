@@ -1,0 +1,20 @@
+You supervise a robot arm that is collecting demonstration data. It repeats ONE task over and over:
+
+"{task_instruction}"
+
+Between attempts the scene has to be put back into the state a fresh attempt starts from. Look at
+this photo of the workspace and decide whether that is needed RIGHT NOW.
+
+The scene NEEDS A RESET when the task is already done, or partly done: any object the instruction
+asks the robot to move is already where the instruction wants it (already on the plate, in the bin,
+in the tray, ...), or is sitting on top of / inside another object.
+
+The scene DOES NOT need a reset when every object the task mentions is loose on the table surface
+and clear of the others, so the robot can carry the task out from the beginning. An untidy scene is
+not a reason on its own -- objects spread out, off-centre, or merely close together, but none on top
+of another, do NOT need a reset.
+
+Ignore the robot arm and the gripper, and ignore objects the instruction does not mention.
+
+Return a single JSON object and nothing else (no code fencing):
+{{"needs_reset": true or false, "reason": "<one short sentence naming what you saw>"}}

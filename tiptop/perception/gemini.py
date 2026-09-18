@@ -118,3 +118,41 @@ async def detect_and_translate_async(
         ),
     )
     return _parse_response(response.text)
+
+
+def _parse_reset_check(response_text: str) -> tuple[bool, str]:
+    """Parse the scene_reset_check response into ``(needs_reset, reason)``.
+
+    Split out from the call so the shape of Gemini's answer is testable without a network round
+    trip. A response missing ``needs_reset`` is an error rather than a False: "no" and "I did not
+    answer" would otherwise be indistinguishable, and the caller acts on the difference.
+    """
+    result = load_json(response_text)
+    if not isinstance(result, dict) or "needs_reset" not in result:
+        raise ValueError(f"scene_reset_check returned no 'needs_reset' field: {response_text}")
+    return bool(result["needs_reset"]), str(result.get("reason") or "").strip()
+
+
+async def check_scene_needs_reset_async(
+    image: Image.Image,
+    task_instruction: str,
+    client: genai.Client | None = None,
+    model_id: str = "gemini-robotics-er-2-preview",
+    temperature: float | None = None,
+) -> tuple[bool, str]:
+    """Ask whether the workspace has to be put back before the task can be attempted again.
+
+    Returns ``(needs_reset, reason)``. Drives auto mode (``tiptop.auto_mode``), which is why it is a
+    yes/no on the WHOLE scene rather than per-object: the reset it triggers works out for itself,
+    from geometry, which objects to move (``tiptop.scene_reset``).
+    """
+    client = client or gemini_client()
+    prompt = load_prompt("scene_reset_check").format(task_instruction=task_instruction)
+    response = await client.aio.models.generate_content(
+        model=model_id,
+        contents=[image, prompt],
+        config=types.GenerateContentConfig(
+            temperature=temperature, thinking_config=types.ThinkingConfig(thinking_budget=0)
+        ),
+    )
+    return _parse_reset_check(response.text)

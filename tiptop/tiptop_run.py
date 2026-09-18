@@ -3,6 +3,7 @@ import ctypes
 import json
 import logging
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -27,8 +28,10 @@ from cutamp.envs import TAMPEnvironment
 from cutamp.tamp_domain import HandEmpty, Holding, On
 from cutamp.utils.rerun_utils import log_curobo_mesh_to_rerun
 from jaxtyping import Bool, Float
+from PIL import Image
 from scipy.spatial import KDTree
 
+from tiptop.auto_mode import resolve_auto_mode, should_reset
 from tiptop.config import as_robot_type as _as_robot_type
 from tiptop.config import load_calibration, tiptop_cfg
 from tiptop.execute_plan import execute_cutamp_dual_plan, execute_cutamp_plan
@@ -77,6 +80,7 @@ from tiptop.perception.cameras import (
     get_external_camera_2,
     get_hand_camera,
 )
+from tiptop.perception.gemini import check_scene_needs_reset_async
 from tiptop.perception.m2t2 import augment_flipped_grasps, m2t2_to_tiptop_transform
 from tiptop.perception.sam2 import sam2_client
 from tiptop.perception.segmentation import TABLE_BOX_CLEARANCE, segment_pointcloud_by_masks, segment_table_with_ransac
@@ -93,7 +97,7 @@ from tiptop.recording import (
     save_run_metadata,
     save_run_outputs,
 )
-from tiptop.scene_reset import build_reset_goal, reset_goal_builder
+from tiptop.scene_reset import build_reset_goal, clip_surface_to_region, reset_goal_builder, reset_placement_region
 from tiptop.utils import (
     NumpyEncoder,
     RobotClient,
@@ -561,6 +565,148 @@ def _label_rollout(save_dir: Path, output_dir: str, timestamp: str) -> Path:
 _LAST_TASK: str | None = None
 _postprocess_procs: list[subprocess.Popen] = []
 
+# Every directory a recorded segment can end up in, in the order a session writes them: a rollout
+# starts in eval/ and is moved to success|failure/ when labelled, a reset stays in resets/.
+SEGMENT_PARENTS = ("eval", "success", "failure", "resets")
+
+# The last recorded segment this process finished -- rollout or reset, successful or not. Read by
+# the next segment to write its `prev_rollout` pointer (see _prev_segment).
+_LAST_SEGMENT_DIR: Path | None = None
+
+
+def _note_segment(segment_dir: Path) -> None:
+    """Record ``segment_dir`` as the segment the NEXT one follows.
+
+    Called with a rollout's FINAL directory (after ``_label_rollout`` has moved it out of ``eval/``)
+    and with a reset's, including a reset that failed -- a half-recorded segment is still a piece of
+    footage, and leaving it out of the chain would silently drop it from a stitched video.
+    """
+    global _LAST_SEGMENT_DIR
+    _LAST_SEGMENT_DIR = Path(segment_dir)
+
+
+def _latest_segment_on_disk(output_dir: str, exclude: Path | None = None) -> Path | None:
+    """Newest segment directory already under ``output_dir``, by timestamped name.
+
+    The fallback for the FIRST segment of a process, where ``_LAST_SEGMENT_DIR`` is still None but
+    the session may well be a restart into a directory that already holds footage. Names are
+    ``%Y-%m-%d_%H-%M-%S``, so lexicographic order is chronological order.
+    """
+    candidates = [
+        d for parent in SEGMENT_PARENTS for d in (Path(output_dir) / parent).glob("*") if d.is_dir() and d != exclude
+    ]
+    return max(candidates, key=lambda d: d.name, default=None)
+
+
+def _segment_kind(segment_dir: Path | None) -> str | None:
+    """``"reset"`` or ``"rollout"`` for a segment directory, from which bucket it sits in."""
+    if segment_dir is None:
+        return None
+    return "reset" if segment_dir.parent.name == "resets" else "rollout"
+
+
+def _prev_segment(output_dir: str, exclude: Path | None = None) -> Path | None:
+    """The segment the one now starting should point back at, or None for the very first."""
+    return _LAST_SEGMENT_DIR if _LAST_SEGMENT_DIR is not None else _latest_segment_on_disk(output_dir, exclude)
+
+
+# Rollouts auto mode collected and did NOT stop to label: ``[(eval_dir, timestamp)]``, oldest first.
+# Drained when auto mode is preempted; anything still here when the session ends stays in ``eval/``
+# and is labelled from the data-collection Episodes page (which plays the video back).
+_AUTO_LABEL_QUEUE: list[tuple[Path, str]] = []
+
+
+def _defer_label(save_dir: Path, timestamp: str) -> None:
+    """Queue a rollout for labelling later instead of prompting now.
+
+    Auto mode's whole point is to keep collecting without the operator in the loop, and the
+    success/failure prompt is a hard stop -- it blocks on stdin until answered. So the rollout is
+    left in ``eval/`` and remembered here.
+    """
+    _AUTO_LABEL_QUEUE.append((save_dir, timestamp))
+    _log.info(
+        f"Auto mode: leaving {save_dir.name} unlabelled in eval/ ({len(_AUTO_LABEL_QUEUE)} waiting); "
+        "preempt to label them, or label them from the Episodes page"
+    )
+    _emit_event({"event": "label_deferred", "dir": str(save_dir), "queued": len(_AUTO_LABEL_QUEUE)})
+
+
+def _drain_auto_label_queue(output_dir: str) -> None:
+    """Prompt for every label auto mode deferred, oldest first.
+
+    Called when auto mode stops (a preempt), which is the point at which the operator is back in
+    the loop and stdin is theirs again. Each rollout goes through the ordinary ``_label_rollout``
+    prompt, so the UI's existing success/failure panel drives it unchanged, one at a time.
+
+    A second Ctrl-C gives up rather than propagating: the rest of the queue is still sitting in
+    ``eval/``, so nothing is lost by stopping here.
+    """
+    if not _AUTO_LABEL_QUEUE:
+        return
+    _log.info(f"Labelling the {len(_AUTO_LABEL_QUEUE)} rollout(s) auto mode collected")
+    try:
+        while _AUTO_LABEL_QUEUE:
+            save_dir, timestamp = _AUTO_LABEL_QUEUE[0]
+            if not save_dir.exists():
+                # Already moved by hand or from the Episodes page while auto mode ran.
+                _log.info(f"{save_dir} is gone; nothing to label")
+                _AUTO_LABEL_QUEUE.pop(0)
+                continue
+            final_dir = _label_rollout(save_dir, output_dir, timestamp)
+            _AUTO_LABEL_QUEUE.pop(0)
+            _spawn_postprocess(final_dir)
+    except KeyboardInterrupt:
+        _log.warning(
+            f"Labelling interrupted; {len(_AUTO_LABEL_QUEUE)} rollout(s) stay in eval/ "
+            "and can be labelled from the Episodes page"
+        )
+        _clear_preempt()
+
+
+def _report_unlabelled(output_dir: str) -> None:
+    """Say what is being left behind unlabelled, at session end.
+
+    The graceful stop is "q\n" followed by SIGTERM two seconds later (data-collection's
+    ``sessions.js`` STOP_GRACE_MS), so there is no window to prompt for a backlog here -- and the
+    episodes are not stranded: ``eval/`` is one of the Episodes page's status buckets and its
+    re-label control moves them to success/failure with the video alongside.
+    """
+    if not _AUTO_LABEL_QUEUE:
+        return
+    names = ", ".join(ts for _, ts in _AUTO_LABEL_QUEUE)
+    _log.warning(
+        f"Session ending with {len(_AUTO_LABEL_QUEUE)} unlabelled rollout(s) in eval/: {names}. "
+        "Label them on the Episodes page (they do not count toward `collected` until you do)."
+    )
+    _emit_event(
+        {"event": "labels_pending", "count": len(_AUTO_LABEL_QUEUE), "timestamps": [ts for _, ts in _AUTO_LABEL_QUEUE]}
+    )
+
+
+def _write_prev_pointer(save_dir: Path, prev: Path | None) -> dict:
+    """Write ``save_dir/prev_rollout.json`` and return the same fields for the events file.
+
+    One artifact in every recorded segment, rollout and reset alike, naming the segment that ran
+    immediately before it. Exists so a stitched video can be ordered without inferring it from
+    timestamps -- which cannot tell a reset that ran between two rollouts from one that ran after a
+    rollout was later relabelled and moved.
+    """
+    pointer = {
+        "prev_rollout": str(prev) if prev is not None else None,
+        # The timestamp is the stable identity; the path above is only where it was when this was
+        # written. Auto mode labels rollouts LATER (_drain_auto_label_queue), which moves them out
+        # of eval/ after this segment has already named them -- so a consumer that finds the path
+        # missing should re-resolve this id across SEGMENT_PARENTS (collect/episodes.py does exactly
+        # that for episodes).
+        "prev_rollout_id": prev.name if prev is not None else None,
+        "prev_rollout_kind": _segment_kind(prev),
+        "kind": _segment_kind(save_dir),
+    }
+    save_dir.mkdir(parents=True, exist_ok=True)
+    (save_dir / "prev_rollout.json").write_text(json.dumps(pointer, indent=2))
+    return pointer
+
+
 # Manual robot commands accepted at the task prompt, in place of a task instruction. The
 # data-collection UI's buttons drive these over stdin; a terminal user can just type them.
 # They run BETWEEN rollouts (the prompt is the one point where the arm is idle and stdin is being
@@ -683,6 +829,60 @@ def _get_task_instruction() -> str:
     return raw
 
 
+def _pending_stdin_line() -> str | None:
+    """A line already waiting on stdin, or None. Never blocks.
+
+    What lets auto mode keep collecting while still obeying the operator: the data-collection server
+    drives this process over stdin (``sessions.js`` writes "q\\n" to stop, a bare "\\n" for *Collect
+    another*, a bare word for a robot command), and a loop that never read it would leave a graceful
+    stop to escalate to SIGTERM two seconds later.
+    """
+    stream = sys.stdin
+    if stream is None or stream.closed:
+        return None
+    try:
+        ready, _, _ = select.select([stream], [], [], 0)
+    except (OSError, ValueError):
+        # Not a selectable stream (some launchers hand over something exotic). Auto mode then
+        # simply runs until preempted, which is the behaviour the operator has anyway.
+        return None
+    if not ready:
+        return None
+    line = stream.readline()
+    if line == "":
+        raise UserExitException("EOF; ending session")
+    return line.strip()
+
+
+def _auto_mode_task_instruction() -> str:
+    """Task for the next auto-mode pass, without stopping to ask.
+
+    Auto mode's loop must not block where :func:`_get_task_instruction` does: the whole point is
+    that it collects continuously. So the launch task is consumed as usual (``TIPTOP_TASK``, which
+    does not block), and after that the last task simply repeats -- while anything the operator DOES
+    send is still honoured: 'q' ends the session, a ``ROBOT_COMMANDS`` word is returned for the
+    caller to run, and a new instruction replaces the one being repeated. A bare Enter (the UI's
+    *Collect another*) is a no-op here, since collecting is already what happens next.
+
+    Falls back to the blocking prompt when there is no task yet at all -- a terminal launch with
+    ``auto_mode`` set and no ``TIPTOP_TASK`` still has to be told what to collect once.
+    """
+    global _LAST_TASK
+    if os.environ.get("TIPTOP_TASK") or _LAST_TASK is None:
+        return _get_task_instruction()
+    raw = _pending_stdin_line()
+    if raw is None:
+        return _LAST_TASK
+    if raw.lower() in ("q", "exit", "quit"):
+        raise UserExitException("user quit")
+    if raw.lower() in ROBOT_COMMANDS:
+        return raw.lower()
+    if raw:
+        _log.info(f"Auto mode: switching the task to {raw!r}")
+        _LAST_TASK = raw
+    return _LAST_TASK
+
+
 def _spawn_postprocess(rollout_dir: Path) -> None:
     """Fire-and-forget background post-processing (gifs + LeRobot export) for one finished
     rollout, so the next rollout can start immediately. No-op if the launcher didn't set
@@ -705,12 +905,21 @@ def _spawn_postprocess(rollout_dir: Path) -> None:
         _log.exception("Failed to launch background post-processing")
 
 
+def _same_footprint(a: Cuboid, b: Cuboid) -> bool:
+    """Whether two axis-aligned cuboids cover the same XY footprint (to 0.1 mm)."""
+    return all(
+        abs(float(u) - float(v)) < 1e-4
+        for u, v in zip([*a.dims[:2], *a.pose[:2]], [*b.dims[:2], *b.pose[:2]], strict=True)
+    )
+
+
 def create_tamp_environment(
     object_meshes: dict[str, Mesh],
     table_cuboid: Cuboid,
     grounded_atoms: list[dict],
     include_workspace: bool,
     extra_surface_labels: set[str] | None = None,
+    placement_region: tuple[tuple[float, float], tuple[float, float]] | None = None,
 ) -> tuple[TAMPEnvironment, list[Cuboid | Mesh]]:
     """Build the cuTAMP environment for one goal.
 
@@ -719,6 +928,12 @@ def create_tamp_environment(
     goal's ``on`` atoms, which is fine for a task but wrong for a scene reset: its goal names only
     the table, so the plate the objects are coming off would be classified movable and the planner
     would be free to pick the plate up. See ``scene_reset.build_reset_goal``.
+
+    ``placement_region`` is an ``((x_lo, x_hi), (y_lo, y_hi))`` box in the robot base frame that
+    placements ONTO THE TABLE are confined to (``scene_reset.reset_placement_region``); None places
+    anywhere on the perceived table, which is what a rollout does. Only the table is clipped -- a
+    detected surface (a plate, a bowl) is already small and is where the goal deliberately wants
+    things.
     """
     # Reject goals that reference objects not present in the perceived scene.
     # Without this, cuTAMP's BFS runs without stopping, expanding the move-chain on an unreachable goal.
@@ -776,6 +991,7 @@ def create_tamp_environment(
     # the object ~1-2 cm INTO the tabletop, with no collision to reject it -- the obstacle really is
     # that low. Grow the box upwards to the true plane, leaving its underside where it was.
     # Conditional, so every goal that does not name the table keeps the existing geometry exactly.
+    table_collision = table_cuboid
     if table_cuboid.name in surface_labels:
         _log.info(
             f"Goal places on '{table_cuboid.name}': raising its box top by {TABLE_PLACEMENT_RAISE} m toward the "
@@ -786,10 +1002,23 @@ def create_tamp_environment(
             dims=[table_cuboid.dims[0], table_cuboid.dims[1], table_cuboid.dims[2] + TABLE_PLACEMENT_RAISE],
             pose=[*table_cuboid.pose[:2], table_cuboid.pose[2] + TABLE_PLACEMENT_RAISE / 2, *table_cuboid.pose[3:]],
         )
+        # Confine placements to a sub-box of the table (scene reset only). Both the sampler and the
+        # placement constraint read the surface's OBB (place_4dof_sampler, cost_function), so
+        # shrinking the box here is the whole mechanism -- no new cost term, no new sampler.
+        table_cuboid = clip_surface_to_region(table_cuboid, placement_region)
+
     all_surfaces = [table_cuboid, *surfaces]
     statics = list(workspace_cuboids()) if include_workspace else []
     for surface in all_surfaces:
         statics.append(surface)
+    # The clipped table is a PLACEMENT surface, not the tabletop: the arm still reaches outside the
+    # zone to PICK, and the strips the clip removed have to keep their collision box or a grasp out
+    # there plans straight down through the table. So the full-extent box goes back in as a static
+    # under its own name (never a Surface, so nothing can be placed on it and cuTAMP's IK-transparent
+    # handling is unaffected).
+    if not _same_footprint(table_collision, table_cuboid):
+        statics.append(replace(table_collision, name=f"{table_collision.name}_full"))
+        _log.info(f"Kept the full-extent '{table_collision.name}' as collision-only '{table_collision.name}_full'")
 
     # Create TAMP environment.
     #
@@ -999,6 +1228,7 @@ async def run_perception(
     include_workspace: bool = True,
     log_to_rerun: bool = True,
     goal_builder=None,
+    placement_region: tuple[tuple[float, float], tuple[float, float]] | None = None,
 ) -> tuple[TAMPEnvironment, list, ProcessedScene, list[dict]]:
     """Perceive the scene and turn it into a cuTAMP environment for ``task_instruction``.
 
@@ -1007,6 +1237,9 @@ async def run_perception(
     the scene reset uses it to plan against a goal built from geometry instead of language
     (``scene_reset.reset_goal_builder``). The atoms actually planned for are what is returned, so a
     caller's run metadata records the effective goal rather than the discarded one.
+
+    ``placement_region`` is forwarded to ``create_tamp_environment`` -- the reset's keep-out box; see
+    there.
     """
     start_time = time.perf_counter()
 
@@ -1143,6 +1376,7 @@ async def run_perception(
         grounded_atoms,
         include_workspace,
         extra_surface_labels=extra_surface_labels,
+        placement_region=placement_region,
     )
     _log.info(f"Processing scene and perception results took {time.perf_counter() - proc_st:.2f}s")
     _log.info(f"Perception pipeline completed, took {time.perf_counter() - start_time:.2f}s")
@@ -1278,6 +1512,7 @@ def _plan_largest_solvable_reset(
     env: TAMPEnvironment,
     all_surfaces: list,
     save_dir: Path,
+    placement_region: tuple[tuple[float, float], tuple[float, float]] | None = None,
 ) -> tuple[list | None, list[str], list[str]]:
     """Plan the biggest subset of the reset goal cuTAMP can actually solve.
 
@@ -1319,6 +1554,8 @@ def _plan_largest_solvable_reset(
                 atoms,
                 include_workspace=True,
                 extra_surface_labels=surfaces,
+                # Same keep-out box as the first attempt -- a retry must not widen the zone.
+                placement_region=placement_region,
             )
         cutamp_plan, _, failure_reason = run_planning(
             env,
@@ -1897,6 +2134,45 @@ def _execute_plan_recorded(
     return n_frames
 
 
+async def _auto_mode_needs_reset(container: _DemoContainer, task_instruction: str, output_dir: str) -> tuple[bool, str]:
+    """Ask Gemini whether the scene has to be put back before ``task_instruction`` runs again.
+
+    The photo comes from the THIRD-PERSON camera whenever the session has one, not from whichever
+    camera perception happens to read: this question is about the whole tabletop, and the wrist
+    view at home is pointed at very little of it. Every decision is saved under
+    ``<output_dir>/auto_mode/`` -- the image that was judged plus the answer -- because "why did it
+    reset there?" is otherwise unanswerable after the fact.
+
+    Errors are not raised. A session that cannot reach Gemini must keep collecting (the operator can
+    still press "Reset scene"), so a failed check reads as "no reset needed" with the error as its
+    reason.
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    audit_dir = Path(output_dir) / "auto_mode"
+    try:
+        camera = container.external_cam if container.external_cam is not None else perception_camera(container)
+        rgb = camera.read_camera().rgb
+        image = Image.fromarray(rgb)
+        # Same 800 px downscale detection uses (perception_wrapper.detect_and_segment) -- what
+        # Gemini reads should not depend on which camera took it.
+        image = image.resize((800, int(800 * image.size[1] / image.size[0])), Image.Resampling.LANCZOS)
+        start = time.perf_counter()
+        needs_reset, reason = await check_scene_needs_reset_async(image, task_instruction)
+        _log.info(f"Auto mode: Gemini says needs_reset={needs_reset} ({reason}) in {time.perf_counter() - start:.2f}s")
+    except Exception as e:
+        _log.exception("Auto mode: the scene check failed; collecting an episode rather than resetting")
+        return False, f"scene check failed ({type(e).__name__}: {e})"
+    try:
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        image.save(audit_dir / f"{timestamp}.jpg")
+        (audit_dir / f"{timestamp}.json").write_text(
+            json.dumps({"instruction": task_instruction, "needs_reset": needs_reset, "reason": reason}, indent=2)
+        )
+    except Exception:
+        _log.exception("Auto mode: failed to save the decision audit (the decision itself stands)")
+    return needs_reset, reason
+
+
 async def _run_scene_reset(
     session: aiohttp.ClientSession, container: _DemoContainer, config: TAMPConfiguration, output_dir: str
 ) -> None:
@@ -1904,10 +2180,12 @@ async def _run_scene_reset(
 
     A finished rollout leaves the scene in its goal state, so the next episode cannot start until the
     toys are off the plate. This runs one extra perceive-plan-execute cycle whose goal is
-    ``on(obj, table)`` for every object something else is holding up (``scene_reset``).
+    ``on(obj, table)`` for every object something else is holding up (``scene_reset``), placing them
+    inside ``scene_reset.placement_region`` -- picking still reaches anywhere on the table, but the
+    put-down spots are confined so a reset stops reaching out to the table edge or the camera.
 
-    It is deliberately NOT an episode: no cameras are recorded, no state is sampled, nothing is
-    labelled and nothing is written under ``eval/``. The artifacts land in
+    It records like a rollout -- cameras + state samplers, single-arm only -- but it is deliberately
+    NOT an episode: nothing is labelled and nothing is written under ``eval/``. The artifacts land in
     ``<output_dir>/resets/<ts>/`` instead, which neither the collected-episode count nor the LeRobot
     dataset build looks at, so a reset can never leak into the training data.
 
@@ -1918,7 +2196,10 @@ async def _run_scene_reset(
     cfg = tiptop_cfg()
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     save_dir = Path(output_dir) / "resets" / timestamp
-    _emit_event({"event": "reset_start", "dir": str(save_dir)})
+    # Resolved BEFORE save_dir exists, so the on-disk fallback cannot mistake this reset for its own
+    # predecessor.
+    pointer = _write_prev_pointer(save_dir, _prev_segment(output_dir, exclude=save_dir))
+    _emit_event({"event": "reset_start", "dir": str(save_dir), **pointer})
     file_handler = None
     try:
         file_handler = add_file_handler(save_dir / "scene_reset.log")
@@ -1954,6 +2235,10 @@ async def _run_scene_reset(
         _log.info(f"Scene reset: perceiving with the last task's instruction {instruction!r}")
 
         observation = capture_live_observation(container)
+        # Where a reset is allowed to put things down. The scene it PERCEIVES is the whole table --
+        # objects are picked wherever they are -- but the goal placements are confined to this box,
+        # so a reset stops parking toys on the table's lip or out by the third-person camera.
+        placement_region = reset_placement_region(container.cost_overrides)
         env, all_surfaces, processed_scene, goal_atoms = await run_perception(
             session,
             observation,
@@ -1961,9 +2246,18 @@ async def _run_scene_reset(
             save_dir,
             depth_estimator=container.depth_estimator,
             goal_builder=reset_goal_builder(),
+            placement_region=placement_region,
         )
         (save_dir / "reset.json").write_text(
-            json.dumps({"instruction": instruction, "goal_atoms": goal_atoms}, indent=2)
+            json.dumps(
+                {
+                    "instruction": instruction,
+                    "goal_atoms": goal_atoms,
+                    "placement_region": placement_region,
+                    **pointer,
+                },
+                indent=2,
+            )
         )
         # Saved BEFORE planning: cutamp_env.pkl (world AABBs + grasps) is exactly what you need to
         # tell a genuinely infeasible reset -- an object embedded in a container it has to come out
@@ -1975,7 +2269,15 @@ async def _run_scene_reset(
             return
 
         cutamp_plan, moved, skipped = _plan_largest_solvable_reset(
-            container, config, processed_scene, observation.q_init, goal_atoms, env, all_surfaces, save_dir
+            container,
+            config,
+            processed_scene,
+            observation.q_init,
+            goal_atoms,
+            env,
+            all_surfaces,
+            save_dir,
+            placement_region=placement_region,
         )
         if cutamp_plan is None:
             raise RuntimeError(f"cuTAMP found no reset plan for any of {sorted(skipped)}")
@@ -2012,21 +2314,25 @@ async def _run_scene_reset(
                 "moved": len(moved),
                 "skipped": skipped,
                 "n_frames": n_frames,
+                **pointer,
             }
         )
     except KeyboardInterrupt:
         _log.info("Scene reset preempted (Ctrl-C)")
-        _emit_event({"event": "reset_failed", "dir": str(save_dir), "error": "aborted"})
+        _emit_event({"event": "reset_failed", "dir": str(save_dir), "error": "aborted", **pointer})
         raise  # the loop's handler clears the preempt latch and returns us to the task prompt
     except UserExitException:
         # run_perception raises this to end the whole session (TIPTOP_DETECT_ONLY). Catching it below
         # as a plain reset failure would keep a session alive that asked to exit.
-        _emit_event({"event": "reset_failed", "dir": str(save_dir), "error": "session exiting"})
+        _emit_event({"event": "reset_failed", "dir": str(save_dir), "error": "session exiting", **pointer})
         raise
     except Exception as e:
         _log.exception(f"Scene reset failed ({type(e).__name__}: {e}); reset the scene by hand and carry on")
-        _emit_event({"event": "reset_failed", "dir": str(save_dir), "error": f"{type(e).__name__}: {e}"})
+        _emit_event({"event": "reset_failed", "dir": str(save_dir), "error": f"{type(e).__name__}: {e}", **pointer})
     finally:
+        # Even a reset that failed part-way is footage the stitched video has to account for, so it
+        # becomes the predecessor of whatever runs next.
+        _note_segment(save_dir)
         if file_handler is not None:
             remove_file_handler(file_handler)
 
@@ -2037,6 +2343,17 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
     arms = configured_arms()
     bimanual = bool(arms)
     dual_handover = cfg.robot.type == "bimanual_yam_dual"
+    # Auto mode picks reset-or-collect at each prompt instead of the operator (tiptop.auto_mode).
+    # Single-arm only: the dual domain has no reset at all (see the 'reset' command below) and the
+    # sequential-bimanual one has no third-person camera to judge the tabletop from.
+    auto_mode = resolve_auto_mode(container.cost_overrides)
+    if auto_mode and (bimanual or dual_handover):
+        _log.warning("auto_mode is single-arm only; ignoring it for this bimanual session")
+        auto_mode = False
+    elif auto_mode:
+        _log.info("Auto mode ON: Gemini decides at each prompt whether to reset the scene or collect")
+    # Resets auto mode has run since the last rollout, for should_reset's stall guard.
+    consecutive_auto_resets = 0
     if bimanual:
         _log.info(f"Bimanual YAM session: arms {arms} (sequential — one cuTAMP plan per arm per episode)")
     elif dual_handover:
@@ -2053,7 +2370,13 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # Get the task BEFORE any pre-trial robot motion so that quitting (or an empty
                 # prompt) ends the session without moving to capture + opening the gripper --
                 # which would drop whatever is currently held. Reuses the warmed container.
-                task_instruction = _get_task_instruction()  # Let UserExitException propagate
+                #
+                # Auto mode reads the same stdin, but without waiting on it: it repeats the last
+                # task and collects, pass after pass, until preempted (_auto_mode_task_instruction).
+                if auto_mode:
+                    task_instruction = _auto_mode_task_instruction()
+                else:
+                    task_instruction = _get_task_instruction()  # Let UserExitException propagate
                 # A robot command from the UI or the prompt: run it against the warm container and go
                 # straight back to the prompt -- no rollout, no episode. 'home'/'open' are single
                 # nudges; 'reset' is a whole unrecorded perceive-plan-execute cycle, hence async.
@@ -2077,6 +2400,35 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         _run_robot_command(container, cfg, task_instruction)
                     continue
                 _log.info(f"User entered instruction: {task_instruction}")
+
+                if auto_mode:
+                    # Home and empty the hand BEFORE the photo: the arm has to be out of the
+                    # third-person shot, and an object still in the gripper is not part of the scene
+                    # being judged. Both are what the pre-episode block below does anyway, and both
+                    # no-op when already so -- so this is that block running early, not a second one.
+                    go_to_home(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
+                    try:
+                        _open_gripper_if_needed(container)
+                    except Exception as _e:
+                        _log.exception("Gripper open/check failed before the auto-mode check: " + str(_e))
+                    needs_reset, reason = await _auto_mode_needs_reset(container, task_instruction, output_dir)
+                    do_reset, decision = should_reset(needs_reset, consecutive_auto_resets)
+                    _log.info(f"Auto mode: {'resetting the scene' if do_reset else 'collecting'} -- {decision}")
+                    _emit_event(
+                        {
+                            "event": "auto_mode_decision",
+                            "reset": do_reset,
+                            "needs_reset": needs_reset,
+                            "reason": reason,
+                            "decision": decision,
+                            "consecutive_resets": consecutive_auto_resets,
+                        }
+                    )
+                    if do_reset:
+                        consecutive_auto_resets += 1
+                        await _run_scene_reset(session, container, config, output_dir)
+                        continue  # back to the prompt; the next pass re-checks the scene
+                    consecutive_auto_resets = 0
 
                 # Reset to a clean starting state for the new episode: return the arm home
                 # and open the gripper -- but only when they aren't already so. go_to_home
@@ -2138,7 +2490,10 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
 
                 save_dir = Path(output_dir) / "eval" / timestamp
                 _log.info(f"Saving logs, results, and visualizations to {save_dir}")
-                _emit_event({"event": "rollout_start", "dir": str(save_dir)})
+                # Same back-pointer a reset writes, so a stitched video can walk the whole session
+                # -- rollouts and the resets interleaved between them -- as one chain.
+                pointer = _write_prev_pointer(save_dir, _prev_segment(output_dir, exclude=save_dir))
+                _emit_event({"event": "rollout_start", "dir": str(save_dir), **pointer})
 
                 # Add log file handler for this run
                 file_handler = add_file_handler(save_dir / "tiptop_run.log")
@@ -2186,7 +2541,10 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         remove_file_handler(file_handler)
                     if execute_plan:
                         final_dir = _label_rollout(save_dir, output_dir, timestamp)
+                        _note_segment(final_dir)
                         _spawn_postprocess(final_dir)
+                    else:
+                        _note_segment(save_dir)
                     continue
 
                 if dual_handover:
@@ -2220,7 +2578,10 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         remove_file_handler(file_handler)
                     if execute_plan:
                         final_dir = _label_rollout(save_dir, output_dir, timestamp)
+                        _note_segment(final_dir)
                         _spawn_postprocess(final_dir)
+                    else:
+                        _note_segment(save_dir)
                     continue
 
                 try:
@@ -2327,8 +2688,19 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         )
                         _log.info(f"Logs, results, and visualizations saved to {save_dir}")
 
-                    if execute_plan:
+                    if execute_plan and auto_mode:
+                        # Auto mode never stops to label: the prompt blocks on stdin, which would
+                        # end the continuous loop after a single episode. The rollout stays in
+                        # eval/ and is labelled when auto mode stops (_drain_auto_label_queue), so
+                        # the segment the NEXT pass points back at is this eval/ directory --
+                        # prev_rollout_id is what survives the later move.
+                        _defer_label(save_dir, timestamp)
+                        _note_segment(save_dir)
+                    elif execute_plan:
                         final_dir = _label_rollout(save_dir, output_dir, timestamp)
+                        # The labelled directory, not the eval/ one it started in: that is where the
+                        # next segment's prev_rollout has to point.
+                        _note_segment(final_dir)
                         # Post-process this rollout (gifs + LeRobot export) in the background so
                         # the next rollout can start immediately instead of blocking on it.
                         _spawn_postprocess(final_dir)
@@ -2337,6 +2709,8 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                         # standalone "did the grasp work?" tests. For cortex we WANT
                         # to keep the object held so Haiku can decide whether to Place
                         # next. Removing the open_gripper() call here.
+                    else:
+                        _note_segment(save_dir)
                 except Exception:
                     _log.exception("TiPToP run failed")
                     raise
@@ -2345,6 +2719,7 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                     remove_file_handler(file_handler)
             except UserExitException:
                 _log.info("User requested exit")
+                _report_unlabelled(output_dir)
                 break
             except KeyboardInterrupt:
                 # Preempt from the data-collection UI (SIGINT), or a terminal Ctrl-C. Treat it
@@ -2366,6 +2741,15 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 # Unwind is done (the finally-blocks above ran as the exception propagated), so a
                 # new Ctrl-C should preempt the next rollout rather than be swallowed.
                 _clear_preempt()
+                if auto_mode:
+                    # A preempt is how the operator stops auto mode: they are back in the loop, so
+                    # hand stdin back to them -- first for the labels auto mode deferred, then for
+                    # the ordinary task prompt. Staying in auto mode would start collecting again
+                    # the moment they finished labelling.
+                    auto_mode = False
+                    _log.info("Auto mode off (preempted); labelling what it collected")
+                    _emit_event({"event": "auto_mode_off", "queued": len(_AUTO_LABEL_QUEUE)})
+                    _drain_auto_label_queue(output_dir)
                 continue
             except Exception as e:
                 # A single rollout failing (a transient Gemini/perception 503, a planning
