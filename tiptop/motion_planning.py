@@ -100,18 +100,18 @@ def get_ik_solver(
 
 
 # tamp-vla repo root: .../tamp-vla/tiptop/tiptop/motion_planning.py -> parents[2] == tamp-vla.
-# Used to resolve repo-relative vae_path overrides (e.g. "vae/checkpoints/vae_full_v2.pt") the same
-# way regardless of the process cwd (tiptop-run runs from tiptop/, not the repo root).
+# Used to resolve repo-relative encoder_path overrides the same way regardless of the process cwd
+# (tiptop-run runs from tiptop/, not the repo root).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def resolve_vae_path(vae_path: str) -> str:
-    """Resolve a vae_path override to an absolute checkpoint path.
+def resolve_encoder_path(encoder_path: str) -> str:
+    """Resolve an encoder_path override to an absolute checkpoint path.
 
-    Absolute (or ~-prefixed) paths are used as-is; relative paths are resolved against the
-    tamp-vla repo root so `vae/checkpoints/vae_full_v2.pt` works from any cwd.
+    Absolute (or ~-prefixed) paths are used as-is; relative paths are resolved against
+    ``_REPO_ROOT``, so the result does not depend on the cwd.
     """
-    p = Path(os.path.expanduser(vae_path))
+    p = Path(os.path.expanduser(encoder_path))
     if not p.is_absolute():
         p = _REPO_ROOT / p
     return str(p)
@@ -131,9 +131,10 @@ def resolve_trace_cfg(overrides: dict | None) -> dict | None:
     ov = overrides or {}
     cfg: dict = {"source_dt": float(ov.get("base_dt") or 0.15), "n_joints": 7}
     active = False
-    if ov.get("vae_manifold_weight"):
+    if ov.get("encoder_weight"):
         # checkpoint_path selects the encoder + DROID latent stats; resolve like apply_cost_overrides.
-        cfg["vae"] = {"checkpoint_path": resolve_vae_path(str(ov["vae_path"])) if ov.get("vae_path") else None}
+        checkpoint_path = resolve_encoder_path(str(ov["encoder_path"])) if ov.get("encoder_path") else None
+        cfg["vae"] = {"checkpoint_path": checkpoint_path}
         active = True
     if ov.get("joint_density_weight"):
         cfg["joint_density"] = {"huber_delta": 0.05}
@@ -155,26 +156,20 @@ def apply_cost_overrides(cost: dict, overrides: dict | None) -> None:
         return
     if overrides.get("uniform_velocity_weight") is not None:
         cost["uniform_velocity_cfg"]["weight"] = float(overrides["uniform_velocity_weight"])
-    # VAE motion-manifold cost (see curobo cost/vae_manifold_cost.py): a single weight knob
-    # (Mahalanobis distance to the DROID latent cluster). The block may be absent on older
-    # configs, so create it on demand when the override is provided.
-    if overrides.get("vae_manifold_weight") is not None or overrides.get("vae_path") is not None:
+    # Trajectory-encoder motion-manifold cost (cuRobo's vae_manifold_cfg, see curobo
+    # cost/vae_manifold_cost.py): a single weight knob, encoder_weight (Mahalanobis distance to the
+    # DROID latent cluster). The block may be absent on older configs, so create it on demand when
+    # the override is provided.
+    if overrides.get("encoder_weight") is not None or overrides.get("encoder_path") is not None:
         vm = cost.setdefault("vae_manifold_cfg", {"weight": 0.0, "n_joints": 7, "source_dt": 0.15})
-        if overrides.get("vae_manifold_weight") is not None:
-            vm["weight"] = float(overrides["vae_manifold_weight"])
-        # vae_retiming promotes each waypoint interval's duration to a trajopt decision variable,
-        # optimized by the same LBFGS pass as the waypoints. The three guard knobs are optional.
-        if resolve_vae_retiming(overrides):
-            vm["retiming"] = True
-            for key in ("retime_scale", "retime_smooth_weight", "retime_limit_weight"):
-                if overrides.get(key) is not None:
-                    vm[key] = float(overrides[key])
-        # vae_path selects WHICH checkpoint the manifold cost loads (encoder + DROID latent stats),
+        if overrides.get("encoder_weight") is not None:
+            vm["weight"] = float(overrides["encoder_weight"])
+        # encoder_path selects WHICH checkpoint the manifold cost loads (encoder + DROID latent stats),
         # overriding the VAE_MANIFOLD_CKPT env default. Resolved to an absolute path so it is cwd-safe.
-        if overrides.get("vae_path") is not None:
-            vm["checkpoint_path"] = resolve_vae_path(str(overrides["vae_path"]))
+        if overrides.get("encoder_path") is not None:
+            vm["checkpoint_path"] = resolve_encoder_path(str(overrides["encoder_path"]))
     # RND novelty cost (see curobo cost/rnd_novelty_cost.py): a single weight knob that MAXIMIZES how
-    # poorly DROID covers the motion (the opposite of vae_manifold_weight). rnd_novelty_log toggles
+    # poorly DROID covers the motion (the opposite of encoder_weight). rnd_novelty_log toggles
     # maximizing log(novelty) (default) vs raw novelty. Block may be absent -> create on demand.
     if overrides.get("rnd_novelty_weight") is not None or overrides.get("rnd_novelty_log") is not None:
         rn = cost.setdefault(
@@ -252,51 +247,40 @@ def _scale_kwargs(overrides: dict | None, n_cspace_joints: int) -> dict:
     return kw
 
 
-def resolve_vae_retiming(overrides: dict | None) -> bool:
-    """Whether the VAE manifold cost owns the trajectory clock (the ``vae_retiming`` override).
-
-    When on, the per-interval durations are decision variables of the cuRobo gradient trajopt (see
-    curobo cost/vae_manifold_cost.py) and every OTHER retiming stage is suppressed: the
-    time_dilation_factor, cuRobo's own time-optimal ``optimize_dt`` rescale, and trajectory
-    blending (both the analytic spline and the flow model). Requires a nonzero
-    ``vae_manifold_weight`` -- with the cost disabled there is nothing optimizing the clock, and
-    silently suppressing every retimer would just emit raw trajopt output at base_dt."""
-    ov = overrides or {}
-    if not ov.get("vae_retiming"):
-        return False
-    if not ov.get("vae_manifold_weight"):
-        _log.warning(
-            "vae_retiming is set but vae_manifold_weight is 0/absent -- nothing would optimize the "
-            "trajectory clock, so vae_retiming is IGNORED."
-        )
-        return False
-    return True
-
-
 def resolve_time_dilation_factor(overrides: dict | None, config_default: float) -> float:
     """Effective time_dilation_factor from UI/sweep overrides.
 
     ``time_dilation_factor_literal`` bypasses the 1.0 sentinel (used by the parameter sweep) so a
     requested value is applied verbatim. Otherwise a ``time_dilation_factor`` of None or 1.0 means
     "no extra scaling" and we fall back to the config default (tiptop.yml robot.time_dilation_factor).
-
-    ``vae_retiming`` wins over both: the VAE owns the clock, so returning anything but 1.0 would
-    rescale the timing it just optimized. 1.0 is cuRobo's no-op sentinel (MotionGenResult.
-    retime_trajectory returns immediately), whereas falling back to ``config_default`` would NOT be
-    a no-op -- tiptop.yml ships robot.time_dilation_factor: 0.2.
     """
     overrides = overrides or {}
-    if resolve_vae_retiming(overrides):
-        requested = overrides.get("time_dilation_factor_literal", overrides.get("time_dilation_factor"))
-        if requested is not None:
-            _log.info(f"vae_retiming active: time_dilation_factor={requested} IGNORED (forced to 1.0)")
-        return 1.0
     if overrides.get("time_dilation_factor_literal") is not None:
         return float(overrides["time_dilation_factor_literal"])
     tdf = overrides.get("time_dilation_factor")
     if tdf is None or abs(float(tdf) - 1.0) < 1e-6:
         return float(config_default)
     return float(tdf)
+
+
+def resolve_solver_effort(overrides: dict | None, num_particles: int, opt_steps_per_skeleton: int) -> tuple[int, int]:
+    """Effective ``(num_particles, opt_steps_per_skeleton)`` for cuTAMP, as tiptop-run and tiptop-server use it.
+
+    A ``num_particles`` / ``opt_steps_per_skeleton`` key in cfg/tamp ``tamp_overrides`` wins over the value
+    passed in (the CLI flag or its default), so a data-gen config sets solver effort without CLI flags.
+    Raises ValueError unless both resolved values are positive.
+    """
+    overrides = overrides or {}
+    if overrides.get("num_particles") is not None:
+        num_particles = int(overrides["num_particles"])
+    if overrides.get("opt_steps_per_skeleton") is not None:
+        opt_steps_per_skeleton = int(overrides["opt_steps_per_skeleton"])
+    if num_particles <= 0 or opt_steps_per_skeleton <= 0:
+        raise ValueError(
+            f"num_particles and opt_steps_per_skeleton must be positive, got "
+            f"{num_particles=}, {opt_steps_per_skeleton=}"
+        )
+    return num_particles, opt_steps_per_skeleton
 
 
 def resolve_traj_length_norm(overrides: dict | None, default: float = 2.0) -> float:
@@ -470,7 +454,8 @@ def resolve_grasp_rank_conf_weight(overrides: dict | None) -> float | None:
 # cfg/tamp `tamp_overrides` keys that retune PERCEPTION rather than the solver, mapped to their
 # path in tiptop.yml. Everything else in tamp_overrides is a cuRobo cost weight or a TAMP-config
 # knob; these are the exceptions, because the grasp candidates perception hands cuTAMP bound what
-# any downstream cost can choose between. Add a key here to make it settable per data-gen config.
+# any downstream cost can choose between. Add a key here (and to override_keys.SUPPORTED_OVERRIDE_KEYS)
+# to make it settable per data-gen config.
 _PERCEPTION_OVERRIDE_KEYS = {
     # Max distance from an M2T2 grasp's contact point to a reconstructed object point for that
     # grasp to be associated with the object (tiptop_run.process_scene). Grasps beyond it are
@@ -559,18 +544,8 @@ def summarize_curobo_config(overrides: dict | None, time_dilation_factor) -> dic
         "overrides": ov,
         "resolved": {
             "uniform_velocity_weight": c["uniform_velocity_cfg"]["weight"],
-            "vae_manifold_weight": c.get("vae_manifold_cfg", {}).get("weight", 0.0),
-            "vae_path": c.get("vae_manifold_cfg", {}).get("checkpoint_path"),
-            # With retiming on, the per-interval durations were trajopt decision variables and every
-            # other retimer was suppressed -- without this the record would be indistinguishable
-            # from a stock run.
-            "vae_retiming": c.get("vae_manifold_cfg", {}).get("retiming", False),
-            "vae_retime_scale": c.get("vae_manifold_cfg", {}).get("retime_scale"),
-            "retiming_suppressed": (
-                ["time_dilation_factor", "optimize_dt", "blending"]
-                if c.get("vae_manifold_cfg", {}).get("retiming", False)
-                else []
-            ),
+            "encoder_weight": c.get("vae_manifold_cfg", {}).get("weight", 0.0),
+            "encoder_path": c.get("vae_manifold_cfg", {}).get("checkpoint_path"),
             "rnd_novelty_weight": c.get("rnd_novelty_cfg", {}).get("weight", 0.0),
             "rnd_novelty_log": c.get("rnd_novelty_cfg", {}).get("use_log", True),
             "joint_density_weight": c.get("joint_density_cfg", {}).get("weight", 0.0),
@@ -675,12 +650,11 @@ def get_motion_gen(
         # just that the CLI arg parsed). Grep tiptop_*.log for "RESOLVED cuRobo cost".
         _gc = grad_cfg["cost"]
         _log.info(
-            "RESOLVED cuRobo cost after overrides: vae_manifold_weight=%s vae_path=%s rnd_novelty_weight=%s joint_density_weight=%s | overrides=%s",
-            _gc.get("vae_manifold_cfg", {}).get("weight"),
-            _gc.get("vae_manifold_cfg", {}).get("checkpoint_path"),
-            _gc.get("rnd_novelty_cfg", {}).get("weight"),
-            _gc.get("joint_density_cfg", {}).get("weight"),
-            cost_overrides,
+            "RESOLVED cuRobo cost after overrides: "
+            f"encoder_weight={_gc.get('vae_manifold_cfg', {}).get('weight')} "
+            f"encoder_path={_gc.get('vae_manifold_cfg', {}).get('checkpoint_path')} "
+            f"rnd_novelty_weight={_gc.get('rnd_novelty_cfg', {}).get('weight')} "
+            f"joint_density_weight={_gc.get('joint_density_cfg', {}).get('weight')} | overrides={cost_overrides}"
         )
         grad_file = grad_cfg  # dict, not str
 

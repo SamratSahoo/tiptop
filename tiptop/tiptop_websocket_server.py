@@ -37,14 +37,17 @@ from tiptop.motion_planning import (
     apply_perception_overrides,
     resolve_grasp_center_cost,
     resolve_grasp_orientation_cost,
+    resolve_grasp_rank_conf_weight,
     resolve_max_motion_refine_attempts,
     resolve_posture_selection,
+    resolve_require_m2t2_grasps,
+    resolve_solver_effort,
     resolve_time_dilation_factor,
     resolve_traj_length_norm,
     resolve_transit_apex,
     resolve_trace_cfg,
 )
-from tiptop.override_aliases import resolve_override_aliases
+from tiptop.override_keys import SESSION_ONLY_OVERRIDE_KEYS, check_override_keys
 from tiptop.perception.cameras import Frame
 from tiptop.planning import build_tamp_config, run_planning, save_tiptop_plan, serialize_plan
 from tiptop.recording import save_run_metadata, save_run_outputs
@@ -57,16 +60,13 @@ _log = logging.getLogger(__name__)
 def _load_curobo_overrides(spec: str | None) -> dict:
     """Parse cuRobo cost overrides from a JSON file path OR an inline JSON string.
 
-    Returns {} when ``spec`` is falsy. These are the same override keys the parameter sweep and
-    the tiptop-viz UI use (vae_manifold_weight, rnd_novelty_weight, joint_density_weight, smooth_weight,
-    self_collision_weight, time_dilation_factor[_literal], ...) -- see motion_planning.apply_cost_overrides.
-    Applying them at
-    server build time makes every plan this server produces use those tamp parameters, so e.g. a
-    data-gen job can generate a dataset with a chosen manifold/novelty/smoothness regime.
+    Returns {} when ``spec`` is falsy. The keys are the tamp overrides listed in
+    override_keys.SUPPORTED_OVERRIDE_KEYS (encoder_weight, retime_*, grasp and perception knobs, ...).
+    Applying them at solver build time makes every plan use those parameters.
 
-    The trajectory-encoder aliases ``encoder_path``, ``encoder_weight`` and ``blend_mode: encoder`` are
-    rewritten here to ``vae_path``, ``vae_manifold_weight`` and ``blend_mode: vae`` (see
-    override_aliases.resolve_override_aliases); the old names keep working unchanged.
+    Raises ValueError for any key tiptop does not read, a ``retime_mode`` other than "encoder", and
+    ``retime_trajectory`` without ``encoder_path`` (see override_keys.check_override_keys), so an
+    unsupported setting fails here instead of being ignored.
     """
     if not spec:
         return {}
@@ -75,7 +75,8 @@ def _load_curobo_overrides(spec: str | None) -> dict:
     overrides = json.loads(text)
     if not isinstance(overrides, dict):
         raise ValueError(f"cuRobo overrides must be a JSON object, got {type(overrides).__name__}")
-    return resolve_override_aliases(overrides)
+    check_override_keys(overrides)
+    return overrides
 
 
 class TiptopPlanningServer:
@@ -108,6 +109,18 @@ class TiptopPlanningServer:
         # cuRobo cost/tamp-parameter overrides (empty by default -> stock gradient_trajopt.yml +
         # tiptop.yml behavior). Applied at solver build time so every plan uses these tamp params.
         self._curobo_overrides = _load_curobo_overrides(curobo_overrides)
+        # Checked before anything is applied: the server has no reset-or-collect loop or scene reset.
+        session_only = sorted(set(self._curobo_overrides) & SESSION_ONLY_OVERRIDE_KEYS)
+        if session_only:
+            raise ValueError(
+                f"tamp override key(s) {session_only} are tiptop-run session options that tiptop-server does not "
+                f"support (SESSION_ONLY_OVERRIDE_KEYS in tiptop/override_keys.py); remove them from curobo_overrides"
+            )
+        # A num_particles / opt_steps_per_skeleton key wins over the argument, exactly as in tiptop-run.
+        num_particles, opt_steps_per_skeleton = resolve_solver_effort(
+            self._curobo_overrides, num_particles, opt_steps_per_skeleton=500
+        )
+        _log.info(f"Solver effort: num_particles={num_particles}, opt_steps_per_skeleton={opt_steps_per_skeleton}")
         # Perception knobs travel in the same dict; applied before any perception so the grasp
         # candidates cuTAMP receives reflect them. See apply_perception_overrides.
         for _key, (_old, _new) in apply_perception_overrides(self._cfg, self._curobo_overrides).items():
@@ -123,6 +136,7 @@ class TiptopPlanningServer:
             "server": "tiptop",
             "version": "0.1.0",
             "num_particles": num_particles,
+            "opt_steps_per_skeleton": opt_steps_per_skeleton,
             "max_planning_time": max_planning_time,
             "curobo_overrides": self._curobo_overrides,
             "time_dilation_factor": time_dilation_factor,
@@ -145,12 +159,13 @@ class TiptopPlanningServer:
         self._config = build_tamp_config(
             num_particles=num_particles,
             max_planning_time=max_planning_time,
-            opt_steps=500,
+            opt_steps=opt_steps_per_skeleton,
             robot_type=self._cfg.robot.type,
             time_dilation_factor=time_dilation_factor,
             traj_length_norm=resolve_traj_length_norm(self._curobo_overrides),
             grasp_orientation_cost=resolve_grasp_orientation_cost(self._curobo_overrides),
             grasp_center_cost=resolve_grasp_center_cost(self._curobo_overrides),
+            grasp_rank_conf_weight=resolve_grasp_rank_conf_weight(self._curobo_overrides),
             # Only meaningful for robot_type == "bimanual_yam_dual" (see tiptop_yam_dual.yml); every
             # other config leaves robot.arm_mode/dual_task unset and gets cuTAMP's single-arm defaults.
             arm_mode=self._cfg.robot.get("arm_mode", "single"),
@@ -163,6 +178,10 @@ class TiptopPlanningServer:
             # IK branch selection by teleop posture (off unless the cfg sets
             # posture_selection_seeds). See resolve_posture_selection.
             posture_selection=_posture_selection,
+            # Fail instead of silently substituting collision-sphere heuristic grasps for an object
+            # perception proposed nothing for (off unless the cfg sets it). See
+            # resolve_require_m2t2_grasps.
+            require_m2t2_grasps=resolve_require_m2t2_grasps(self._curobo_overrides),
         )
         self._output_dir = Path("tiptop_server_outputs")
         # Concurrency model. The slow part of a plan is I/O-bound perception (Gemini / SAM2 / M2T2
@@ -461,7 +480,7 @@ def _run_server(
     Args:
         host: Host to bind to.
         port: Port to bind to.
-        num_particles: Number of particles for cuTAMP.
+        num_particles: Number of particles for cuTAMP; a ``num_particles`` key in curobo_overrides wins.
         max_planning_time: Max planning time in seconds.
         rerun_mode: Rerun visualization mode. 'stream' spawns the Rerun viewer; 'save' writes .rrd files to disk; 'disabled' skips all Rerun logging.
         include_workspace: If True, include real-robot workspace cuboids in the collision world.
@@ -472,10 +491,12 @@ def _run_server(
         max_concurrent_perception: Max perceptions running at once when overlap is on; bounds load
             on the Gemini API / M2T2 grasp server.
         curobo_overrides: cuRobo cost/tamp-parameter overrides as a JSON file path OR an inline JSON
-            object string (e.g. '{"vae_manifold_weight": 5000, "rnd_novelty_weight": 100000,
+            object string (e.g. '{"encoder_weight": 5000, "rnd_novelty_weight": 100000,
             "time_dilation_factor_literal": 0.5}'). Applied at solver build time so every plan this
-            server produces uses those tamp parameters. Keys match motion_planning.apply_cost_overrides.
-            Absent -> stock gradient_trajopt.yml / tiptop.yml defaults.
+            server produces uses those tamp parameters; ``opt_steps_per_skeleton`` (default 500) has no flag
+            of its own and is set only here. Keys not in override_keys.SUPPORTED_OVERRIDE_KEYS are rejected,
+            as are the tiptop-run session options in override_keys.SESSION_ONLY_OVERRIDE_KEYS. Absent ->
+            stock gradient_trajopt.yml / tiptop.yml defaults.
     """
     print_tiptop_banner()
     check_cutamp_version()

@@ -148,9 +148,9 @@ def run_planning(
 
     Returns (None, elapsed, failure_reason) if cuTAMP fails to find a plan.
 
-    ``cost_overrides`` is the config's ``tamp_overrides`` dict; it is used here only to resolve the
-    trajectory-blending settings (``blend_trajectory`` etc. -- see resolve_blend_config). Blending is
-    off unless the config opts in.
+    ``cost_overrides`` is the config's ``tamp_overrides`` dict; it is used here only for the grasp soft
+    costs and the stroke re-timing settings (``retime_trajectory`` etc. -- see resolve_blend_config).
+    Re-timing is off unless the config opts in.
 
     ``q_return`` overrides where the plan's closing GoToInitial drives to, which otherwise is the
     ``q_init`` it started from. Only a caller concatenating plans needs it -- see
@@ -218,10 +218,11 @@ def run_planning(
         _log.error(f"cuTAMP failed to find a plan: {failure_reason}")
     else:
         _log.info(f"Found plan with {len(cutamp_plan)} steps")
-        # Optionally blend + re-time consecutive trajectory segments into continuous strokes so the
-        # arm only stops at gripper events (opt-in via `blend_trajectory` in tamp_overrides; see
-        # trajectory_blending). Done here, before both serialize_plan and execute_cutamp_plan, so the
-        # saved and executed plans are the identical (possibly blended) object.
+        # Optionally merge the consecutive trajectory segments of each operation into one stroke
+        # re-timed by the trajectory encoder, so the arm only slows at gripper events (opt-in via
+        # `retime_trajectory` in tamp_overrides; see trajectory_blending). Done here, before both
+        # serialize_plan and execute_cutamp_plan, so the saved and executed plans are the identical
+        # (possibly re-timed) object.
         blend_config = resolve_blend_config(cost_overrides)
         if blend_config.enabled:
             dof = next(
@@ -229,32 +230,9 @@ def run_planning(
             )
             if dof is not None:
                 vel_limit, acc_limit = arm_joint_limits(motion_gen, dof)
-                cutamp_plan = _apply_blend(cutamp_plan, blend_config, vel_limit, acc_limit)
+                cutamp_plan = blend_cutamp_plan(cutamp_plan, blend_config, vel_limit=vel_limit, acc_limit=acc_limit)
 
     return cutamp_plan, elapsed, failure_reason
-
-
-def _apply_blend(cutamp_plan, blend_config, vel_limit, acc_limit):
-    """Dispatch trajectory blending on ``blend_config.mode`` (see resolve_blend_config).
-
-    ``spline`` (default) uses the analytic time law in ``trajectory_blending``. ``flow`` samples a full
-    human-like stroke per operation from the conditional flow-matching model (``flow_blending``), so
-    generated data reproduces the distribution of teleoperator styles; it loads from
-    ``blend_config.model_path``, and any setup failure (missing/corrupt checkpoint, import error) is logged
-    and falls back to the analytic spline blend, so a plan is never lost to a model problem.
-    """
-    if blend_config.mode == "flow":
-        try:
-            from tiptop.flow_blending import flow_blend_cutamp_plan
-            from tiptop.networks.flow_timing import FlowModel
-
-            model = FlowModel(blend_config.model_path)
-            return flow_blend_cutamp_plan(
-                cutamp_plan, blend_config, model, vel_limit=vel_limit, acc_limit=acc_limit
-            )
-        except Exception:
-            _log.exception("Flow blending unavailable; falling back to the analytic spline blend")
-    return blend_cutamp_plan(cutamp_plan, blend_config, vel_limit=vel_limit, acc_limit=acc_limit)
 
 
 def _per_timestep_cost(velocity, position=None, trace_cfg=None) -> dict:

@@ -62,6 +62,7 @@ from tiptop.motion_planning import (
     resolve_max_motion_refine_attempts,
     resolve_posture_selection,
     resolve_require_m2t2_grasps,
+    resolve_solver_effort,
     resolve_time_dilation_factor,
     resolve_trace_cfg,
     resolve_traj_length_norm,
@@ -281,7 +282,7 @@ class _DemoContainer:
     curobo_config_summary: dict
 
     # Raw cfg/tamp/*.yml tamp_overrides, threaded to run_planning for the plan-time knobs it resolves
-    # itself (currently trajectory blending -- `blend_trajectory` etc.).
+    # itself (the grasp soft costs and stroke re-timing -- `retime_trajectory` etc.).
     cost_overrides: dict
 
 
@@ -2779,13 +2780,16 @@ def _sync_entrypoint(
     Args:
         output_dir: Top-level directory to save outputs to; a timestamped subdirectory is created per run.
         max_planning_time: Maximum time to spend planning with cuTAMP across all skeletons (approximate).
-        opt_steps_per_skeleton: Number of optimization steps per skeleton in cuTAMP.
+        opt_steps_per_skeleton: Number of optimization steps per skeleton in cuTAMP; an
+            ``opt_steps_per_skeleton`` key in curobo_overrides wins.
         execute_plan: Whether to execute the plan on the real robot.
         cutamp_visualize: Whether to visualize cuTAMP optimization.
-        num_particles: Number of particles for cuTAMP; decrease if running out of GPU memory.
+        num_particles: Number of particles for cuTAMP; decrease if running out of GPU memory. A
+            ``num_particles`` key in curobo_overrides wins.
         enable_recording: Whether to record external camera video during execution.
         curobo_overrides: cuRobo cost overrides as a JSON file path OR inline JSON (the cfg/tamp/*.yml
-            cost knobs, e.g. vae_manifold_weight); applied at solver build time so every plan uses them.
+            cost knobs, e.g. encoder_weight); applied at solver build time so every plan uses them. A key
+            tiptop does not read is rejected (see tiptop.override_keys).
     """
     assert max_planning_time > 0
     assert opt_steps_per_skeleton > 0
@@ -2799,18 +2803,9 @@ def _sync_entrypoint(
     from tiptop.tiptop_websocket_server import _load_curobo_overrides
 
     cost_overrides = _load_curobo_overrides(curobo_overrides)
-    # num_particles / opt_steps_per_skeleton may be set from the cfg/tamp yml (tamp_overrides) so a
-    # data-gen config controls solver effort without CLI flags; an override wins over the CLI default.
-    # (These key names are also echoed by summarize_curobo_config.)
-    if cost_overrides.get("num_particles") is not None:
-        num_particles = int(cost_overrides["num_particles"])
-    if cost_overrides.get("opt_steps_per_skeleton") is not None:
-        opt_steps_per_skeleton = int(cost_overrides["opt_steps_per_skeleton"])
-    if num_particles <= 0 or opt_steps_per_skeleton <= 0:
-        raise ValueError(
-            f"num_particles and opt_steps_per_skeleton must be positive, got "
-            f"{num_particles=}, {opt_steps_per_skeleton=}"
-        )
+    # A num_particles / opt_steps_per_skeleton key in the cfg/tamp yml (tamp_overrides) wins over the CLI
+    # flag, exactly as in tiptop-server. (These key names are also echoed by summarize_curobo_config.)
+    num_particles, opt_steps_per_skeleton = resolve_solver_effort(cost_overrides, num_particles, opt_steps_per_skeleton)
     _log.info(f"Solver effort: num_particles={num_particles}, opt_steps_per_skeleton={opt_steps_per_skeleton}")
     cfg = tiptop_cfg()
     # Perception knobs from the same tamp_overrides dict. Applied HERE -- before the entrypoint runs

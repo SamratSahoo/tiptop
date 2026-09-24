@@ -1,21 +1,20 @@
-"""Stroke re-timing driven entirely by the VAE motion-manifold cost -- no flow model, no search.
+"""Stroke re-timing driven entirely by the trajectory encoder's motion-manifold cost -- no search.
 
-WHY THIS EXISTS, AND WHY IT IS NOT THE `vae_retiming` TAMP OVERRIDE
-------------------------------------------------------------------
-Both put the VAE manifold cost in charge of the clock; they differ in what a "segment" is, and that
-difference is the whole ballgame.
+WHY PER STROKE, NOT PER cuRobo LEG
+----------------------------------
+cuRobo's manifold cost can also own the clock inside each ``plan_single`` (its ``vae_manifold_cfg``
+``retiming`` flag, which tiptop leaves off). What differs is what a "segment" is, and that difference
+is the whole ballgame.
 
-The in-trajopt `vae_retiming` override optimizes duration knots inside each cuRobo ``plan_single``.
-But cuTAMP issues 2-3 ``plan_single`` calls per gripper-to-gripper motion (retract, approach, grasp
+cuTAMP issues 2-3 ``plan_single`` calls per gripper-to-gripper motion (retract, approach, grasp
 -- see cutamp/motion_solver.py), while DROID's latent cluster was built on whole human strokes. The
-cost then pulls every LEG to a human STROKE duration. Measured on a 3-toy pick-and-place: 19 legs,
-each emitted at 4.58-4.72 s (a 1.03x spread) while their joint path lengths spanned 12.4x -- a 5 cm
-retract given the same 4.6 s as a 3.5 rad transit. Seven strokes took 13.9 s each against teleop's
-6.8 s median, for an 88 s episode against teleop's 48.8 s.
+in-trajopt retiming therefore pulls every LEG to a human STROKE duration. Measured on a 3-toy
+pick-and-place: 19 legs, each emitted at 4.58-4.72 s (a 1.03x spread) while their joint path lengths
+spanned 12.4x -- a 5 cm retract given the same 4.6 s as a 3.5 rad transit. Seven strokes took 13.9 s
+each against teleop's 6.8 s median, for an 88 s episode against teleop's 48.8 s.
 
 This module scores the unit DROID actually has: one gripper-delimited stroke. The grouping,
-vel/accel caps and endpoint pinning are the existing blender's (see trajectory_blending); only the
-TIME LAW is ours.
+vel/accel caps and endpoint pinning are trajectory_blending's; only the TIME LAW is here.
 
 WHAT IS OPTIMIZED, AND WHY THERE IS NO DURATION SEARCH
 ------------------------------------------------------
@@ -47,7 +46,7 @@ comparable, because they now literally step together in one optimizer.
 THREE THINGS THAT HAD TO BE RIGHT (each was measured, each alternative was worse)
 --------------------------------------------------------------------------------
 1. TRUE 15 Hz ENCODING. ``droid_mean``/``droid_prec`` were built from motion sampled at 15 Hz
-   (vae/data.py COMMON_RATE), and the encoder is a filterbank whose kernels therefore mean a fixed
+   (encoder/data.py NATIVE_RATE), and the encoder is a filterbank whose kernels therefore mean a fixed
    number of SECONDS. Holding the frame count fixed and letting the spacing float instead (which
    would make duration differentiable the easy way, through the 1/h scaling of the derivative
    channels) feeds that filterbank the wrong rate: against a true 15 Hz encode it correlates
@@ -149,7 +148,7 @@ _N_STARTS = 16
 #: ladder lifts back out along it -- so |v| has to pass through a minimum there no matter how the
 #: stroke is timed. Human teleop, which does NOT reverse (cos +0.85, only 6% of events), holds a
 #: 0.168 rad/s median minimum through its own gripper events. What the timing controls is not
-#: whether the dip happens but how long it lasts, and that is set by `blend_boundary_speed`.
+#: whether the dip happens but how long it lasts, and that is set by `retime_boundary_speed`.
 #:
 #: A/B'd on one raw 19-leg plan, counting emitted frames at 15 Hz:
 #:    target @ 0.01   58 frames < 0.10 rad/s, longest near-zero run 17   junction acc 0.48x limit
@@ -159,18 +158,18 @@ _N_STARTS = 16
 #: tried and rejected: it does not reduce the stall further, and the extra end speed it permits pushes
 #: the reversal's acceleration -- which spans TWO strokes and is therefore invisible to _emit's
 #: per-stroke cap check -- past the FR3's 15 rad/s^2 at two of six junctions. 0.10 already sits at
-#: 0.91x, so it is close to the ceiling: raising `blend_boundary_speed` further trades a stall the
+#: 0.91x, so it is close to the ceiling: raising `retime_boundary_speed` further trades a stall the
 #: robot can track for a commanded reversal it cannot.
 _BOUNDARY_WEIGHT = 50.0
 
 #: Allowed duration range, as multiples of the stroke's own cuRobo wall-clock, and the absolute
 #: seconds it is clipped to. These are BOX BOUNDS on the optimized duration (``span`` is projected
-#: onto them after each Adam step), not a set of candidates. The lower multiple is what lets the VAE
-#: speed a stroke up; the upper one is `blend_max_duration_mult`, passed in.
+#: onto them after each Adam step), not a set of candidates. The lower multiple is what lets the
+#: encoder speed a stroke up; the upper one is `retime_max_duration_mult`, passed in.
 _D_LO_MULT = 0.2
 _D_ABS_LO, _D_ABS_HI = 0.8, 20.0
 
-_VAE_RATE_HZ = 15.0
+_ENCODER_RATE_HZ = 15.0
 
 # Shrinkage ladder for the sampled target draw (see target_latent). The draw is a TARGET, not a
 # feasibility statement, so an extreme one asks for a stroke the robot's velocity/acceleration caps
@@ -185,10 +184,10 @@ _TARGET_SCALES = (1.0, 0.6, 0.3, 0.0)
 
 
 class _Scorer:
-    """Loads the VAE manifold pack once and scores 15 Hz-sampled strokes against the DROID cluster."""
+    """Loads the encoder manifold pack once and scores 15 Hz-sampled strokes against the DROID cluster."""
 
     def __init__(self, checkpoint_path: str | None, n_joints: int):
-        # Imported lazily: cuRobo is heavy and this module is only reached when blend_mode is "vae".
+        # Imported lazily: cuRobo is heavy and this module is only reached when retime_trajectory is on.
         from curobo.rollout.cost.vae_manifold_cost import load_vae_manifold
         from curobo.types.base import TensorDeviceType
 
@@ -201,7 +200,7 @@ class _Scorer:
         """q: [B, T, J] sampled at exactly 15 Hz -> [B, C, T] standardized [q|v|a|jerk]."""
         from curobo.rollout.cost.vae_manifold_cost import _grad_time
 
-        h = 1.0 / _VAE_RATE_HZ
+        h = 1.0 / _ENCODER_RATE_HZ
         v = _grad_time(q, h)
         a = _grad_time(v, h)
         jk = _grad_time(a, h)
@@ -245,7 +244,7 @@ class _Scorer:
         a sampled target, ranking starts by distance to the cluster mean would re-select the most
         typical candidate and undo the sampling (an argmin over _N_STARTS is an extreme-value pick).
         """
-        n = max(6, int(round(duration * _VAE_RATE_HZ)) + 1)
+        n = max(6, int(round(duration * _ENCODER_RATE_HZ)) + 1)
         src = np.linspace(0.0, 1.0, len(positions))
         tgt = np.linspace(0.0, 1.0, n)
         q = np.stack([np.interp(tgt, src, positions[:, j]) for j in range(positions.shape[1])], axis=1)
@@ -273,7 +272,7 @@ def target_latent(scorer: "_Scorer", knots_np: np.ndarray, enabled: bool,
     """One latent for this stroke to aim at: a DRAW from the DROID cluster, or None for the mean.
 
     WHY THIS EXISTS. The objective minimises Mahalanobis distance to ``droid_mean``, so its optimum
-    is the cluster CENTROID -- and ``vae_retime_group`` then takes an argmin over ``_N_STARTS``
+    is the cluster CENTROID -- and ``encoder_retime_group`` then takes an argmin over ``_N_STARTS``
     candidates, which pushes further into "more typical than typical". Both levels select for
     typicality, and the result is that every stroke of a given path length gets nearly the same
     clock. Measured on gripper-delimited strokes matched for path length (1.5-4.0 rad), residual
@@ -311,7 +310,7 @@ def _time_knots(theta: torch.Tensor) -> torch.Tensor:
 
     ``softmax(_RAIL * tanh(theta))`` gives each equal-distance arc interval a share of the stroke's
     time, so theta owns the SHAPE of the speed profile. The tanh rail keeps every interval within
-    exp(+-1.5) ~ 4.5x of the uniform pace; without it intervals collapse toward zero time (measured
+    exp(+-_RAIL) ~ 2.7x of the uniform pace; without it intervals collapse toward zero time (measured
     down to 0.0000 frames), which is an unbounded acceleration the cap check then has to throw away.
     """
     return F.pad(torch.cumsum(torch.softmax(_RAIL * torch.tanh(theta), dim=-1), dim=-1), (1, 0))
@@ -345,11 +344,11 @@ def _optimize(scorer, q_knots, d_lo, d_hi, lead_speed, trail_speed, target=None)
     (measured: 0 of 16 starts ended at a bound), so nothing is lost by dropping it.
     """
     dev = q_knots.device
-    s_lo, s_hi = d_lo * _VAE_RATE_HZ, d_hi * _VAE_RATE_HZ
+    s_lo, s_hi = d_lo * _ENCODER_RATE_HZ, d_hi * _ENCODER_RATE_HZ
     n_frames = int(np.ceil(s_hi)) + 8
 
     starts = np.geomspace(d_lo, d_hi, _N_STARTS + 2)[1:-1]
-    span = torch.tensor(starts * _VAE_RATE_HZ, device=dev, dtype=torch.float32, requires_grad=True)
+    span = torch.tensor(starts * _ENCODER_RATE_HZ, device=dev, dtype=torch.float32, requires_grad=True)
     theta = torch.zeros(_N_STARTS, q_knots.shape[1] - 1, device=dev, requires_grad=True)
     knots = q_knots.expand(_N_STARTS, -1, -1)
     frames = torch.arange(n_frames, device=dev, dtype=q_knots.dtype)
@@ -375,9 +374,9 @@ def _optimize(scorer, q_knots, d_lo, d_hi, lead_speed, trail_speed, target=None)
                        torch.stack([zero, zero + 1.0, span - 1.0, span], dim=1) / span[:, None])
         bnd = q.new_zeros(())
         if lead_speed > 0.0:
-            bnd = bnd + (((ends[:, 1] - ends[:, 0]).norm(dim=-1) * _VAE_RATE_HZ - lead_speed) ** 2).sum()
+            bnd = bnd + (((ends[:, 1] - ends[:, 0]).norm(dim=-1) * _ENCODER_RATE_HZ - lead_speed) ** 2).sum()
         if trail_speed > 0.0:
-            bnd = bnd + (((ends[:, 3] - ends[:, 2]).norm(dim=-1) * _VAE_RATE_HZ - trail_speed) ** 2).sum()
+            bnd = bnd + (((ends[:, 3] - ends[:, 2]).norm(dim=-1) * _ENCODER_RATE_HZ - trail_speed) ** 2).sum()
 
         (loss + _BOUNDARY_WEIGHT * bnd).backward()
         opt.step()
@@ -387,7 +386,7 @@ def _optimize(scorer, q_knots, d_lo, d_hi, lead_speed, trail_speed, target=None)
     with torch.no_grad():
         spans = span.detach().cpu().numpy()
         tau = _time_knots(theta)
-    return [(float(spans[b] / _VAE_RATE_HZ), tau[b : b + 1].detach()) for b in range(_N_STARTS)]
+    return [(float(spans[b] / _ENCODER_RATE_HZ), tau[b : b + 1].detach()) for b in range(_N_STARTS)]
 
 
 def _emit(q_knots, tau, duration, dt, vel_cap_np, acc_cap_np):
@@ -410,7 +409,7 @@ def _emit(q_knots, tau, duration, dt, vel_cap_np, acc_cap_np):
     return pos, vel, acc
 
 
-def vae_retime_group(
+def encoder_retime_group(
     positions: np.ndarray,
     dt: float,
     orig_duration: float,
@@ -425,13 +424,12 @@ def vae_retime_group(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """Re-time one joined stroke so its motion sits as close as possible to the DROID manifold.
 
-    Same contract as :func:`trajectory_blending.blend_group` -- (pos, vel, acc, dt_out) -- so it drops
-    into the same call site. ``orig_duration`` is the stroke's cuRobo wall-clock, used only to bound
-    the duration range; unlike the spline/flow laws it is NOT a target, because the point here is to
-    let the cost pick the pace.
+    Returns (pos, vel, acc, dt_out) resampled at ~``dt``. ``orig_duration`` is the stroke's cuRobo
+    wall-clock, used only to bound the duration range; it is NOT a target, because the point here is
+    to let the cost pick the pace.
 
-    Geometry is the planner's, re-parameterized by arc length and smoothed with the shared
-    ``blend_smoothing`` spline (``smoothing`` = 0 keeps the exact planner polyline, hence its exact
+    Geometry is the planner's, re-parameterized by arc length and smoothed with the
+    ``retime_smoothing`` spline (``smoothing`` = 0 keeps the exact planner polyline, hence its exact
     collision status, at the price of the polyline's corner accelerations).
     """
     from tiptop.trajectory_blending import _dedup_path, _eval_geometry, _fit_geometry
@@ -439,7 +437,7 @@ def vae_retime_group(
     t_start = time.perf_counter()
     pos = _dedup_path(np.asarray(positions, dtype=np.float64))
     if len(pos) < 3:
-        raise ValueError(f"VAE re-timing needs at least 3 distinct waypoints, got {len(pos)}")
+        raise ValueError(f"Encoder re-timing needs at least 3 distinct waypoints, got {len(pos)}")
     dof = pos.shape[1]
 
     # Arc-length canvas: the same curve, sampled uniformly in distance rather than in cuRobo's time.
@@ -456,13 +454,13 @@ def vae_retime_group(
     knots_np[-1] = pos[-1]
 
     if dof != 7:
-        # The VAE encodes a 28-D [q|v|a|j] metric for 7 joints; there is no meaningful score for a
+        # The encoder embeds a 28-D [q|v|a|j] metric for 7 joints; there is no meaningful score for a
         # 12-DOF bimanual chain, and silently scoring its first 7 columns would re-time BOTH arms
         # from one arm's motion. blend_cutamp_plan catches this per stroke and keeps the original
         # segments, so an unsupported embodiment degrades to "no re-timing" rather than to bad timing.
         raise ValueError(
-            f"VAE stroke re-timing is 7-DOF only (the VAE was trained on 7-DOF Franka joint "
-            f"metrics); this plan has dof={dof}"
+            f"Encoder stroke re-timing is 7-DOF only (the trajectory encoder was trained on 7-DOF "
+            f"Franka joint metrics); this plan has dof={dof}"
         )
     scorer = _scorer(checkpoint_path, dof)
     q_knots = torch.as_tensor(knots_np[None], device=scorer.device, dtype=torch.float32)
@@ -500,21 +498,21 @@ def vae_retime_group(
         best = _best_for(target)
         if best is not None:
             if scale not in (scales[0], 0.0):
-                _log.info("VAE re-timing: sampled target shrunk to %.1fx to meet the caps", scale)
+                _log.info(f"Encoder re-timing: sampled target shrunk to {scale:.1f}x to meet the caps")
             break
         if scale > 0.0:
-            _log.debug("VAE re-timing: target scale %.1f had no admissible clock; shrinking", scale)
+            _log.debug(f"Encoder re-timing: target scale {scale:.1f} had no admissible clock; shrinking")
 
     if best is None:
         raise RuntimeError(
-            f"VAE re-timing found no duration in [{d_lo:.2f}, {d_hi:.2f}]s that meets the velocity/"
+            f"Encoder re-timing found no duration in [{d_lo:.2f}, {d_hi:.2f}]s that meets the velocity/"
             f"acceleration caps for this stroke"
         )
     m2, duration, (out_pos, out_vel, out_acc) = best
+    score_name = "d2(sampled target)" if target is not None else "maha2"
     _log.debug(
-        "VAE stroke re-timing: %.2f s -> %.2f s (%s %.2f, %d waypoints, %.1f s to fit)",
-        orig_duration, duration, "d2(sampled target)" if target is not None else "maha2",
-        m2, len(out_pos), time.perf_counter() - t_start,
+        f"Encoder stroke re-timing: {orig_duration:.2f} s -> {duration:.2f} s ({score_name} {m2:.2f}, "
+        f"{len(out_pos)} waypoints, {time.perf_counter() - t_start:.1f} s to fit)"
     )
     from tiptop.trajectory_blending import _finish_stroke
 

@@ -268,7 +268,7 @@ def test_an_explicit_null_in_overrides_means_unrestricted():
 
 def test_overrides_without_the_key_fall_through_to_the_config():
     """Every existing cfg/tamp yml is this case."""
-    assert reset_placement_region({"vae_manifold_weight": 25000}) == reset_placement_region()
+    assert reset_placement_region({"encoder_weight": 25000}) == reset_placement_region()
 
 
 def test_a_malformed_region_is_refused_loudly():
