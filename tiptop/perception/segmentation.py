@@ -77,6 +77,42 @@ def _object_contact_points(xyz_world: np.ndarray, masks: np.ndarray, valid_mask:
     return np.array(contacts) if contacts else np.empty((0, 3))
 
 
+def _upward(plane_model: np.ndarray) -> np.ndarray:
+    """The plane, normalised and oriented so its normal points UP (+z)."""
+    model = np.asarray(plane_model, dtype=np.float64)
+    model = model / np.linalg.norm(model[:3])
+    return -model if model[2] < 0.0 else model
+
+
+#: How far BELOW a candidate plane an object's contact point may sit and still count as resting on
+#: it. Slack for depth noise and for the contact point being a bottom-decile centroid rather than a
+#: true contact -- not for a real gap, because an object cannot be inside the table. Measured on
+#: 2026-09-07_21-31-41, the plane that stole the fit had contacts 6 mm and 20 mm below it.
+_CONTACT_BELOW_TOL = 0.005
+
+
+def _plane_support_score(
+    plane_model, contact_pts: np.ndarray, contact_threshold: float, below_tol: float = _CONTACT_BELOW_TOL
+) -> int:
+    """How many objects are RESTING ON this plane.
+
+    Signed, not absolute. An object resting on the table has its contact point ON the plane or a
+    little above it -- never below, because it cannot be inside the table. Scoring |distance| counts
+    an object as "on" a plane floating above it, and that is what picked the wrong table on
+    2026-09-07_21-31-41: a plane 4 cm above the tabletop scored 3/3 against contact points 2-3 cm
+    BELOW it, beat the real tabletop's 2/3, and the near-table filter that follows then swallowed the
+    plate and the box whole -- leaving the planner a scene with no box in it to put the bread in.
+
+    ``below_tol`` is the slack for depth noise and for the contact point being a bottom-percentile
+    centroid rather than a true contact; ``contact_threshold`` bounds how far ABOVE the plane an
+    object may sit and still count, which is what keeps something resting on top of something else
+    (the loaf on the closed box) from voting for a plane it is nowhere near.
+    """
+    a, b, c, d = _upward(plane_model)
+    signed = contact_pts @ np.array([a, b, c]) + d
+    return int(((signed >= -below_tol) & (signed <= contact_threshold)).sum())
+
+
 def segment_table_with_ransac(
     xyz_world: np.ndarray,
     rgb: np.ndarray,
@@ -84,6 +120,7 @@ def segment_table_with_ransac(
     valid_mask: np.ndarray = None,
     max_planes: int = 5,
     contact_threshold: float = 0.03,
+    support_vote: bool = False,
 ) -> trimesh.primitives.Box:
     """Segment the table by finding the plane that the most detected objects rest on.
 
@@ -99,6 +136,11 @@ def segment_table_with_ransac(
         max_planes: Maximum number of RANSAC iterations to run.
         contact_threshold: Distance (metres) within which an object contact point
                            is considered to lie on a candidate plane.
+        support_vote: Score each plane by the objects resting ON it -- contact points at most
+                      ``_CONTACT_BELOW_TOL`` below it and ``contact_threshold`` above it (see
+                      ``_plane_support_score``) -- and break ties by inlier count. Off by default,
+                      which keeps the absolute-distance score: that one also counts objects BELOW a
+                      plane, and can crown a plane floating above the tabletop.
 
     Returns:
         table_box: trimesh.primitives.Box representing the table.
@@ -126,6 +168,7 @@ def segment_table_with_ransac(
 
     # Iterative RANSAC: score each candidate plane by number of objects resting on it
     remaining_pcd = pcd
+    best_key = (-1, -1)
     best_score = -1
     best_pcd = None
 
@@ -134,17 +177,28 @@ def segment_table_with_ransac(
             break
 
         plane_model, inlier_idxs = remaining_pcd.segment_plane(distance_threshold=0.01, ransac_n=3, num_iterations=1000)
-        a, b, c, d = plane_model
-        norm = np.linalg.norm([a, b, c])
+        if support_vote:
+            score = _plane_support_score(plane_model, contact_pts, contact_threshold)
+            # Inlier count breaks ties: several planes can support the same objects, and the tabletop
+            # is the biggest thing in the scene by a wide margin.
+            key = (score, len(inlier_idxs))
+        else:
+            a, b, c, d = plane_model
+            norm = np.linalg.norm([a, b, c])
 
-        # Distance from each contact point to this plane
-        dists = np.abs(contact_pts @ np.array([a, b, c]) + d) / norm
-        score = int((dists < contact_threshold).sum())
+            # Distance from each contact point to this plane
+            dists = np.abs(contact_pts @ np.array([a, b, c]) + d) / norm
+            score = int((dists < contact_threshold).sum())
+            # The first strictly better plane wins; a tie never displaces it.
+            key = (score, 0)
 
         inlier_pcd = remaining_pcd.select_by_index(inlier_idxs)
-        _log.debug(f"Plane {i}: model={plane_model}, objects_on_plane={score}/{len(contact_pts)}")
+        _log.debug(
+            f"Plane {i}: model={plane_model}, objects_on_plane={score}/{len(contact_pts)}, inliers={len(inlier_idxs)}"
+        )
 
-        if score > best_score:
+        if key > best_key:
+            best_key = key
             best_score = score
             best_pcd = inlier_pcd
 
@@ -473,7 +527,15 @@ def segment_pointcloud_by_masks(
 
         z_mask = xyz_obj[..., 2] > max_z
         if not z_mask.any():
-            _log.warning(f"Skipping {label}: no points above max_z={max_z:.3f}")
+            # Almost always a bad table fit rather than a genuinely flat object: max_z sits just
+            # under the detected tabletop, so an object entirely below it is one the table was
+            # fitted ABOVE. Said plainly because the consequence is silent and total -- the object
+            # is dropped from the scene, and a task that names it cannot be planned at all.
+            _log.error(
+                f"Skipping {label}: its highest point is {xyz_obj[..., 2].max():.3f}, below "
+                f"max_z={max_z:.3f}. The table plane is probably fitted too high; {label} will be "
+                f"missing from the scene entirely."
+            )
             continue
         xyz_proj, rgb_proj = augment_with_base_projections(xyz_obj[z_mask], rgb_obj[z_mask])
 

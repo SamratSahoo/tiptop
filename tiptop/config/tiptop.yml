@@ -95,6 +95,14 @@ perception:
   contact_threshold_m: 0.01
   mask_erosion_pixels: 3
 
+  # How RANSAC picks the table among its candidate planes. false (the original) counts an object as
+  # "on" a plane when its contact point is within 3 cm of it either side, which also counts objects
+  # BELOW a plane: on 2026-09-07_21-31-41 a plane 4 cm above the tabletop won 3/3 that way, and the
+  # near-table filter then dropped the plate and the box from the scene. true counts only objects
+  # resting ON a plane (5 mm below it to 3 cm above) and breaks ties by the plane's size. Settable
+  # per data-gen config via `table_plane_support_vote` in cfg/tamp tamp_overrides.
+  table_plane_support_vote: false
+
   # Padding added to each of the robot's cuRobo collision spheres before they are projected into the
   # third-person view and dropped from the point cloud (see project_spheres_to_mask). Covers
   # extrinsics and kinematics error; raise it if a rim of arm survives in the cloud. Unused when the

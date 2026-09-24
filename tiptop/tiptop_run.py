@@ -1093,8 +1093,17 @@ def process_scene_geometry(
     Returns:
         ProcessedScene with table cuboid, object meshes, pcds, and filtered grasps
     """
-    # Segment table with RANSAC (returns trimesh Box)
-    table_trimesh = segment_table_with_ransac(xyz_map, rgb_map, masks, valid_mask=valid_mask)
+    # Segment table with RANSAC (returns trimesh Box). `table_plane_support_vote` (off unless the
+    # cfg sets it) scores candidate planes by the objects resting ON them; see
+    # segmentation._plane_support_score. Read with .get so a tiptop.yml without the key keeps the
+    # original scoring.
+    table_trimesh = segment_table_with_ransac(
+        xyz_map,
+        rgb_map,
+        masks,
+        valid_mask=valid_mask,
+        support_vote=bool(tiptop_cfg().perception.get("table_plane_support_vote", False)),
+    )
     table_cuboid = convert_trimesh_box_to_curobo_cuboid(table_trimesh, name="table")
     log_curobo_mesh_to_rerun("world/table", table_cuboid.get_mesh(), static_transform=True)
 

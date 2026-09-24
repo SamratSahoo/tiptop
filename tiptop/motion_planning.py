@@ -566,7 +566,21 @@ _PERCEPTION_OVERRIDE_KEYS = {
     # mean of 3 calls) for ~0.2 s. Note the gain was uneven -- one toy went 9 -> 44, the other two
     # stayed near zero -- so this raises the floor, it does not guarantee any given object.
     "voxel_downsample_size": (("perception", "voxel_downsample_size"), float),
+    # Which RANSAC plane is the table: false keeps the original absolute-distance vote, true counts
+    # only objects resting ON a plane and breaks ties by inlier count (see
+    # segmentation._plane_support_score). A switch, not a magnitude, so it is exempt from the
+    # positivity check below.
+    "table_plane_support_vote": (("perception", "table_plane_support_vote"), bool),
 }
+
+
+def _as_bool(key: str, value) -> bool:
+    """A YAML/JSON boolean, strictly: bool("false") is True, so a quoted "false" must not slip by."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise ValueError(f"{key} must be true or false, got {value!r}")
 
 
 def apply_perception_overrides(cfg, overrides: dict | None) -> dict:
@@ -586,10 +600,13 @@ def apply_perception_overrides(cfg, overrides: dict | None) -> dict:
         value = (overrides or {}).get(key)
         if value is None:
             continue
-        # Cast before comparing: an int knob given 20.0 by JSON must land as 20, not 20.0.
-        value = cast(value)
-        if value <= 0:
-            raise ValueError(f"{key} must be positive, got {value}")
+        if cast is bool:
+            value = _as_bool(key, value)
+        else:
+            # Cast before comparing: an int knob given 20.0 by JSON must land as 20, not 20.0.
+            value = cast(value)
+            if value <= 0:
+                raise ValueError(f"{key} must be positive, got {value}")
         node = cfg
         for part in path[:-1]:
             node = node[part]
