@@ -60,12 +60,35 @@ The state_port (5557) serves get_robot_state from a cache filled by a ~100 Hz ba
 poller, so encoders stay readable while _control_handler is parked inside a blocking
 move_to_joint_positions (the control socket cannot answer during motion).
 ----------------------------------------------------------------------------------
-GRIPPER STATE CACHE: get_gripper_state is likewise served from a ~50 Hz background poller
-inside RobotiqDriver (start_polling / get_cached_state), NOT a live Modbus read on the
-request path. A live read stalls on the post-arm-motion RTU retries exactly during the
-open/close ramp, starving the LeRobot gripper sampler so the recorded gripper obs collapses
-to a single-frame jump. The poller and move writes share the one RTU link via _io_lock
-(pymodbus RTU is not thread-safe).
+GRIPPER BACKEND: the Robotiq hangs off ONE RS-485 link (/dev/ttyUSB0), and polymetis's own
+launch_gripper.py client already owns it -- it polls the status registers at 60 Hz and issues the
+position commands. Opening that same tty a second time from here (what this file used to do by
+default) put two Modbus masters on one half-duplex bus with nothing arbitrating between them: a
+tty is not exclusive, so both processes read the same byte stream, response frames get split
+between them, our reads fail CRC, and _read_status burns its retry budget (up to ~3.3 s) while
+holding _io_lock. The cached width then freezes for the whole open/close ramp and teleports when
+the poller re-syncs -- e.g. 0.0083 -> 0.0840 m in 51 ms, i.e. 75 mm of stroke that the 2F-85 needs
+~0.5-1 s to cover. That is the "single-frame jump" in recorded gripper proprioception, and the
+"RS-485 noise around Franka arm activity" blamed below was this contention.
+
+So the gripper is now driven through polymetis's gripper server over gRPC (PolymetisGripper,
+:50052) and ONE process owns the serial link. get_gripper_state is a live GetState RPC -- no local
+cache that can go stale behind our back -- and `stale` is derived from the state's own timestamp
+(>100 ms old) or its error_code, then forwarded to the client so a recorder can drop frozen
+samples instead of interpolating through them.
+
+Note polymetis calibrates position as gPO 230 -> 0.000 m and gPO 3 -> 0.085 m
+(robotiq_2f_gripper.get_pos), where RobotiqDriver used a plain 255..0 -> 0..0.085 ramp. The 2F-85
+really does saturate near those counts, so this backend reads slightly wider at the closed end
+(fully closed is exactly 0.0, not 0.0083); episodes recorded either side of this change sit on
+marginally different width scales. GripperState also carries no motor current -- gCU is only
+visible over raw Modbus -- so `current` is 0.0 on this backend.
+
+--gripper-backend modbus forces the direct-RTU RobotiqDriver below, for a bench setup with no
+polymetis gripper server. It now refuses to open the port when another process already holds it
+rather than reproducing the two-master corruption; its state path keeps the ~50 Hz poller and
+_io_lock (pymodbus RTU is not thread-safe) and ages the cache out to stale instead of serving a
+frozen sample as fresh.
 ----------------------------------------------------------------------------------
 """
 from __future__ import annotations
@@ -105,11 +128,13 @@ class RobotiqDriver:
 
     OPEN_POS = 0      # 0 = fully open (~85mm)
     CLOSED_POS = 255  # 255 = fully closed (0mm)
+    STALE_AFTER_S = 0.1  # ~5 periods of the 50 Hz poller
 
     def __init__(self, port: str = "/dev/ttyUSB0", slave: int = 9):
         from pymodbus.client.sync import ModbusSerialClient
         self.slave = slave
         self._last_state: dict | None = None  # last successful get_state, reused on transient read failure
+        self._last_state_t: float = 0.0       # when that sample landed, for the staleness check
         # A single RTU serial link, now touched by two threads: the gripper handler (move writes +
         # bootstrap reads) and the background _poll_loop (continuous status reads). pymodbus RTU is
         # NOT thread-safe -- interleaved transactions corrupt the frame -- so every register access
@@ -214,6 +239,11 @@ class RobotiqDriver:
         if not ok:
             return {"success": False, "error": "Modbus write failed"}
         if blocking:
+            # gOBJ still reports the PREVIOUS motion's outcome (typically 3, "position reached")
+            # for the first few control cycles after the write, so polling it immediately returns
+            # instantly and the caller advances before the fingers have moved -- which shows up in
+            # a recording as a step instead of a ramp. Let the gripper pick the command up first.
+            time.sleep(0.06)
             t0 = time.time()
             while time.time() - t0 < timeout:
                 st = self._read_status()
@@ -221,6 +251,21 @@ class RobotiqDriver:
                     break
                 time.sleep(0.05)
         return {"success": True}
+
+    def goto_width(self, width_m: float, speed01: float = 0.5, force01: float = 0.5,
+                   blocking: bool = True, timeout: float = 3.0) -> dict:
+        """Common gripper surface (see PolymetisGripper): width in metres, speed/force in 0..1."""
+        speed = int(max(0, min(255, float(speed01) * 255)))
+        force = int(max(0, min(255, float(force01) * 255)))
+        return self.move(self.width_to_pos(width_m), speed=speed, force=force,
+                         blocking=blocking, timeout=timeout)
+
+    def close_grip(self, speed01: float = 0.5, force01: float = 0.5,
+                   blocking: bool = True, timeout: float = 3.0) -> dict:
+        speed = int(max(0, min(255, float(speed01) * 255)))
+        force = int(max(0, min(255, float(force01) * 255)))
+        return self.move(self.CLOSED_POS, speed=speed, force=force,
+                         blocking=blocking, timeout=timeout)
 
     def width_to_pos(self, width_m: float) -> int:
         # Robotiq 2F-85: 0.0..0.085 m maps to 255..0 (inverse)
@@ -256,9 +301,11 @@ class RobotiqDriver:
             "is_grasped": is_grasped,
             "is_moving": is_moving,
             "current": float(st.get("gCU", 0)) * 0.1,
+            "stale": False,
         }
         with self._state_lock:
             self._last_state = state
+            self._last_state_t = time.time()
         return state
 
     def start_polling(self, period_s: float = 0.02) -> None:
@@ -287,11 +334,19 @@ class RobotiqDriver:
         background poller's cache so those reads stay fast and dense through an open/close ramp,
         instead of stalling on the post-arm-motion RTU retries a live read would incur. Falls back
         to a one-off live read only to bootstrap before the poller's first sample lands.
+
+        A sample older than STALE_AFTER_S is flagged rather than served as fresh: when the poller
+        is stuck in _read_status's retries it can hold _io_lock for seconds, and an unflagged
+        frozen width is indistinguishable from a stationary gripper until it jumps.
         """
         with self._state_lock:
             cached = self._last_state
+            age = time.time() - self._last_state_t if cached is not None else 0.0
         if cached is not None:
-            return dict(cached)
+            out = dict(cached)
+            if age > self.STALE_AFTER_S:
+                out["stale"] = True
+            return out
         return self.get_state()
 
     def close(self):
@@ -302,6 +357,165 @@ class RobotiqDriver:
             self.client.close()
         except Exception:
             pass
+
+
+class PolymetisGripper:
+    """Gripper backend that goes through polymetis's gripper server over gRPC (default :50052).
+
+    launch_gripper.py's RobotiqGripperClient owns /dev/ttyUSB0 and runs the 60 Hz status/command
+    loop; this class only reads the state it publishes and posts commands to it. Nothing here
+    touches the serial link, so the two-master frame corruption described in the header -- which is
+    what froze the old cached width and produced the jumps -- cannot happen.
+
+    Exposes the same surface as RobotiqDriver (goto_width / close_grip / get_cached_state / close)
+    so _gripper_handler is backend-agnostic.
+    """
+
+    # Units of Robotiq2FingerGripper.goto, which is what the gripper server ultimately calls:
+    # vel in m/s over ~[0.013, 0.1], force in percent of max. The bamboo wire protocol sends both
+    # normalised 0..1, so map into these ranges rather than into raw 0..255 register counts.
+    SPEED_MIN_MPS, SPEED_MAX_MPS = 0.013, 0.1
+    FORCE_MAX_PCT = 100.0
+    STALE_AFTER_S = 0.1  # ~6 cycles of the 60 Hz polymetis client loop
+
+    def __init__(self, ip: str = "localhost", port: int = 50052, connect_timeout: float = 2.0):
+        _, GripperInterface = _import_polymetis()
+        if GripperInterface is None:
+            raise RuntimeError("polymetis GripperInterface unavailable")
+        # GripperInterface's constructor swallows a missing server (it only warns when the metadata
+        # RPC fails), so probe the socket first -- otherwise an absent gripper server would look
+        # like a healthy backend that answers every state read with an exception.
+        import socket as _socket
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+            s.settimeout(connect_timeout)
+            if s.connect_ex((ip, port)) != 0:
+                raise RuntimeError(f"no gripper server listening on {ip}:{port}")
+        self.iface = GripperInterface(ip_address=ip, port=port)
+        md = getattr(self.iface, "metadata", None)
+        self.max_width = float(getattr(md, "max_width", 0.0) or 0.085)
+        self._lock = threading.Lock()
+        self._last_state: dict | None = None
+        # Probe once so a server that is up but has no client behind it fails here, not later.
+        st = self.get_state()
+        log.info(f"PolymetisGripper connected to {ip}:{port} (max_width={self.max_width:.3f} m, state={st}).")
+
+    def get_state(self) -> dict:
+        try:
+            s = self.iface.get_state()
+        except Exception as e:
+            # The RPC itself failed. Reuse the last good sample, flagged -- never fabricate a
+            # position, which would land in recorded proprioception as a real reading.
+            with self._lock:
+                last = self._last_state
+            if last is not None:
+                out = dict(last)
+                out["stale"] = True
+                return out
+            log.warning(f"gripper GetState failed with no prior sample: {e}")
+            return {"width": self.max_width, "is_grasped": False, "is_moving": False,
+                    "current": 0.0, "stale": True}
+        # The gripper server hands back whatever its client last pushed, so a client that died
+        # leaves a state that still reads fine. Age it against its own timestamp. error_code=1 is
+        # RobotiqGripperClient telling us its Modbus read failed and this is a repeat of the
+        # previous sample.
+        ts = s.timestamp.seconds + s.timestamp.nanos * 1e-9
+        age = (time.time() - ts) if s.timestamp.seconds else 0.0
+        state = {
+            "width": float(s.width),
+            "is_grasped": bool(s.is_grasped),
+            "is_moving": bool(s.is_moving),
+            # GripperState carries no motor current; gCU is only reachable over raw Modbus.
+            "current": 0.0,
+            "stale": bool(s.error_code) or age > self.STALE_AFTER_S,
+        }
+        with self._lock:
+            self._last_state = state
+        return state
+
+    def get_cached_state(self) -> dict:
+        """Name kept for _gripper_handler; here it is a live RPC.
+
+        There is deliberately no local cache on this backend. A cache is what turned a stalled
+        reader into a silently frozen width before; the serial polling now happens in the polymetis
+        client, and its freshness is visible in the state's timestamp.
+        """
+        return self.get_state()
+
+    def _wait_settled(self, target_w: float, timeout: float,
+                      tol: float = 0.003, start_dwell: float = 0.06) -> bool:
+        # gGTO/gOBJ (and so is_moving/is_grasped) still describe the PREVIOUS motion for the first
+        # few cycles after a command lands, so waiting on "not is_moving" straight away returns
+        # instantly and the caller advances before the fingers have moved.
+        time.sleep(start_dwell)
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            st = self.get_state()
+            if not st["stale"] and not st["is_moving"] and (
+                st["is_grasped"] or abs(st["width"] - target_w) <= tol
+            ):
+                return True
+            time.sleep(0.01)
+        log.warning(f"gripper settle timed out after {timeout:.1f}s (target={target_w:.4f} m)")
+        return False
+
+    def goto_width(self, width_m: float, speed01: float = 0.5, force01: float = 0.5,
+                   blocking: bool = True, timeout: float = 3.0) -> dict:
+        w = max(0.0, min(self.max_width, float(width_m)))
+        speed01 = max(0.0, min(1.0, float(speed01)))
+        force01 = max(0.0, min(1.0, float(force01)))
+        speed = self.SPEED_MIN_MPS + speed01 * (self.SPEED_MAX_MPS - self.SPEED_MIN_MPS)
+        force = force01 * self.FORCE_MAX_PCT
+        try:
+            # GripperInterface.goto(blocking=True) only waits for the command to leave its internal
+            # queue, NOT for the fingers to arrive -- the settle wait below is what makes this
+            # blocking in the sense the wire protocol means.
+            self.iface.goto(width=w, speed=speed, force=force, blocking=True)
+        except Exception as e:
+            return {"success": False, "error": f"gripper goto failed: {e}"}
+        if blocking:
+            self._wait_settled(w, timeout)
+        return {"success": True}
+
+    def close_grip(self, speed01: float = 0.5, force01: float = 0.5,
+                   blocking: bool = True, timeout: float = 3.0) -> dict:
+        # polymetis maps grasp -> goto(width=0) for Robotiq anyway (apply_gripper_command), so go
+        # through the same path and let the settle wait stop on is_grasped.
+        return self.goto_width(0.0, speed01=speed01, force01=force01,
+                               blocking=blocking, timeout=timeout)
+
+    def close(self):
+        try:
+            self.iface.channel.close()
+        except Exception:
+            pass
+
+
+def _serial_port_holder(path: str) -> str | None:
+    """Describe the process already holding `path`, or None if it is free.
+
+    A tty is not opened exclusively, so a second open() succeeds silently and lands you with two
+    Modbus masters on one RS-485 link corrupting each other's frames (see the header). Only
+    same-uid processes are visible in /proc, which is enough here: launch_gripper.py runs as the
+    same user we do.
+    """
+    import os
+    try:
+        real = os.path.realpath(path)
+    except Exception:
+        return None
+    me = os.getpid()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == me:
+            continue
+        try:
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                if os.path.realpath(f"/proc/{pid}/fd/{fd}") == real:
+                    with open(f"/proc/{pid}/cmdline", "rb") as f:
+                        cmd = f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+                    return f"pid {pid} ({cmd[:120]})"
+        except OSError:
+            continue  # process exited, or not ours to inspect
+    return None
 
 
 class _TrajectoryStreamer:
@@ -503,20 +717,40 @@ def _np_from(a):
     return np.asarray(a, dtype=np.float32)
 
 
-def _connect_robot(ip, port, robotiq_port: str | None = "/dev/ttyUSB0"):
+def _connect_robot(ip, port, robotiq_port: str | None = "/dev/ttyUSB0",
+                   gripper_backend: str = "auto", gripper_grpc_port: int = 50052):
     RobotInterface, _ = _import_polymetis()
     log.info(f"Connecting RobotInterface to {ip}:{port} ...")
     robot = RobotInterface(ip_address=ip, port=port, enforce_version=False)
     log.info(f"Connected. q0 = {robot.get_joint_positions().tolist()}")
 
     gripper = None
-    if robotiq_port:
+    # Preferred path: polymetis's gripper server, so launch_gripper.py stays the ONLY process on
+    # the RS-485 link. See the header for what sharing it did to the reported width.
+    if gripper_backend in ("auto", "grpc"):
         try:
-            gripper = RobotiqDriver(port=robotiq_port)
-            log.info(f"RobotiqDriver connected on {robotiq_port}.")
+            gripper = PolymetisGripper(ip=ip, port=gripper_grpc_port)
         except Exception as e:
-            log.warning(f"RobotiqDriver unavailable on {robotiq_port}: {e}; using STUB gripper (motions are no-ops).")
-            gripper = None
+            log.warning(f"polymetis gripper server unavailable at {ip}:{gripper_grpc_port}: {e}")
+
+    if gripper is None and gripper_backend in ("auto", "modbus") and robotiq_port:
+        holder = _serial_port_holder(robotiq_port)
+        if holder:
+            log.error(
+                f"Refusing to open {robotiq_port} for direct Modbus: already held by {holder}. "
+                "Two Modbus masters on one RS-485 link corrupt each other's frames and freeze the "
+                "reported gripper width. Reach the gripper through that process instead "
+                "(--gripper-backend grpc, the default), or stop it first."
+            )
+        else:
+            try:
+                gripper = RobotiqDriver(port=robotiq_port)
+                log.info(f"RobotiqDriver connected on {robotiq_port} (direct Modbus; sole owner of the link).")
+            except Exception as e:
+                log.warning(f"RobotiqDriver unavailable on {robotiq_port}: {e}")
+
+    if gripper is None and gripper_backend != "stub":
+        log.warning("No gripper backend available; using STUB gripper (motions are no-ops).")
     return robot, gripper
 
 
@@ -694,7 +928,7 @@ def _gripper_handler(socket: zmq.Socket, gripper):
     log.info("Gripper loop listening...")
     # State stub used when real gripper is unavailable — keeps TiPToP planning alive.
     STUB_WIDTH = 0.085  # max-open width (Robotiq 2F-85)
-    stub_state = {"width": STUB_WIDTH, "is_grasped": False, "is_moving": False}
+    stub_state = {"width": STUB_WIDTH, "is_grasped": False, "is_moving": False, "stale": False}
     while True:
         replied = False
         try:
@@ -720,16 +954,14 @@ def _gripper_handler(socket: zmq.Socket, gripper):
                 socket.send(msgpack.packb(resp))
                 continue
             elif cmd == "open_gripper":
-                # bamboo client passes width in metres, speed/force normalised 0..1
+                # bamboo client passes width in metres, speed/force normalised 0..1. Both backends
+                # expose the same width-based surface, so the unit mapping lives in the backend.
                 width = float(req.get("width", 0.085))
                 speed01 = float(req.get("speed", 0.5))
                 force01 = float(req.get("force", 0.5))
                 blocking = bool(req.get("blocking", True))
                 try:
-                    pos = gripper.width_to_pos(width)
-                    speed = int(max(0, min(255, speed01 * 255)))
-                    force = int(max(0, min(255, force01 * 255)))
-                    resp = gripper.move(pos, speed=speed, force=force, blocking=blocking)
+                    resp = gripper.goto_width(width, speed01=speed01, force01=force01, blocking=blocking)
                 except Exception as e:
                     resp = {"success": False, "error": str(e)}
             elif cmd == "close_gripper":
@@ -737,15 +969,14 @@ def _gripper_handler(socket: zmq.Socket, gripper):
                 force01 = float(req.get("force", 0.5))
                 blocking = bool(req.get("blocking", True))
                 try:
-                    speed = int(max(0, min(255, speed01 * 255)))
-                    force = int(max(0, min(255, force01 * 255)))
-                    resp = gripper.move(gripper.CLOSED_POS, speed=speed, force=force, blocking=blocking)
+                    resp = gripper.close_grip(speed01=speed01, force01=force01, blocking=blocking)
                 except Exception as e:
                     resp = {"success": False, "error": str(e)}
             elif cmd in ("get_gripper_state", "get_state"):
                 try:
-                    # Serve from the background poller's cache (no live Modbus read on the request
-                    # path) so sampler/settle reads stay dense through the open/close ramp.
+                    # gRPC backend: a live GetState against the polymetis gripper server.
+                    # Modbus backend: the background poller's cache, so sampler/settle reads stay
+                    # dense through the open/close ramp instead of stalling on RTU retries.
                     st = gripper.get_cached_state()
                     resp = {
                         "success": True,
@@ -754,6 +985,9 @@ def _gripper_handler(socket: zmq.Socket, gripper):
                             "is_grasped": bool(st["is_grasped"]),
                             "is_moving": bool(st["is_moving"]),
                             "current": float(st.get("current", 0.0)),
+                            # Forwarded so a recorder can drop a frozen sample rather than treat it
+                            # as a real stationary reading and interpolate through the gap.
+                            "stale": bool(st.get("stale", False)),
                         },
                     }
                     log.info(
@@ -861,7 +1095,18 @@ def main():
     p.add_argument("--state-port", type=int, default=5557)
     p.add_argument("--polymetis-ip", default="localhost")
     p.add_argument("--polymetis-port", type=int, default=50051)
-    p.add_argument("--robotiq-port", default="/dev/ttyUSB0", help="serial device (set '' to stub)")
+    p.add_argument(
+        "--gripper-backend", choices=("auto", "grpc", "modbus", "stub"), default="auto",
+        help="how to reach the Robotiq. 'grpc' (and 'auto' when the server is up) goes through "
+        "polymetis's gripper server, leaving launch_gripper.py the only process on the RS-485 "
+        "link -- sharing that link is what froze the reported width and produced jumps in the "
+        "recorded gripper obs. 'modbus' drives /dev/ttyUSB0 directly and is only safe when no "
+        "gripper server is running.",
+    )
+    p.add_argument("--gripper-grpc-port", type=int, default=50052,
+                   help="polymetis gripper server port (conf/launch_gripper.yaml)")
+    p.add_argument("--robotiq-port", default="/dev/ttyUSB0",
+                   help="serial device for --gripper-backend modbus (set '' to stub)")
     p.add_argument(
         "--endpoint-exec",
         action="store_true",
@@ -873,7 +1118,10 @@ def main():
     args = p.parse_args()
     dense_exec = not args.endpoint_exec
 
-    robot, gripper = _connect_robot(args.polymetis_ip, args.polymetis_port, args.robotiq_port or None)
+    robot, gripper = _connect_robot(
+        args.polymetis_ip, args.polymetis_port, args.robotiq_port or None,
+        gripper_backend=args.gripper_backend, gripper_grpc_port=args.gripper_grpc_port,
+    )
 
     ctx = zmq.Context.instance()
     ctrl_sock = ctx.socket(zmq.REP); ctrl_sock.bind(f"tcp://{args.bind}:{args.control_port}")
