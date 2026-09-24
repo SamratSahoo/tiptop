@@ -245,7 +245,7 @@ def segment_pointcloud_by_masks(
     return_pcd: bool = False,
     erode_pixels: int = 0,
     valid_mask: np.ndarray = None,
-) -> dict[str, trimesh.Trimesh] | tuple[dict[str, trimesh.Trimesh], dict]:
+) -> dict[str, trimesh.Trimesh] | tuple[dict[str, trimesh.Trimesh], dict, dict]:
     """Segment pointcloud using object masks.
 
     Args:
@@ -260,10 +260,17 @@ def segment_pointcloud_by_masks(
             geometry and invalid depth. Only NaNs are excluded without it.
 
     Returns:
-        Dictionary mapping object labels to trimesh.Trimesh objects
+        Dictionary mapping object labels to trimesh.Trimesh objects, and with ``return_pcd`` also
+        the per-object point clouds and the per-object SUPPORT points (see ``object_support``).
     """
     object_meshes = {}
     object_pcds = {}
+    # Points exactly as observed: masked, eroded, validity-filtered, and nothing else. The point
+    # clouds above are not a substitute -- they drop everything within `max_z` of the table, which
+    # is the whole floor of any shallow container, and they carry augment_with_base_projections'
+    # synthetic copies. cuTAMP fits its placement support regions to these (TAMPEnvironment
+    # .support_points), and a container whose floor has been filtered away has no support to find.
+    object_support = {}
     masks_2d = masks.squeeze(1).astype(bool)  # (num_objects, H, W)
 
     # Check that we have a structured pointcloud
@@ -383,6 +390,8 @@ def segment_pointcloud_by_masks(
             _log.warning(f"Skipping {label}: too few points ({len(xyz_obj)})")
             continue
 
+        object_support[label] = xyz_obj.copy()
+
         z_mask = xyz_obj[..., 2] > max_z
         if not z_mask.any():
             _log.warning(f"Skipping {label}: no points above max_z={max_z:.3f}")
@@ -426,6 +435,6 @@ def segment_pointcloud_by_masks(
             _log.warning(f"Failed to create mesh for {label}: {e}")
 
     if return_pcd:
-        return object_meshes, object_pcds
+        return object_meshes, object_pcds, object_support
     else:
         return object_meshes

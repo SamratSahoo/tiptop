@@ -17,6 +17,7 @@ from cutamp.particle_initialization import NoGraspsError
 from cutamp.scripts.utils import default_constraint_to_mult, default_constraint_to_tol
 from cutamp.task_planning.constraints import StablePlacement
 from cutamp.task_planning.costs import GraspCost
+from cutamp.utils.support import NoSupportRegion
 from jaxtyping import Float
 
 from tiptop.trajectory_blending import arm_joint_limits, blend_cutamp_plan, resolve_blend_config
@@ -64,11 +65,15 @@ def build_tamp_config(
     transit_apex_min_dist: float = 0.10,
     posture_selection: dict | None = None,
     require_m2t2_grasps: bool = False,
+    placement: dict | None = None,
 ) -> TAMPConfiguration:
     """Build a TAMPConfiguration with TiPToP defaults.
 
     See https://github.com/tiptop-robot/cuTAMP/blob/main/cutamp/config.py for
     documentation of each TAMPConfiguration parameter.
+
+    ``placement`` overrides the placement-region keys, from ``resolve_placement_support``. Empty or
+    absent leaves the bounding-box region every config has always used.
 
     ``arm_mode``/``dual_task`` opt into cuTAMP's simultaneous dual-arm planning (only valid with
     ``robot_type == "bimanual_yam_dual"`` -- cuTAMP's own ``validate_tamp_config`` enforces the two
@@ -92,8 +97,12 @@ def build_tamp_config(
         world_activation_distance=collision_activation_distance,
         movable_activation_distance=0.01,
         time_dilation_factor=time_dilation_factor,
-        placement_check="obb",
-        placement_shrink_dist=0.01,
+        # Where an object may be placed on a surface. The default is the surface's oriented bounding
+        # box with the object's bottom at the box's top, which is the height of the surface's highest
+        # vertex -- a box's lid, a plate's rim. A cfg/tamp yml opts into the fitted support region
+        # instead with `placement_support: true`; see resolve_placement_support, which supplies every
+        # key in `placement`, and cutamp/utils/support.py for what it fits.
+        **({"placement_check": "obb", "placement_shrink_dist": 0.01} | (placement or {})),
         enable_visualizer=enable_visualizer,
         coll_sphere_radius=0.008,
         # Cost-sensitive task planning that minimizes joint-space distance traveled: each
@@ -156,13 +165,20 @@ def run_planning(
     ``q_init`` it started from. Only a caller concatenating plans needs it -- see
     ``tiptop_run.plan_clear_then_task``, whose second plan starts mid-episode.
     """
-    constraint_to_tol = default_constraint_to_tol.copy()
-    constraint_to_mult = default_constraint_to_mult.copy()
+    # Deep enough to own the per-type dicts: `.copy()` is shallow, so writing a surface's tolerance
+    # into the inner dict below would mutate cuTAMP's module-level default for the whole process.
+    constraint_to_tol = {k: dict(v) for k, v in default_constraint_to_tol.items()}
+    constraint_to_mult = {k: dict(v) for k, v in default_constraint_to_mult.items()}
     # Loosen tolerances slightly to enable finding a plan practically
     for surface in all_surfaces:
         constraint_to_tol[StablePlacement.type][f"{surface.name}_in_xy"] = 1e-2
         constraint_to_tol[StablePlacement.type][f"{surface.name}_support"] = 1e-2
         constraint_to_mult[StablePlacement.type][f"{surface.name}_support"] = 1.0
+        # Emitted only where a support region holds the object at ONE orientation (see
+        # cutamp.utils.support.Footprint). |sin(yaw error)|, so this is ~4 degrees -- tight, because
+        # the region was fitted for that orientation and a rectangle turned out of it sweeps
+        # straight over the edge it was fitted to clear.
+        constraint_to_tol[StablePlacement.type][f"{surface.name}_yaw"] = 7e-2
     # Opt-in grasp orientation-change cost (cfg/tamp `grasp_pose_change_weight` in tamp_overrides):
     # weights cuTAMP's GraspCost = geodesic angle between each grasp's EE orientation and the robot's
     # initial EE orientation, steering the planner toward grasps that reorient the wrist least. Absent
@@ -185,7 +201,7 @@ def run_planning(
     if center_weight:
         grasp_weights["grasp_center_offset"] = float(center_weight)
     if grasp_weights:
-        # Fresh dict: default_constraint_to_mult.copy() is shallow, so mutating the inner dict leaks.
+        # Fresh dict: this leg's copy of the grasp-cost multipliers, never cuTAMP's shared default.
         constraint_to_mult[GraspCost.type] = grasp_weights
         _log.info("Grasp soft costs active: " + ", ".join(f"{k} weight={v}" for k, v in grasp_weights.items()))
     cost_reducer = CostReducer(constraint_to_mult)
@@ -205,11 +221,14 @@ def run_planning(
             experiment_dir=experiment_dir,
             q_return=q_return,
         )
-    except NoGraspsError as exc:
-        # `require_m2t2_grasps` refused to substitute heuristic collision-sphere grasps for an
-        # object perception proposed nothing for. That is a PLANNING failure, not a crash: reported
-        # the same way as any other, so the reset path drops the offending object and retries and the
-        # task path fails the episode cleanly instead of unwinding the session.
+    except (NoGraspsError, NoSupportRegion) as exc:
+        # NoGraspsError: `require_m2t2_grasps` refused to substitute heuristic collision-sphere grasps
+        # for an object perception proposed nothing for. NoSupportRegion: no level patch of a goal
+        # surface is big enough to hold the object (placement_check="support"), which is the honest
+        # answer when the only thing the bounding box offered was the top of a box's lid. Both are
+        # PLANNING failures, not crashes: reported the same way as any other, so the reset path drops
+        # the offending object and retries and the task path fails the episode cleanly instead of
+        # unwinding the session.
         cutamp_plan, failure_reason = None, str(exc)
     elapsed = time.perf_counter() - start
     _log.info(f"cuTAMP planning took: {elapsed:.2f}s")
