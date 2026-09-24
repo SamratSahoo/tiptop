@@ -27,7 +27,7 @@ stop the file importing/running -- likely copy artifacts; verify against your co
 ----------------------------------------------------------------------------------
 EXECUTION MODE (execute_trajectory): by default the control handler streams every cuRobo waypoint
 through joint impedance so the arm tracks the planned path -- including the DROID-manifold
-jerkiness that vae_manifold_weight induces. Pass --endpoint-exec to revert to the legacy behavior,
+jerkiness that encoder_weight induces. Pass --endpoint-exec to revert to the legacy behavior,
 which collapses a trajectory to its FINAL waypoint and lets polymetis min-jerk there over the
 summed duration (intermediate waypoints discarded, so the executed arm path is NOT the planned one
 -- fine in free workspace). Under --endpoint-exec, anyone recording plan-derived commanded actions
@@ -791,7 +791,7 @@ def _control_handler(socket: zmq.Socket, robot, gripper, robotiq_only: bool, den
                 elif dense_exec and len(waypoints) > 1:
                     # Dense execution: stream EVERY cuRobo waypoint through a joint-impedance
                     # controller so the arm tracks the planned path -- including the DROID-manifold
-                    # jerkiness that vae_manifold_weight induces. Contrast with the endpoint path
+                    # jerkiness that encoder_weight induces. Contrast with the endpoint path
                     # below, which min-jerks to the final waypoint and discards the plan's shape.
                     #
                     # Both modes go through the same streamer, which paces to an ABSOLUTE per-waypoint
@@ -1113,7 +1113,7 @@ def main():
         help="revert to the legacy endpoint behavior: min-jerk to each segment's FINAL waypoint and "
         "discard the intermediate ones. The default streams cuRobo's dense waypoints through joint "
         "impedance so the arm tracks the planned path (incl. DROID-manifold jerkiness from "
-        "vae_manifold_weight).",
+        "encoder_weight).",
     )
     args = p.parse_args()
     dense_exec = not args.endpoint_exec

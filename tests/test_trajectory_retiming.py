@@ -1,9 +1,9 @@
 """Tests for the velocity/acceleration cap guarantees in stroke re-timing.
 
-The failure these pin down: ``vae_retime_group`` used to raise when no duration inside its searched
+The failure these pin down: ``encoder_retime_group`` used to raise when no duration inside its searched
 range met the caps, and ``blend_cutamp_plan`` answers an exception by passing that operation's raw
 cuRobo segments through at the plan's time-dilation factor -- the fastest, least-checked motion in
-the episode. With ``blend_stretch_to_caps`` on, both halves slow down instead; these tests call the
+the episode. With ``retime_stretch_to_caps`` on, both halves slow down instead; these tests call the
 two fallbacks directly, and tests/test_stretch_to_caps_gate.py checks that the switch gates them.
 """
 
@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from tiptop.trajectory_blending import BlendConfig, _slow_to_caps
-from tiptop.vae_retiming import _emit_raw, _stretch_to_caps, _time_knots
+from tiptop.encoder_retiming import _emit_raw, _stretch_to_caps, _time_knots
 
 DOF = 7
 DT = 0.02

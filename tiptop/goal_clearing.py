@@ -71,8 +71,8 @@ def resolve_clear_goal_surfaces(overrides: dict | None) -> bool:
 
     Off unless a config opts in with ``clear_goal_surfaces: true``, so every existing task plans
     exactly the goal Gemini grounded. Same shape as :func:`trajectory_blending.resolve_blend_config`
-    and the other ``tamp_overrides`` knobs: unknown keys are ignored by ``apply_cost_overrides``, so
-    this rides the same JSON the data-collection server already writes.
+    and the other ``tamp_overrides`` knobs, so this rides the same JSON the data-collection server
+    already writes (the key is listed in :mod:`tiptop.override_keys`).
     """
     return bool((overrides or {}).get("clear_goal_surfaces"))
 

@@ -17,7 +17,7 @@ def test_auto_mode_is_off_unless_a_config_asks():
     """Every existing cfg/tamp yml has no auto_mode key and must keep prompting the operator."""
     assert resolve_auto_mode(None) is False
     assert resolve_auto_mode({}) is False
-    assert resolve_auto_mode({"vae_manifold_weight": 25000}) is False
+    assert resolve_auto_mode({"encoder_weight": 25000}) is False
     assert resolve_auto_mode({"auto_mode": False}) is False
     assert resolve_auto_mode({"auto_mode": True}) is True
 

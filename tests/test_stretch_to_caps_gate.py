@@ -1,6 +1,6 @@
-"""``blend_stretch_to_caps`` gates the slow-into-the-caps fallbacks, and is off by default.
+"""``retime_stretch_to_caps`` gates the slow-into-the-caps fallbacks, and is off by default.
 
-Without the switch, a stroke no clock in [d_lo, d_hi] can fit raises in ``vae_retime_group`` and
+Without the switch, a stroke no clock in [d_lo, d_hi] can fit raises in ``encoder_retime_group`` and
 ``blend_cutamp_plan`` keeps that operation's original segments exactly as cuRobo emitted them -- the
 behaviour every config had before the fallbacks existed. With it, the stroke is slowed past d_hi
 until it fits, and a run whose blending failed is slowed into the same caps (see
@@ -14,9 +14,9 @@ import numpy as np
 import pytest
 import torch
 
-from tiptop import trajectory_blending, vae_retiming
+from tiptop import encoder_retiming, trajectory_blending
 from tiptop.trajectory_blending import BlendConfig, blend_cutamp_plan, resolve_blend_config
-from tiptop.vae_retiming import _KNOTS, _time_knots, vae_retime_group
+from tiptop.encoder_retiming import _KNOTS, _time_knots, encoder_retime_group
 
 DOF = 7
 DT = 0.02
@@ -24,19 +24,19 @@ DT = 0.02
 
 class TestResolveBlendConfig:
     def test_off_by_default(self):
-        assert resolve_blend_config({"blend_trajectory": True, "blend_mode": "vae"}).stretch_to_caps is False
+        assert resolve_blend_config({"retime_trajectory": True}).stretch_to_caps is False
         assert BlendConfig().stretch_to_caps is False
 
     @pytest.mark.parametrize("value", [True, False])
     def test_a_boolean_sets_it(self, value):
-        cfg = resolve_blend_config({"blend_trajectory": True, "blend_stretch_to_caps": value})
+        cfg = resolve_blend_config({"retime_trajectory": True, "retime_stretch_to_caps": value})
         assert cfg.stretch_to_caps is value
 
     @pytest.mark.parametrize("bad", ["false", "true", 0.5, 2])
     def test_only_a_real_boolean_is_accepted(self, bad):
         """bool("false") is True: a quoted value must fail, not switch the fallback on."""
         with pytest.raises(ValueError, match="must be true or false"):
-            resolve_blend_config({"blend_trajectory": True, "blend_stretch_to_caps": bad})
+            resolve_blend_config({"retime_trajectory": True, "retime_stretch_to_caps": bad})
 
 
 class _Scorer:
@@ -46,11 +46,11 @@ class _Scorer:
         return 0.0
 
 
-def _stub_vae(monkeypatch, duration):
+def _stub_encoder(monkeypatch, duration):
     """One candidate: the even time-warp at ``duration`` seconds."""
     tau = _time_knots(torch.zeros(1, _KNOTS - 1))
-    monkeypatch.setattr(vae_retiming, "_scorer", lambda *_: _Scorer())
-    monkeypatch.setattr(vae_retiming, "_optimize", lambda *_args, **_kw: [(duration, tau)])
+    monkeypatch.setattr(encoder_retiming, "_scorer", lambda *_: _Scorer())
+    monkeypatch.setattr(encoder_retiming, "_optimize", lambda *_args, **_kw: [(duration, tau)])
 
 
 def _sweep(n=16, sweep=1.5):
@@ -64,7 +64,7 @@ def _retime(stretch_to_caps, caps):
     orig = (len(positions) - 1) * DT
     vel_cap, acc_cap = np.full(DOF, caps[0]), np.full(DOF, caps[1])
     smoothing, lead_speed, trail_speed, max_duration_mult = 3e-4, 0.0, 0.0, 2.0
-    out = vae_retime_group(
+    out = encoder_retime_group(
         positions,
         DT,
         orig,
@@ -81,19 +81,19 @@ def _retime(stretch_to_caps, caps):
 
 class TestVaeRetimeGroup:
     def test_without_the_switch_a_stroke_no_clock_fits_raises(self, monkeypatch):
-        _stub_vae(monkeypatch, duration=0.6)
+        _stub_encoder(monkeypatch, duration=0.6)
         with pytest.raises(RuntimeError, match=r"no duration in \[.*\]s that meets the velocity"):
             _retime(False, caps=(0.5, 2.0))
 
     def test_with_the_switch_it_is_slowed_into_the_caps(self, monkeypatch):
-        _stub_vae(monkeypatch, duration=0.6)
+        _stub_encoder(monkeypatch, duration=0.6)
         (pos, vel, acc, dt_out), orig = _retime(True, caps=(0.5, 2.0))
         assert dt_out * (len(pos) - 1) > 2.0 * orig  # past d_hi
         assert np.abs(vel).max() <= 0.5
         assert np.abs(acc).max() <= 2.0
 
     def test_an_admissible_stroke_is_the_same_either_way(self, monkeypatch):
-        _stub_vae(monkeypatch, duration=0.6)
+        _stub_encoder(monkeypatch, duration=0.6)
         (off, _), (on, _) = _retime(False, caps=(1e3, 1e4)), _retime(True, caps=(1e3, 1e4))
         for a, b in zip(off, on):
             np.testing.assert_array_equal(a, b)
@@ -122,7 +122,7 @@ class TestBlendCutampPlanFallback:
         def fail(*_args, **_kwargs):
             raise RuntimeError("no clock fits")
 
-        monkeypatch.setattr(trajectory_blending, "_blend_trajectory_steps", fail)
+        monkeypatch.setattr(trajectory_blending, "_retime_trajectory_steps", fail)
 
     def _run(self, **config):
         plan = _plan_with_one_fast_operation()
