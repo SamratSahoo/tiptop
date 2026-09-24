@@ -404,9 +404,10 @@ def _emit_raw(q_knots, tau, duration, dt, vel_cap_np, acc_cap_np):
     hence ``max(v/v_cap, sqrt(a/a_cap))``, and hence a long enough duration ALWAYS exists. See
     :func:`_stretch_to_caps`, which is what makes that guarantee good.
 
-    This is the ONLY thing enforcing the robot's limits. An in-loop hinge was tried and removed: it
-    scored strictly worse (6.62 -> 6.34 and 13.12 -> 12.37 total maha^2 without it) and changed how
-    many starts survive this test by less than one.
+    This emission and :func:`_within_caps`, applied to what it returns, are the ONLY thing enforcing
+    the robot's limits. An in-loop hinge was tried and removed: it scored strictly worse (6.62 ->
+    6.34 and 13.12 -> 12.37 total maha^2 without it) and changed how many starts survive this test
+    by less than one.
     """
     n_out = max(3, int(round(duration / dt)) + 1)
     dt_out = duration / (n_out - 1)
@@ -422,15 +423,27 @@ def _emit_raw(q_knots, tau, duration, dt, vel_cap_np, acc_cap_np):
     return pos, vel, acc, over
 
 
+def _within_caps(vel, acc, vel_cap_np, acc_cap_np) -> bool:
+    """Whether an emitted stroke is admissible: no sample past either cap, compared element-wise.
+
+    The admissibility test vae_retime_group has always applied. ``over <= 1`` says nearly the same
+    thing, but not exactly: the square root in it can round a 1-ulp acceleration overshoot down to
+    1.0, and a zero cap turns a 0/0 into a NaN that compares as "fits". Candidates are accepted by
+    this test, so a plan re-timed without ``stretch_to_caps`` picks exactly the stroke it always did;
+    ``over`` only ranks and sizes the fallback.
+    """
+    return not ((np.abs(vel) > vel_cap_np).any() or (np.abs(acc) > acc_cap_np).any())
+
+
 def _stretch_to_caps(q_knots, tau, duration, dt, vel_cap_np, acc_cap_np):
     """Slow one candidate stroke down until it fits inside the caps. -> (pos, vel, acc, duration).
 
-    The last resort when no duration inside the searched range produced an admissible stroke -- an
-    optimizer that lands on a peaked time-warp can want a dash the robot cannot make in twice the
-    planner's wall-clock. Resampling makes ``over`` only approximately the exact scale factor (the
-    frame count changes with the duration), so this iterates on the measured value rather than
-    trusting one step of it; each pass overshoots by 2% so it converges from above rather than
-    creeping up on the cap. Two or three passes in practice.
+    The last resort, taken only under ``blend_stretch_to_caps``, when no duration inside the searched
+    range produced an admissible stroke -- an optimizer that lands on a peaked time-warp can want a
+    dash the robot cannot make in twice the planner's wall-clock. Resampling makes ``over`` only
+    approximately the exact scale factor (the frame count changes with the duration), so this
+    iterates on the measured value rather than trusting one step of it; each pass overshoots by 2% so
+    it converges from above rather than creeping up on the cap. Two or three passes in practice.
 
     Returning a slow stroke matters more than it looks: the alternative is an exception, and
     ``blend_cutamp_plan`` answers an exception by passing that operation's ORIGINAL cuRobo segments
@@ -460,6 +473,7 @@ def vae_retime_group(
     max_duration_mult: float,
     checkpoint_path: str | None = None,
     sample_target: bool = False,
+    stretch_to_caps: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """Re-time one joined stroke so its motion sits as close as possible to the DROID manifold.
 
@@ -467,6 +481,11 @@ def vae_retime_group(
     into the same call site. ``orig_duration`` is the stroke's cuRobo wall-clock, used only to bound
     the duration range; unlike the spline/flow laws it is NOT a target, because the point here is to
     let the cost pick the pace.
+
+    When no duration in that range fits the velocity/acceleration caps, this raises (the default),
+    and blend_cutamp_plan keeps the operation's original segments. ``stretch_to_caps`` (the
+    ``blend_stretch_to_caps`` override) instead slows the mildest candidate past the range until it
+    fits; see :func:`_stretch_to_caps`.
 
     Geometry is the planner's, re-parameterized by arc length and smoothed with the shared
     ``blend_smoothing`` spline (``smoothing`` = 0 keeps the exact planner polyline, hence its exact
@@ -514,7 +533,7 @@ def vae_retime_group(
     # None (the default) reproduces the original mode-seeking objective exactly.
     #
     # A sampled target can ask for a stroke no admissible clock realizes -- it is a draw from the
-    # human cluster, not a feasibility statement, and _emit_raw rejects anything past the robot's caps
+    # human cluster, not a feasibility statement, and _within_caps rejects anything past the robot's caps
     # (measured 1 stroke in 10 at _TARGET_SCALE 1.0). Falling back to the mean target is strictly
     # better than losing the plan: that stroke keeps the old, over-typical timing while every other
     # stroke keeps its sampled one.
@@ -530,7 +549,7 @@ def vae_retime_group(
         relax = None
         for duration, tau in _optimize(scorer, q_knots, d_lo, d_hi, lead_speed, trail_speed, target):
             pos, vel, acc, over = _emit_raw(q_knots, tau, duration, dt, np.abs(vel_cap), np.abs(acc_cap))
-            if over > 1.0:
+            if not _within_caps(vel, acc, np.abs(vel_cap), np.abs(acc_cap)):
                 stretched = duration * over
                 if relax is None or stretched < relax[0]:
                     relax = (stretched, duration, tau)
@@ -558,13 +577,22 @@ def vae_retime_group(
         if scale > 0.0:
             _log.debug("VAE re-timing: target scale %.1f had no admissible clock; shrinking", scale)
 
+    if best is None and not stretch_to_caps:
+        # The default: blend_cutamp_plan catches this and keeps the operation's original segments.
+        raise RuntimeError(
+            f"VAE re-timing found no duration in [{d_lo:.2f}, {d_hi:.2f}]s that meets the velocity/"
+            f"acceleration caps for this stroke"
+        )
     if best is None:
-        # No clock inside [d_lo, d_hi] fits the caps. Slow the mildest candidate past d_hi until it
-        # does, rather than raising: an exception here is not "no re-timing", it is
-        # blend_cutamp_plan falling back to this operation's raw cuRobo segments at the plan's
-        # time-dilation factor -- the fastest motion in the episode, and the one nothing has checked
-        # against the caps. A stroke slower than max_duration_mult asked for is the lesser cost, and
-        # it is announced loudly enough to be tuned (raise blend_max_duration_mult, or the slacks).
+        # blend_stretch_to_caps: no clock inside [d_lo, d_hi] fits the caps. Slow the mildest
+        # candidate past d_hi until it does, rather than raising: an exception here is not "no
+        # re-timing", it is blend_cutamp_plan falling back to this operation's raw cuRobo segments at
+        # the plan's time-dilation factor -- the fastest motion in the episode, and the one nothing
+        # has checked against the caps. A stroke slower than max_duration_mult asked for is the
+        # lesser cost, and it is announced loudly enough to be tuned (raise blend_max_duration_mult,
+        # or the slacks). It can be much slower than the raw segments slowed into the same caps: a
+        # synthetic 0.30 s stroke came out at 9.66 s here, where trajectory_blending._slow_to_caps
+        # needed 1.51 s -- which is why this is opt-in.
         if relax is None:
             raise RuntimeError(
                 f"VAE re-timing produced no candidate clock at all in [{d_lo:.2f}, {d_hi:.2f}]s"

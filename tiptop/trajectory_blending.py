@@ -204,6 +204,12 @@ class BlendConfig:
     # draw on a long path can run several times longer than the planner intended. The vel/accel caps are
     # applied after it, so they still win.
     max_duration_mult: float = 2.0
+    # What happens to an operation whose stroke cannot be re-timed inside the vel/accel caps. False
+    # (default): vae mode raises when no duration up to max_duration_mult fits, and any failed run
+    # keeps its original segments at the plan's own timing. True: vae mode slows the mildest candidate
+    # past max_duration_mult until it fits (vae_retiming._stretch_to_caps), and a failed run's original
+    # segments are slowed into the same caps (_slow_to_caps) before they pass through.
+    stretch_to_caps: bool = False
     # Path to the fitted DROID timing stats (relative paths resolve under the tiptop package dir).
     stats_path: str | None = None
     # Seed for the pace / boundary / flow draws. None (default) means fresh entropy per plan, which is
@@ -274,6 +280,15 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
                                         Fixes a measured collapse of between-stroke timing variance
                                         (residual log-duration sd 0.148 vs DROID's 0.414); see
                                         vae_retiming.target_latent.
+        blend_stretch_to_caps: bool  -- what an operation that cannot be re-timed inside the vel/accel
+                                        caps gets. False (default): vae mode gives up when no duration
+                                        up to blend_max_duration_mult fits, and a run whose blending
+                                        failed keeps its original segments at the plan's timing. True:
+                                        vae mode slows the stroke past that bound until it fits, and a
+                                        failed run's original segments are slowed into the same caps.
+                                        Can make a stroke many times slower than the planner's; LJ's
+                                        tuning runs for the toy-puzzle and bread-in-box tasks had it on.
+                                        Must be a real boolean: a quoted "false" is rejected.
     """
     o = overrides or {}
     # vae_retiming means the VAE manifold cost owns the clock (it optimizes each waypoint interval's
@@ -283,7 +298,7 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
     # backends -- and before the blend_* validation below, so a stale or malformed blend stanza in a
     # vae_retiming config cannot raise on values that are about to be ignored anyway.
     # local: keeps this module import-light
-    from tiptop.motion_planning import resolve_vae_path, resolve_vae_retiming
+    from tiptop.motion_planning import _as_bool, resolve_vae_path, resolve_vae_retiming
 
     if resolve_vae_retiming(o):
         if o.get("blend_trajectory"):
@@ -324,6 +339,9 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
         raise ValueError(f"blend_boundary_window_sec must be > 0 (got {window_sec})")
     raw_stats = o.get("blend_stats_path")
     raw_seed = o.get("blend_seed")
+    # Strict: bool("false") is True, and this switch trades a raised stroke for a much slower one.
+    raw_stretch = o.get("blend_stretch_to_caps")
+    stretch_to_caps = False if raw_stretch is None else _as_bool("blend_stretch_to_caps", raw_stretch)
     return BlendConfig(
         enabled=bool(o.get("blend_trajectory", False)),
         smoothing=float(o.get("blend_smoothing", _DEFAULT_SMOOTHING)),
@@ -347,6 +365,7 @@ def resolve_blend_config(overrides: dict | None) -> BlendConfig:
         boundary_window_sec=window_sec,
         profile_end_sec=float(o.get("blend_profile_end_sec", 1.0)),
         max_duration_mult=float(o.get("blend_max_duration_mult", 2.0)),
+        stretch_to_caps=stretch_to_caps,
         stats_path=str(raw_stats) if raw_stats else None,
         seed=int(raw_seed) if raw_seed is not None else None,
     )
@@ -688,6 +707,7 @@ def _blend_trajectory_steps(
         pos, vel, acc, dt_out = vae_retime_group(
             joined, dt, target_duration, vel_cap, acc_cap, config.smoothing, lead_speed, trail_speed,
             config.max_duration_mult, config.vae_path, config.vae_sample_target,
+            stretch_to_caps=config.stretch_to_caps,
         )
     else:
         pos, vel, acc, dt_out = blend_group(
@@ -714,7 +734,8 @@ def _slow_to_caps(
 ) -> list[dict]:
     """The run's ORIGINAL segments, time-scaled if they exceed the velocity/acceleration caps.
 
-    The passthrough taken when blending a run fails. Passing the segments through as they are hands
+    The passthrough taken when blending a run fails under ``blend_stretch_to_caps`` (without it, the
+    segments pass through untouched, as they always did). Passing the segments through as they are hands
     the robot this operation at the plan's time-dilation factor while every blended operation around
     it obeys these caps -- so the one motion nothing could re-time is also the fastest in the
     episode. Scaling the clock by ``max(v/v_cap, sqrt(a/a_cap))`` costs the same segments a slower
@@ -815,14 +836,18 @@ def blend_cutamp_plan(
             stats["blended"] += 1
         except Exception:
             # Best-effort: on any numerical/shape surprise, keep the original segments for this run
-            # rather than failing the whole plan -- but slowed into the same caps the blended strokes
-            # obey, so the one operation that could not be re-timed is not also the fastest thing the
-            # robot does in the episode. See _slow_to_caps.
+            # rather than failing the whole plan.
             _log.exception("Trajectory blending failed for a segment run; keeping original segments")
-            try:
-                out.extend(_slow_to_caps(run, config, vel_limit, acc_limit))
-            except Exception:
-                _log.exception("Could not cap the unblended segments either; passing them through")
+            if config.stretch_to_caps:
+                # blend_stretch_to_caps: slowed into the same caps the blended strokes obey, so the
+                # one operation that could not be re-timed is not also the fastest thing the robot
+                # does in the episode. See _slow_to_caps.
+                try:
+                    out.extend(_slow_to_caps(run, config, vel_limit, acc_limit))
+                except Exception:
+                    _log.exception("Could not cap the unblended segments either; passing them through")
+                    out.extend(run)
+            else:
                 out.extend(run)
         run.clear()
 

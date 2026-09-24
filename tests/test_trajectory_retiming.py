@@ -3,7 +3,8 @@
 The failure these pin down: ``vae_retime_group`` used to raise when no duration inside its searched
 range met the caps, and ``blend_cutamp_plan`` answers an exception by passing that operation's raw
 cuRobo segments through at the plan's time-dilation factor -- the fastest, least-checked motion in
-the episode. Both halves now slow down instead.
+the episode. With ``blend_stretch_to_caps`` on, both halves slow down instead; these tests call the
+two fallbacks directly, and tests/test_stretch_to_caps_gate.py checks that the switch gates them.
 """
 
 import numpy as np
