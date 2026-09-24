@@ -44,6 +44,7 @@ from tiptop.motion_planning import (
     resolve_transit_apex,
     resolve_trace_cfg,
 )
+from tiptop.override_aliases import resolve_override_aliases
 from tiptop.perception.cameras import Frame
 from tiptop.planning import build_tamp_config, run_planning, save_tiptop_plan, serialize_plan
 from tiptop.recording import save_run_metadata, save_run_outputs
@@ -62,6 +63,10 @@ def _load_curobo_overrides(spec: str | None) -> dict:
     Applying them at
     server build time makes every plan this server produces use those tamp parameters, so e.g. a
     data-gen job can generate a dataset with a chosen manifold/novelty/smoothness regime.
+
+    The trajectory-encoder aliases ``encoder_path``, ``encoder_weight`` and ``blend_mode: encoder`` are
+    rewritten here to ``vae_path``, ``vae_manifold_weight`` and ``blend_mode: vae`` (see
+    override_aliases.resolve_override_aliases); the old names keep working unchanged.
     """
     if not spec:
         return {}
@@ -70,7 +75,7 @@ def _load_curobo_overrides(spec: str | None) -> dict:
     overrides = json.loads(text)
     if not isinstance(overrides, dict):
         raise ValueError(f"cuRobo overrides must be a JSON object, got {type(overrides).__name__}")
-    return overrides
+    return resolve_override_aliases(overrides)
 
 
 class TiptopPlanningServer:
