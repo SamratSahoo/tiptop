@@ -236,6 +236,80 @@ def augment_with_base_projections(
     return augmented_points, augmented_colors
 
 
+def resolve_mask_overlaps(masks_2d: np.ndarray, labels: list[str]) -> np.ndarray:
+    """Make the object masks disjoint by giving each contested pixel to the SMALLEST claimant.
+
+    SAM2 is seeded from Gemini's boxes, and a box drawn around a container necessarily contains
+    whatever is sitting on it -- so the mask for a book comes back covering the marker lying on it,
+    the mask for a tray covers the toy inside it. On the 2026-09-06_23-06-41 run 81% of the marker's
+    pixels were also book pixels.
+
+    Here this shapes only the per-object SUPPORT points that cuTAMP fits placement regions to (see
+    segment_pointcloud_by_masks and _support_points), never the meshes or point clouds, so default
+    perception and planning are unchanged. It matters there because the fit keeps the LARGEST level
+    patch of a surface's points: a cloth whose mask also covers the puzzle board lying on it offers
+    the board's top as its best patch, and "place the toy on the cloth" puts it back on the board.
+    With the board's pixels given to the board, the cloth beneath it reads as unobserved and nothing
+    may rest there -- the 24 x 6.5 cm bare-cloth region the toy-puzzle task was tuned on.
+
+    Smallest-area-wins is the resolution because the containment is one-directional: the thing on
+    top is the more specific detection, and it is the one that must keep its points. Mutually
+    subtracting would delete the overlap from BOTH masks and erase the small object entirely.
+
+    Args:
+        masks_2d: (num_objects, H, W) boolean masks, one per entry of ``labels``.
+        labels: Object labels, only used for logging.
+
+    Returns:
+        (num_objects, H, W) boolean masks in which no pixel is set for more than one object.
+    """
+    if len(masks_2d) < 2:
+        return masks_2d
+
+    areas = masks_2d.sum(axis=(1, 2))
+    # Paint largest first so the smallest claimant is written last and wins every contested pixel.
+    owner = np.full(masks_2d.shape[1:], -1, dtype=np.int16)
+    for idx in np.argsort(-areas):
+        owner[masks_2d[idx]] = idx
+
+    disjoint = np.zeros_like(masks_2d)
+    for idx in range(len(masks_2d)):
+        disjoint[idx] = owner == idx
+        lost = int(areas[idx]) - int(disjoint[idx].sum())
+        if lost > 0:
+            label = labels[idx] if idx < len(labels) else f"mask {idx}"
+            _log.debug(
+                f"{label}: support points exclude {lost}/{int(areas[idx])} px "
+                f"({lost / max(int(areas[idx]), 1):.0%}) claimed by a smaller object's mask"
+            )
+    return disjoint
+
+
+def _support_points(
+    xyz_world: np.ndarray, mask_2d: np.ndarray, erode_pixels: int, valid_mask: np.ndarray | None
+) -> np.ndarray:
+    """The observed points under one object's DISJOINT mask, prepared the way its mesh's points are.
+
+    Eroded by ``erode_pixels`` and validity-filtered, falling back to the un-eroded mask when erosion
+    leaves fewer than 10 points -- the steps segment_pointcloud_by_masks takes on the mask SAM2
+    returned, taken here on the one resolve_mask_overlaps left, so the two differ only in contested
+    pixels. Eroding AFTER the overlap is resolved also gives the hole an object on top opens in a
+    surface the same edge clearance as the surface's outer boundary.
+    """
+
+    def observed(mask: np.ndarray) -> np.ndarray:
+        xyz = xyz_world[mask]
+        valid = valid_mask[mask] if valid_mask is not None else ~np.isnan(xyz).any(axis=1)
+        return xyz[valid]
+
+    if erode_pixels > 0:
+        kernel = np.ones((erode_pixels * 2 + 1, erode_pixels * 2 + 1), np.uint8)
+        points = observed(cv2.erode(mask_2d.astype(np.uint8), kernel, iterations=1).astype(bool))
+        if len(points) >= 10:
+            return points
+    return observed(mask_2d)
+
+
 def segment_pointcloud_by_masks(
     xyz_world: np.ndarray,
     rgb: np.ndarray,
@@ -265,11 +339,12 @@ def segment_pointcloud_by_masks(
     """
     object_meshes = {}
     object_pcds = {}
-    # Points exactly as observed: masked, eroded, validity-filtered, and nothing else. The point
-    # clouds above are not a substitute -- they drop everything within `max_z` of the table, which
-    # is the whole floor of any shallow container, and they carry augment_with_base_projections'
-    # synthetic copies. cuTAMP fits its placement support regions to these (TAMPEnvironment
-    # .support_points), and a container whose floor has been filtered away has no support to find.
+    # Points exactly as observed: masked (disjointly -- see resolve_mask_overlaps), eroded,
+    # validity-filtered, and nothing else. The point clouds above are not a substitute -- they drop
+    # everything within `max_z` of the table, which is the whole floor of any shallow container, and
+    # they carry augment_with_base_projections' synthetic copies. cuTAMP fits its placement support
+    # regions to these (TAMPEnvironment.support_points), and a container whose floor has been
+    # filtered away has no support to find.
     object_support = {}
     masks_2d = masks.squeeze(1).astype(bool)  # (num_objects, H, W)
 
@@ -356,8 +431,12 @@ def segment_pointcloud_by_masks(
         masks = selected_masks
         masks_2d = masks.squeeze(1).astype(bool)  # Update masks_2d with selected masks
 
+    # Support points come from DISJOINT masks, so a surface's points stop at whatever rests on it.
+    # Only the support points: the meshes and point clouds below keep the masks SAM2 returned.
+    support_masks_2d = resolve_mask_overlaps(masks_2d, [bbox["label"] for bbox in bboxes[: len(masks_2d)]])
+
     # Process each mask and create a mesh for each object
-    for mask_2d, bbox in zip(masks_2d, bboxes):
+    for mask_2d, support_mask_2d, bbox in zip(masks_2d, support_masks_2d, bboxes):
         label = bbox["label"]
 
         # Erode the mask to handle depth edge noise. If erosion leaves too few
@@ -390,7 +469,7 @@ def segment_pointcloud_by_masks(
             _log.warning(f"Skipping {label}: too few points ({len(xyz_obj)})")
             continue
 
-        object_support[label] = xyz_obj.copy()
+        object_support[label] = _support_points(xyz_world, support_mask_2d, erode_pixels, valid_mask)
 
         z_mask = xyz_obj[..., 2] > max_z
         if not z_mask.any():
