@@ -571,6 +571,11 @@ _PERCEPTION_OVERRIDE_KEYS = {
     # segmentation._plane_support_score). A switch, not a magnitude, so it is exempt from the
     # positivity check below.
     "table_plane_support_vote": (("perception", "table_plane_support_vote"), bool),
+    # Whether the object meshes and point clouds are built from disjoint masks (each contested pixel
+    # to the smallest object claiming it), so a container's hull stops at the object resting on it.
+    # false keeps SAM2's masks; the placement support points use disjoint masks either way (see
+    # segmentation.resolve_mask_overlaps). A switch, so exempt from the positivity check below.
+    "disjoint_object_masks": (("perception", "disjoint_object_masks"), bool),
 }
 
 

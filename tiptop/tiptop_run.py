@@ -1110,6 +1110,10 @@ def process_scene_geometry(
     # For filtering to table plane height
     config = TAMPConfiguration()
     table_top_z = table_trimesh.bounds[1, 2] + config.world_activation_distance + config.coll_sphere_radius * 2
+    # `disjoint_object_masks` (off unless the cfg sets it) builds the meshes and point clouds from
+    # disjoint masks too, so a container's hull stops at the object resting on it; see
+    # segmentation.resolve_mask_overlaps. Read with .get so a tiptop.yml without the key keeps SAM2's
+    # masks.
     object_trimeshes, object_pcds_computed, object_support_points = segment_pointcloud_by_masks(
         xyz_map,
         rgb_map,
@@ -1119,6 +1123,7 @@ def process_scene_geometry(
         return_pcd=True,
         erode_pixels=tiptop_cfg().perception.mask_erosion_pixels,
         valid_mask=valid_mask,
+        disjoint_masks=bool(tiptop_cfg().perception.get("disjoint_object_masks", False)),
     )
 
     # Use provided point clouds if available, otherwise use computed ones

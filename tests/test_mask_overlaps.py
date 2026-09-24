@@ -2,9 +2,10 @@
 
 SAM2 is seeded from Gemini's boxes, and a box around a book contains the marker lying on it -- the
 book's mask came back covering 81% of the marker's pixels (3_pen_open_book/failure/2026-09-06_23-06-41).
-On this branch the disjoint masks shape only the per-object support points cuTAMP fits placement
-regions to (`placement_support: true`); the meshes and point clouds keep SAM2's masks, so default
-perception is unchanged. The last two tests pin that split.
+On this branch the disjoint masks shape the per-object support points cuTAMP fits placement regions
+to (`placement_support: true`); the meshes and point clouds keep SAM2's masks, so default perception
+is unchanged. The segment_pointcloud_by_masks tests pin that split, and the `disjoint_object_masks`
+switch that builds the meshes and point clouds from the disjoint masks too, as LJ's fork does.
 
 Ported from LJ1356/tiptop@37b9678 (the resolve_mask_overlaps tests are LJ's, unchanged).
 
@@ -15,7 +16,11 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import pytest
+import trimesh
 
+from tiptop.config import tiptop_cfg
+from tiptop.motion_planning import apply_perception_overrides
 from tiptop.perception.segmentation import resolve_mask_overlaps, segment_pointcloud_by_masks
 
 
@@ -127,9 +132,86 @@ def test_meshes_and_point_clouds_keep_the_masks_sam2_returned():
 def test_erosion_applies_to_the_disjoint_mask():
     """The hole the board opens in the cloth gets the same edge clearance as the cloth's outline."""
     xyz, rgb, masks, bboxes, board = _cloth_and_board()
-    _, _, support = segment_pointcloud_by_masks(
-        xyz, rgb, masks, bboxes, max_z=-1.0, return_pcd=True, erode_pixels=2
-    )
+    _, _, support = segment_pointcloud_by_masks(xyz, rgb, masks, bboxes, max_z=-1.0, return_pcd=True, erode_pixels=2)
     kernel = np.ones((5, 5), np.uint8)
     expected = cv2.erode((~board).astype(np.uint8), kernel, iterations=1).astype(bool)
     assert len(support["cloth"]) == int(expected.sum())
+
+
+def test_the_switch_builds_meshes_and_point_clouds_from_the_disjoint_masks_too():
+    """disjoint_masks=True: the cloth's hull stops at the board, as in LJ's fork."""
+    xyz, rgb, masks, bboxes, board = _cloth_and_board()
+    meshes, pcds, support = segment_pointcloud_by_masks(
+        xyz, rgb, masks, bboxes, max_z=-1.0, return_pcd=True, disjoint_masks=True
+    )
+    assert np.asarray(pcds["cloth"].points)[:, 2].max() < -0.01
+    assert meshes["cloth"].bounds[1, 2] < -0.01
+    # The board is the smaller claimant, so it keeps what it had without the switch.
+    default_meshes, default_pcds, default_support = segment_pointcloud_by_masks(
+        xyz, rgb, masks, bboxes, max_z=-1.0, return_pcd=True
+    )
+    np.testing.assert_array_equal(np.asarray(pcds["board"].points), np.asarray(default_pcds["board"].points))
+    # The support points came from the disjoint masks already, so the switch leaves them alone.
+    assert support.keys() == default_support.keys()
+    for label in support:
+        np.testing.assert_array_equal(support[label], default_support[label])
+
+
+def test_the_switch_erodes_the_disjoint_mask():
+    xyz, rgb, masks, bboxes, board = _cloth_and_board()
+    _, pcds, _ = segment_pointcloud_by_masks(
+        xyz, rgb, masks, bboxes, max_z=-1.0, return_pcd=True, erode_pixels=2, disjoint_masks=True
+    )
+    assert np.asarray(pcds["cloth"].points)[:, 2].max() < -0.01
+
+
+@pytest.fixture
+def cfg():
+    c = tiptop_cfg()
+    original = c.perception.get("disjoint_object_masks")
+    yield c
+    c.perception.disjoint_object_masks = original
+
+
+class TestSwitch:
+    def test_tiptop_yml_ships_it_off(self, cfg):
+        assert cfg.perception.disjoint_object_masks is False
+
+    def test_a_cfg_tamp_override_turns_it_on(self, cfg):
+        assert apply_perception_overrides(cfg, {"disjoint_object_masks": True}) == {
+            "disjoint_object_masks": (False, True)
+        }
+        assert tiptop_cfg().perception.disjoint_object_masks is True
+
+    @pytest.mark.parametrize("bad", ["false", "true", 0.5, 2])
+    def test_only_a_real_boolean_is_accepted(self, cfg, bad):
+        """bool("false") is True: a quoted value must fail, not switch the masks over."""
+        with pytest.raises(ValueError, match="must be true or false"):
+            apply_perception_overrides(cfg, {"disjoint_object_masks": bad})
+        assert cfg.perception.disjoint_object_masks is False
+
+    @pytest.mark.parametrize("setting, expected", [(None, False), (False, False), (True, True)])
+    def test_process_scene_geometry_reads_it_from_the_live_config(self, cfg, monkeypatch, setting, expected):
+        from tiptop import tiptop_run
+
+        seen = {}
+
+        class Stop(Exception):
+            pass
+
+        def capture(*_args, **kwargs):
+            seen.update(kwargs)
+            raise Stop
+
+        monkeypatch.setattr(
+            tiptop_run, "segment_table_with_ransac", lambda *_a, **_k: trimesh.creation.box((1, 1, 0.1))
+        )
+        monkeypatch.setattr(tiptop_run, "segment_pointcloud_by_masks", capture)
+        if setting is None:
+            del cfg.perception["disjoint_object_masks"]  # a tiptop.yml that predates the key
+        else:
+            cfg.perception.disjoint_object_masks = setting
+        xyz, rgb, masks, bboxes, _ = _cloth_and_board()
+        with pytest.raises(Stop):
+            tiptop_run.process_scene_geometry(xyz, rgb, masks, bboxes=bboxes, grasps={})
+        assert seen["disjoint_masks"] is expected

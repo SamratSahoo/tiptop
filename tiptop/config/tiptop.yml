@@ -103,6 +103,15 @@ perception:
   # per data-gen config via `table_plane_support_vote` in cfg/tamp tamp_overrides.
   table_plane_support_vote: false
 
+  # Whether the object meshes and point clouds are built from DISJOINT masks. SAM2 is seeded from
+  # boxes, and a box around a container contains what rests on it, so the container's mask (and then
+  # its convex hull) can swallow that object: on 2026-09-06_23-06-41 the book's collision box covered
+  # the marker lying on it and every pick pose was in collision. true gives every pixel that two
+  # masks both claim to the smaller object, as LJ's fork always does. false (the original) keeps
+  # SAM2's masks. The placement support points use disjoint masks either way. Settable per data-gen
+  # config via `disjoint_object_masks` in cfg/tamp tamp_overrides.
+  disjoint_object_masks: false
+
   # Padding added to each of the robot's cuRobo collision spheres before they are projected into the
   # third-person view and dropped from the point cloud (see project_spheres_to_mask). Covers
   # extrinsics and kinematics error; raise it if a rim of arm survives in the cloud. Unused when the

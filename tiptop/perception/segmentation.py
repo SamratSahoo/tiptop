@@ -298,13 +298,18 @@ def resolve_mask_overlaps(masks_2d: np.ndarray, labels: list[str]) -> np.ndarray
     the mask for a tray covers the toy inside it. On the 2026-09-06_23-06-41 run 81% of the marker's
     pixels were also book pixels.
 
-    Here this shapes only the per-object SUPPORT points that cuTAMP fits placement regions to (see
-    segment_pointcloud_by_masks and _support_points), never the meshes or point clouds, so default
-    perception and planning are unchanged. It matters there because the fit keeps the LARGEST level
-    patch of a surface's points: a cloth whose mask also covers the puzzle board lying on it offers
-    the board's top as its best patch, and "place the toy on the cloth" puts it back on the board.
-    With the board's pixels given to the board, the cloth beneath it reads as unobserved and nothing
-    may rest there -- the 24 x 6.5 cm bare-cloth region the toy-puzzle task was tuned on.
+    By default this shapes only the per-object SUPPORT points that cuTAMP fits placement regions to
+    (see segment_pointcloud_by_masks and _support_points), never the meshes or point clouds, so
+    default perception and planning are unchanged. It matters there because the fit keeps the
+    LARGEST level patch of a surface's points: a cloth whose mask also covers the puzzle board lying
+    on it offers the board's top as its best patch, and "place the toy on the cloth" puts it back on
+    the board. With the board's pixels given to the board, the cloth beneath it reads as unobserved
+    and nothing may rest there -- the 24 x 6.5 cm bare-cloth region the toy-puzzle task was tuned on.
+
+    ``perception.disjoint_object_masks`` applies it to the meshes and point clouds too, as LJ's fork
+    does. Otherwise each mask becomes its own convex hull, so a container's hull swallows the object
+    resting on it: on that run the book's collision box reached z = 0.052 against a marker spanning
+    0.036-0.051, every pick pose was in collision, and collision-aware IK found 1 of 512 seeds.
 
     Smallest-area-wins is the resolution because the containment is one-directional: the thing on
     top is the more specific detection, and it is the one that must keep its points. Mutually
@@ -333,8 +338,8 @@ def resolve_mask_overlaps(masks_2d: np.ndarray, labels: list[str]) -> np.ndarray
         if lost > 0:
             label = labels[idx] if idx < len(labels) else f"mask {idx}"
             _log.debug(
-                f"{label}: support points exclude {lost}/{int(areas[idx])} px "
-                f"({lost / max(int(areas[idx]), 1):.0%}) claimed by a smaller object's mask"
+                f"{label}: {lost}/{int(areas[idx])} px ({lost / max(int(areas[idx]), 1):.0%}) go to a "
+                f"smaller object's mask"
             )
     return disjoint
 
@@ -373,6 +378,7 @@ def segment_pointcloud_by_masks(
     return_pcd: bool = False,
     erode_pixels: int = 0,
     valid_mask: np.ndarray = None,
+    disjoint_masks: bool = False,
 ) -> dict[str, trimesh.Trimesh] | tuple[dict[str, trimesh.Trimesh], dict, dict]:
     """Segment pointcloud using object masks.
 
@@ -386,6 +392,10 @@ def segment_pointcloud_by_masks(
         erode_pixels: Number of pixels to erode the mask by to handle depth edge noise. Default is 0 (no erosion).
         valid_mask: Optional (H, W) boolean mask of usable points, e.g. excluding the robot's own
             geometry and invalid depth. Only NaNs are excluded without it.
+        disjoint_masks: Build the meshes and point clouds from DISJOINT masks too (see
+            resolve_mask_overlaps), so a container's hull stops at the object resting on it. Off by
+            default: only the support points use disjoint masks, and the meshes and point clouds keep
+            the masks SAM2 returned.
 
     Returns:
         Dictionary mapping object labels to trimesh.Trimesh objects, and with ``return_pcd`` also
@@ -486,8 +496,13 @@ def segment_pointcloud_by_masks(
         masks_2d = masks.squeeze(1).astype(bool)  # Update masks_2d with selected masks
 
     # Support points come from DISJOINT masks, so a surface's points stop at whatever rests on it.
-    # Only the support points: the meshes and point clouds below keep the masks SAM2 returned.
+    # By default only the support points: the meshes and point clouds below keep the masks SAM2
+    # returned. With disjoint_masks they are built from the disjoint masks too, as LJ's fork does --
+    # resolved BEFORE the erosion below, so the hole an object on top opens in a container gets the
+    # same edge clearance as the container's outer boundary.
     support_masks_2d = resolve_mask_overlaps(masks_2d, [bbox["label"] for bbox in bboxes[: len(masks_2d)]])
+    if disjoint_masks:
+        masks_2d = support_masks_2d
 
     # Process each mask and create a mesh for each object
     for mask_2d, support_mask_2d, bbox in zip(masks_2d, support_masks_2d, bboxes):
