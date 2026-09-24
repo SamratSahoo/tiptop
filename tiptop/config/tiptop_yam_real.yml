@@ -126,6 +126,10 @@ perception:
   voxel_downsample_size: 0.0075
   contact_threshold_m: 0.01
   mask_erosion_pixels: 3
+  # Off, as in tiptop.yml, which documents both. Either can be switched on per data-gen config in
+  # cfg/tamp tamp_overrides.
+  table_plane_support_vote: false
+  disjoint_object_masks: false
 
   # Median-fuse a burst of stereo frames at the (static) capture pose to suppress sensor noise.
   # Worth more here than on the ZED: the D435's IR stereo is noisier, and unlike the Franka the
