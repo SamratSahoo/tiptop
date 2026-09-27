@@ -67,7 +67,7 @@ cameras:
   # the sim plans from (MolmoAct2's top_cam).
   #
   # mount: world means its calibration entry IS world_from_cam, read straight out of
-  # calibration_info_<workspace>.json and NOT composed with forward kinematics. Add an entry keyed
+  # calibration_info.json and NOT composed with forward kinematics. Add an entry keyed
   # by this serial, as [x, y, z, roll, pitch, yaw] in the URDF `world` frame — whose origin is
   # 0.24 m in -x from the base column and 0.0551 m below its mounting face.
   hand:

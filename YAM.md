@@ -35,7 +35,7 @@ Then add the fixed camera's extrinsics. `cameras.hand.mount: world` means its ca
 `world_from_cam` (no forward kinematics), keyed by serial, as `[x, y, z, roll, pitch, yaw]`:
 
 ```jsonc
-// tiptop/config/assets/calibration_info_<workspace>.json
+// tiptop/config/assets/calibration_info.json
 { "254622075770": { "pose": [x, y, z, roll, pitch, yaw] } }
 ```
 
@@ -46,7 +46,7 @@ its mounting face**, +y toward the left arm. That is also the frame `robot.base_
 
 ### Measuring it: `calibrate-top-cam`
 
-The entry shipped in `calibration_info_prism.json` is the **sim design pose** — where the camera was
+The entry shipped in `calibration_info.json` is the **sim design pose** — where the camera was
 placed in MolmoAct2's sim-eval, not where this one is bolted. Replace it with a measurement:
 
 > **The board must be clamped in or taped to the moving gripper.** The whole method rests on the
@@ -62,7 +62,7 @@ placed in MolmoAct2's sim-eval, not where this one is bolted. Replace it with a 
 pixi run calibrate-top-cam --mode aim
 
 # 3. Calibrate. It aims itself first, and the right arm gets parked for you.
-DC_WORKSPACE=prism pixi run calibrate-top-cam --arm left --close-gripper
+pixi run calibrate-top-cam --arm left --close-gripper
 ```
 
 **Aiming is automatic.** The board only has to be clamped in and roughly visible — the arm turns the
@@ -90,7 +90,7 @@ one that reprojects best wins; the worst sample is dropped and re-solved until e
 ### Moving the board yourself: `--mode manual`
 
 ```bash
-DC_WORKSPACE=prism pixi run calibrate-top-cam --mode manual --arm left --close-gripper
+pixi run calibrate-top-cam --mode manual --arm left --close-gripper
 ```
 
 The arm's six joints go limp — gravity compensated, **gripper still clamped** — and you push the
@@ -150,9 +150,6 @@ matter what the residuals said. `--replay <that dir>` re-solves offline with dif
 `--mode static --board-pose x y z r p y` is the fallback when the board sits at a pose you already
 know in world coordinates: one `solvePnP` and an inversion. It is only as good as the numbers you
 type, so use it to sanity-check, not to calibrate.
-
-`DC_WORKSPACE` is required for saving — without it the result would land in the shared
-`calibration_info.json`, which is the Franka rig's, and the script refuses.
 
 ## Per session
 

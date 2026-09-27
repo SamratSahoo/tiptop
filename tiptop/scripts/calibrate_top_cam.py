@@ -6,7 +6,7 @@ kinematics. ``cameras.hand.mount: world`` means the calibration entry **is** ``w
 (see ``perception.cameras.camera_mount``), and that is what this writes.
 
 The frame is the URDF's ``world`` link — cuRobo's ``base_link`` for both YAM configs — so the pose
-this produces is directly comparable to the sim design pose in ``calibration_info_prism.json``
+this produces is directly comparable to the sim design pose in ``calibration_info.json``
 (``[0.39, 0, 0.8551, ...]``, the MolmoAct2 ``top_cam`` mount carried through
 ``droid-sim-evals``'s ``MOUNT_XYZ``). That entry is a *design* pose, not a measurement; replacing it
 with a real one is the point of this script.
@@ -78,17 +78,17 @@ Usage::
     pixi run calibrate-top-cam --mode aim
 
     # 2. left arm holds the board; it aims itself first, and the right arm is parked for you
-    DC_WORKSPACE=prism pixi run calibrate-top-cam --arm left
+    pixi run calibrate-top-cam --arm left
 
     # ... or move the board yourself: the arm goes limp and each steady new pose is captured
-    DC_WORKSPACE=prism pixi run calibrate-top-cam --mode manual --arm left --close-gripper
+    pixi run calibrate-top-cam --mode manual --arm left --close-gripper
 
     # a plain 9x6-inner-corner chessboard instead of the Charuco default
-    DC_WORKSPACE=prism pixi run calibrate-top-cam --board-kind chessboard --cols 9 --rows 6 \
+    pixi run calibrate-top-cam --board-kind chessboard --cols 9 --rows 6 \
         --square-size 0.025
 
     # DROID-style: hand-pose the board, press Enter, then a Lissajous sweep collects the samples
-    DC_WORKSPACE=prism pixi run calibrate-top-cam --mode sweep --arm left --close-gripper
+    pixi run calibrate-top-cam --mode sweep --arm left --close-gripper
 
     # re-solve offline from a previous run's samples (no robot, no camera)
     pixi run calibrate-top-cam --replay tiptop/.cache/top_cam_calib/20260802-141530
@@ -1512,9 +1512,9 @@ def calibrate_top_cam(
             generalizes, DROID-style; ``--outlier-px`` doubles as the acceptance threshold for the
             held-out RMS.
         replay: Re-solve from a previous run directory instead of touching hardware.
-        save: Write the result into the active workspace's calibration file.
+        save: Write the result into ``calibration_info.json``.
     """
-    from tiptop.config import update_calibration_info, workspace_calib_path
+    from tiptop.config import update_calibration_info
     from tiptop.utils import get_tiptop_cache_dir
     from tiptop.yam import active_arm
 
@@ -1538,16 +1538,6 @@ def calibrate_top_cam(
             "A plain chessboard needs the WHOLE grid visible in every frame and can order its "
             "corners from either end when the board is near 180 deg rotated. Prefer --board-kind "
             "charuco if you have one; if not, keep the board upright and fully in view."
-        )
-
-    # update_calibration_info writes to the workspace layer when DC_WORKSPACE is set and to the
-    # SHARED default file when it is not — and that default is the Franka rig's. Writing a YAM
-    # world_from_cam there would shadow a wrist camera's ee_from_cam for every other robot.
-    if save and workspace_calib_path() is None:
-        raise ValueError(
-            "DC_WORKSPACE is not set, so the result would be written into the shared default "
-            "calibration_info.json rather than this rig's layer. Rerun with DC_WORKSPACE=<workspace> "
-            "(e.g. prism), or pass --no-save to solve without storing."
         )
 
     if replay is not None:
